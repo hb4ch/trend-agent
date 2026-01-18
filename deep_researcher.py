@@ -2,6 +2,8 @@ import json
 import os
 import urllib.request
 import re
+import time
+import dataclasses
 from typing import List, Optional
 
 from zai import ZhipuAiClient
@@ -26,6 +28,13 @@ QWEN_MODEL = os.environ.get("QWEN_MODEL", "Qwen/Qwen3-8B")
 DEBUG_DEEPSEEK = os.environ.get("DEBUG_DEEPSEEK", "").strip() in {"1", "true", "True", "YES", "yes"}
 DEBUG_ZHIPU_SEARCH = os.environ.get("DEBUG_ZHIPU_SEARCH", "").strip() in {"1", "true", "True", "YES", "yes"}
 DEBUG_SILICONFLOW = os.environ.get("DEBUG_SILICONFLOW", "").strip() in {"1", "true", "True", "YES", "yes"}
+
+ZHIPU_SEARCH_ENGINE = os.environ.get("ZHIPU_SEARCH_ENGINE", "search_pro")
+ZHIPU_SEARCH_COUNT = int(os.environ.get("ZHIPU_SEARCH_COUNT", "15"))
+ZHIPU_SEARCH_CONTENT_SIZE = os.environ.get("ZHIPU_SEARCH_CONTENT_SIZE", "high")
+ZHIPU_SEARCH_RECENCY_FILTER = os.environ.get("ZHIPU_SEARCH_RECENCY_FILTER", "noLimit")
+ZHIPU_SEARCH_TIMEOUT_S = int(os.environ.get("ZHIPU_SEARCH_TIMEOUT_S", "60"))
+ZHIPU_SEARCH_RETRIES = int(os.environ.get("ZHIPU_SEARCH_RETRIES", "3"))
 
 
 def _truncate(text: str, limit: int = 8000) -> str:
@@ -63,22 +72,42 @@ def _debug_zhipu(prefix: str, payload: object) -> None:
 
 
 def _to_dict(obj: object) -> object:
-    if hasattr(obj, "model_dump"):
-        try:
-            return obj.model_dump()  # type: ignore[attr-defined]
-        except Exception:
-            pass
-    if hasattr(obj, "dict"):
-        try:
-            return obj.dict()  # type: ignore[attr-defined]
-        except Exception:
-            pass
-    if hasattr(obj, "__dict__"):
-        try:
-            return obj.__dict__  # type: ignore[attr-defined]
-        except Exception:
-            pass
-    return obj
+    def deep_convert(value: object) -> object:
+        if isinstance(value, dict):
+            return {str(k): deep_convert(v) for k, v in value.items()}
+        if isinstance(value, list):
+            return [deep_convert(v) for v in value]
+        if isinstance(value, tuple):
+            return [deep_convert(v) for v in value]
+
+        if dataclasses.is_dataclass(value):
+            try:
+                return deep_convert(dataclasses.asdict(value))
+            except Exception:
+                pass
+        if hasattr(value, "model_dump"):
+            try:
+                return deep_convert(value.model_dump())  # type: ignore[attr-defined]
+            except Exception:
+                pass
+        if hasattr(value, "dict"):
+            try:
+                return deep_convert(value.dict())  # type: ignore[attr-defined]
+            except Exception:
+                pass
+        if hasattr(value, "__dict__"):
+            try:
+                raw = {
+                    k: v
+                    for k, v in value.__dict__.items()  # type: ignore[attr-defined]
+                    if not str(k).startswith("_")
+                }
+                return deep_convert(raw)
+            except Exception:
+                pass
+        return value
+
+    return deep_convert(obj)
 
 
 def _walk(obj: object):
@@ -108,6 +137,47 @@ def _normalize_url(url: str) -> str:
 def _extract_web_results(payload: object) -> List[dict]:
     results: List[dict] = []
     seen = set()
+    direct_lists = []
+    if isinstance(payload, dict):
+        for key in ("data", "results", "list", "items", "search_result"):
+            val = payload.get(key)
+            if isinstance(val, list):
+                direct_lists.append(val)
+    for lst in direct_lists:
+        for node in lst:
+            if not isinstance(node, dict):
+                continue
+            url = node.get("url") or node.get("link") or node.get("href")
+            if not isinstance(url, str):
+                continue
+            url = _normalize_url(url)
+            if not url or url in seen:
+                continue
+            seen.add(url)
+            title = node.get("title") if isinstance(node.get("title"), str) else ""
+            snippet = (
+                node.get("snippet")
+                if isinstance(node.get("snippet"), str)
+                else node.get("content") if isinstance(node.get("content"), str) else ""
+            )
+            date = ""
+            for dk in (
+                "date",
+                "publish_date",
+                "publish_time",
+                "publishTime",
+                "published_at",
+                "time",
+                "datetime",
+            ):
+                dv = node.get(dk)
+                if isinstance(dv, str) and dv.strip():
+                    date = dv.strip()
+                    break
+            results.append({"title": title, "url": url, "snippet": snippet, "date": date})
+            if len(results) >= 10:
+                return results
+
     for node in _walk(payload):
         if not isinstance(node, dict):
             continue
@@ -288,29 +358,53 @@ class ZhipuSearchTool:
                 cleaned_query = re.sub(r"site:[^\s]+", "", query).strip()
 
             kwargs = {
-                "search_engine": "search_pro",
+                "search_engine": ZHIPU_SEARCH_ENGINE,
                 "search_query": cleaned_query,
-                "count": 15,
-                "search_recency_filter": "noLimit",
-                "content_size": "high",
+                "count": max(1, min(50, ZHIPU_SEARCH_COUNT)),
+                "search_recency_filter": ZHIPU_SEARCH_RECENCY_FILTER,
+                "content_size": ZHIPU_SEARCH_CONTENT_SIZE,
             }
             if domain_filter:
                 kwargs["search_domain_filter"] = domain_filter
 
-            response = self.client.web_search.web_search(**kwargs)
-            resp_obj = _to_dict(response)
+            last_error = None
+            resp_obj = None
+            for attempt in range(1, max(1, ZHIPU_SEARCH_RETRIES) + 1):
+                try:
+                    response = self.client.web_search.web_search(**kwargs)
+                    resp_obj = _to_dict(response)
+                    break
+                except Exception as e:
+                    last_error = str(e)
+                    if attempt < ZHIPU_SEARCH_RETRIES:
+                        time.sleep(0.5 * attempt)
+
+            if resp_obj is None:
+                normalized = {
+                    "results": [],
+                    "summary": "检索失败（连接/接口错误），请稍后重试。",
+                    "error": last_error or "unknown_error",
+                    "meta": {"query": cleaned_query, "domain_filter": domain_filter, **kwargs},
+                }
+                _debug_zhipu("normalized", normalized)
+                return json.dumps(normalized, ensure_ascii=False)
+
             _debug_zhipu("raw_response", resp_obj)
 
             results = _extract_web_results(resp_obj)
-            summary = ""
-            if not results:
-                summary = "未找到相关链接。"
+            summary = "未找到相关链接。" if not results else ""
 
-            normalized = {"results": results, "summary": summary}
+            normalized = {
+                "results": results,
+                "summary": summary,
+                "meta": {"query": cleaned_query, "domain_filter": domain_filter, **kwargs},
+            }
             _debug_zhipu("normalized", normalized)
             return json.dumps(normalized, ensure_ascii=False)
         except Exception as e:
-            return f"❌ Search Error: {e}"
+            normalized = {"results": [], "summary": "检索异常。", "error": str(e)}
+            _debug_zhipu("normalized", normalized)
+            return json.dumps(normalized, ensure_ascii=False)
 
 # 实例化工具
 try:
