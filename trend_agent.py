@@ -5,6 +5,7 @@ import json
 import os
 import re
 import subprocess
+import contextlib
 from dataclasses import dataclass
 from datetime import datetime
 from datetime import timedelta
@@ -394,21 +395,56 @@ def local_brief_for_audit(row: pd.Series) -> str:
 
 
 def run_python(code: str, context: Dict) -> str:
+    def safe_import(name, globals=None, locals=None, fromlist=(), level=0):
+        allowed = {
+            "pandas",
+            "numpy",
+            "duckdb",
+            "math",
+            "datetime",
+            "re",
+            "json",
+        }
+        if name in allowed:
+            return __import__(name, globals, locals, fromlist, level)
+        raise ImportError(f"import not allowed: {name}")
+
     safe_builtins = {
+        "__import__": safe_import,
         "len": len,
         "range": range,
         "min": min,
         "max": max,
         "sum": sum,
         "sorted": sorted,
+        "enumerate": enumerate,
+        "zip": zip,
+        "any": any,
+        "all": all,
+        "print": print,
+        "str": str,
+        "int": int,
+        "float": float,
+        "dict": dict,
+        "list": list,
+        "set": set,
+        "tuple": tuple,
     }
+
     local_ctx = dict(context)
+    local_ctx["context"] = dict(context)
+    local_ctx.setdefault("pd", pd)
+    local_ctx.setdefault("np", np)
+    local_ctx.setdefault("duckdb", duckdb)
     local_ctx["__builtins__"] = safe_builtins
+
+    stdout = io.StringIO()
     try:
-        exec(code, local_ctx, local_ctx)
+        with contextlib.redirect_stdout(stdout):
+            exec(code, local_ctx, local_ctx)
     except Exception as exc:
         return f"python_error: {exc}"
-    output = ""
+    output = stdout.getvalue().strip()
     result = local_ctx.get("result")
     if result is not None:
         return f"{output}\nresult: {result}".strip()
@@ -1139,6 +1175,8 @@ def phase5_report_with_deepseek(
         "你是由A股游资策略师、量化研究员和数据可视化专家组成的投研团队负责人，遵循“重势、通过滤、待时机”。你可以请求工具来补充证据。"
         "工具调用格式为JSON："
         '{"tool":"web_search|duckdb|python","input":"..."}'
+        "python 工具环境：已预置 pd(pandas), np(numpy)，以及变量 candidates_df(DataFrame), audits_df(DataFrame), signals(dict), candidates_records(list[dict])；同时提供 context(dict)。尽量不要 import；如需 import 仅允许 pandas/numpy/duckdb/math/datetime/re/json。"
+        "python 工具返回：请把最终结构放入变量 result（例如 dict 或 markdown 字符串）。"
         "当你准备好输出最终报告时，返回JSON："
         '{"final_report":"# Markdown ..."}'
         "注意：引用来源必须使用提供的真实URL，不要写占位符。"
@@ -1162,8 +1200,10 @@ def phase5_report_with_deepseek(
 
     report_md = None
     tool_context = {
-        "candidates": candidates,
-        "audits": audit_df,
+        "candidates_df": candidates,
+        "audits_df": audit_df,
+        "signals": signals,
+        "candidates_records": candidates.head(15).to_dict("records"),
     }
 
     for _ in range(5):
