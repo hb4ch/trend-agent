@@ -377,6 +377,22 @@ def is_relevant_search_hit(name: str, symbol: str, hit: dict) -> bool:
     return False
 
 
+def local_brief_for_audit(row: pd.Series) -> str:
+    parts = [
+        f"ts_code={row.get('ts_code','')}",
+        f"name={row.get('name','')}",
+        f"industry={row.get('industry','')}",
+        f"market_cap={row.get('market_cap', '')}",
+        f"consolidation_score={row.get('consolidation_score','')}",
+        f"volume_boost={row.get('volume_boost','')}",
+        f"ma_spread={row.get('ma_spread','')}",
+        f"ma_spread_std={row.get('ma_spread_std','')}",
+        f"main_business={str(row.get('main_business',''))[:200]}",
+        f"business_scope={str(row.get('business_scope',''))[:200]}",
+    ]
+    return " | ".join(parts)
+
+
 def run_python(code: str, context: Dict) -> str:
     safe_builtins = {
         "len": len,
@@ -628,7 +644,7 @@ def phase3_deep_audit(
             ds_print(f"audit_start stock={name} theme={theme}")
             trace_append(trace_path, "audit_start", {"ts_code": row["ts_code"], "name": name, "theme": theme})
             merged = {}
-            evidence_snippets = []
+            evidence_snippets = [f"[local]\n{local_brief_for_audit(row)}"]
             used_queries = set()
             verdict = "warn"
             rationale = ""
@@ -711,6 +727,9 @@ def phase3_deep_audit(
                         ]
                         if relevant_hits:
                             search_results = relevant_hits
+                        else:
+                            # Don't let strict filtering zero-out the evidence; keep top hits for planning.
+                            search_results = [hit for hit in search_results if isinstance(hit, dict)]
                         parts = []
                         for item in search_results[:5]:
                             if not isinstance(item, dict):
@@ -723,6 +742,9 @@ def phase3_deep_audit(
                             parts.append(f"- {title}{date_part}\n  {url}\n  {snippet}".strip())
                         items_text = "\n".join(parts)
                     raw_clean = "\n".join([str(summary or "").strip(), items_text]).strip()
+                    if not raw_clean:
+                        url_preview = ", ".join(urls[:3]) if isinstance(urls, list) else ""
+                        raw_clean = f"未找到可用摘要/结果（可能被过滤）。query={query} urls={url_preview}"
                     merged[f"pass{pass_id}_{len(merged)+1}"] = {
                         "query": query,
                         "raw": raw_clean,
