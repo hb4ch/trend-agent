@@ -32,7 +32,7 @@ DEBUG_SILICONFLOW = os.environ.get("DEBUG_SILICONFLOW", "").strip() in {"1", "tr
 ZHIPU_SEARCH_ENGINE = os.environ.get("ZHIPU_SEARCH_ENGINE", "search_pro")
 ZHIPU_SEARCH_COUNT = int(os.environ.get("ZHIPU_SEARCH_COUNT", "15"))
 ZHIPU_SEARCH_CONTENT_SIZE = os.environ.get("ZHIPU_SEARCH_CONTENT_SIZE", "high")
-ZHIPU_SEARCH_RECENCY_FILTER = os.environ.get("ZHIPU_SEARCH_RECENCY_FILTER", "noLimit")
+ZHIPU_SEARCH_RECENCY_FILTER = os.environ.get("ZHIPU_SEARCH_RECENCY_FILTER", "oneMonth")
 ZHIPU_SEARCH_TIMEOUT_S = int(os.environ.get("ZHIPU_SEARCH_TIMEOUT_S", "60"))
 ZHIPU_SEARCH_RETRIES = int(os.environ.get("ZHIPU_SEARCH_RETRIES", "3"))
 
@@ -227,7 +227,7 @@ def siliconflow_chat(
     api_key: Optional[str] = None,
     base_url: Optional[str] = None,
     temperature: float = 0.2,
-    timeout_s: int = 60,
+    timeout_s: int = 300,
     debug: bool = False,
     debug_prefix: str = "SiliconFlow",
 ) -> Optional[str]:
@@ -284,9 +284,17 @@ def siliconflow_chat(
             except Exception:
                 pass
         return content
-    except Exception:
+    except urllib.error.HTTPError as e:
         if debug or DEBUG_SILICONFLOW:
-            print(f"[{debug_prefix}] error: request_failed")
+            print(f"[{debug_prefix}] HTTP error: {e.code} - {e.reason}")
+        return None
+    except urllib.error.URLError as e:
+        if debug or DEBUG_SILICONFLOW:
+            print(f"[{debug_prefix}] URL error: {e.reason}")
+        return None
+    except Exception as e:
+        if debug or DEBUG_SILICONFLOW:
+            print(f"[{debug_prefix}] error: {str(e)}")
         return None
 
 

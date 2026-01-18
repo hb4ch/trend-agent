@@ -1,16 +1,26 @@
 #!/usr/bin/env python3
-import hashlib
+"""
+Trend Agent - A-share stock research and screening pipeline.
+
+Implements a 5-phase pipeline:
+1. Market Intelligence - Extract market themes
+2. Quantitative Mining - Screen stocks by technical criteria
+3. Deep Research - Audit and due diligence
+4. Visualization - Generate charts
+5. Report Generation - Create research reports
+"""
+
 import io
 import json
+import logging
 import os
 import re
 import subprocess
 import contextlib
 from dataclasses import dataclass
-from datetime import datetime
-from datetime import timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import duckdb
 import matplotlib as mpl
@@ -24,6 +34,21 @@ from langchain_core.prompts import ChatPromptTemplate
 
 from deep_researcher import deepseek_chat, deepseek_plan_queries, qwen_chat, zhipu_search
 from screen_growth_stocks import screen_all_stocks
+from utils import (
+    extract_urls,
+    is_recent,
+    normalize_verdict,
+    parse_result_date,
+    pretty_print,
+    safe_json_loads,
+    setup_logging,
+    stock_symbol,
+    trace_append,
+    truncate,
+)
+
+# Setup logging
+logger = logging.getLogger(__name__)
 
 
 DATA_ROOT = Path("data")
@@ -40,11 +65,14 @@ CHART_FONT_FALLBACKS = [
     "SimHei",
     "Arial Unicode MS",
 ]
+
+# Configuration from environment
 DEBUG_DEEPSEEK = os.environ.get("DEBUG_DEEPSEEK", "").strip() in {"1", "true", "True", "YES", "yes"}
 USE_QWEN_THEME_MATCH = os.environ.get("USE_QWEN_THEME_MATCH", "").strip() in {"1", "true", "True", "YES", "yes"}
 REGULATORY_MAX_AGE_DAYS = int(os.environ.get("REGULATORY_MAX_AGE_DAYS", "730"))
 
 def setup_matplotlib_chinese_fonts() -> None:
+    """Configure Chinese fonts for matplotlib and mplfinance."""
     candidate_font_files = [
         "/usr/share/fonts/adobe-source-han-sans/SourceHanSansCN-Regular.otf",
         "/usr/share/fonts/adobe-source-han-sans/SourceHanSansCN-Normal.otf",
@@ -58,49 +86,33 @@ def setup_matplotlib_chinese_fonts() -> None:
         except Exception:
             pass
 
+    # Configure matplotlib for Chinese text
     mpl.rcParams["font.family"] = "sans-serif"
     mpl.rcParams["font.sans-serif"] = CHART_FONT_FALLBACKS
     mpl.rcParams["axes.unicode_minus"] = False
+    mpl.rcParams["figure.figsize"] = (16, 10)
+
+    # mplfinance uses matplotlib's rcParams internally, so the above settings
+    # should apply. However, mplfinance's built-in styles override some settings.
+    # We need to explicitly override the style's font configuration.
+    try:
+        from mplfinance import _styles
+        # Modify the base styles dictionary directly
+        if hasattr(_styles, "_base_styles"):
+            for style_name in _styles._base_styles:
+                _styles._base_styles[style_name]["font.family"] = CHART_FONT
+                _styles._base_styles[style_name]["font.unicode_minus"] = False
+    except Exception:
+        pass
 
 
 setup_matplotlib_chinese_fonts()
 
 
-def _truncate(text: str, limit: int = 5000) -> str:
-    text = text or ""
-    if len(text) <= limit:
-        return text
-    return text[:limit] + f"\n...[truncated {len(text) - limit} chars]"
-
-
-def _pretty(payload: object) -> str:
-    if isinstance(payload, (dict, list)):
-        try:
-            return json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True)
-        except Exception:
-            return str(payload)
-    return str(payload)
-
-
-def ds_print(msg: str) -> None:
-    if DEBUG_DEEPSEEK:
-        print(f"[DeepSeek] {msg}")
-
-
-def trace_append(path: Optional[Path], event: str, payload: object) -> None:
-    if not path:
-        return
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text("", encoding="utf-8") if not path.exists() else None
-        with path.open("a", encoding="utf-8") as f:
-            f.write(json.dumps({"ts": datetime.now().isoformat(), "event": event, "payload": payload}, ensure_ascii=False) + "\n")
-    except Exception:
-        return
-
-
 @dataclass
 class ThemeItem:
+    """Market theme with keywords and sources."""
+
     name: str
     keywords: List[str]
     summary: str
@@ -109,6 +121,8 @@ class ThemeItem:
 
 @dataclass
 class AuditResult:
+    """Audit result for a stock-theme pair."""
+
     ts_code: str
     name: str
     theme: str
@@ -118,6 +132,7 @@ class AuditResult:
 
 
 def run_search(query: str) -> str:
+    """Execute web search using Zhipu AI."""
     if hasattr(zhipu_search, "invoke"):
         return zhipu_search.invoke(query)
     if callable(zhipu_search):
@@ -125,20 +140,19 @@ def run_search(query: str) -> str:
     return "❌ Search tool unavailable."
 
 
-def extract_urls(text: str) -> List[str]:
-    urls = re.findall(r"(https?://[^\s\]\)\"']+|www\.[^\s\]\)\"']+)", text)
-    unique = []
-    for url in urls:
-        if url.startswith("www."):
-            url = "https://" + url
-        if url not in unique:
-            unique.append(url)
-    return unique
+def parse_search_payload(raw: Any) -> Dict[str, Any]:
+    """
+    Parse search result payload into structured format.
 
+    Args:
+        raw: Raw search result (dict, JSON string, or other)
 
-def parse_search_payload(raw: object) -> Dict[str, object]:
+    Returns:
+        Dict with summary, results list, and extracted URLs
+    """
     if raw is None:
         return {"summary": "", "results": [], "urls": []}
+
     if isinstance(raw, dict):
         payload = raw
     else:
@@ -151,6 +165,7 @@ def parse_search_payload(raw: object) -> Dict[str, object]:
     results = payload.get("results") if isinstance(payload, dict) else None
     if not isinstance(results, list):
         results = []
+
     urls: List[str] = []
     for item in results:
         if not isinstance(item, dict):
@@ -158,48 +173,37 @@ def parse_search_payload(raw: object) -> Dict[str, object]:
         url = item.get("url")
         if isinstance(url, str) and url and url not in urls:
             urls.append(url)
+
     summary = payload.get("summary", "")
     if not isinstance(summary, str):
         summary = ""
+
     return {"summary": summary, "results": results, "urls": urls}
-
-
-def parse_result_date(value: object) -> Optional[datetime]:
-    if not isinstance(value, str):
-        return None
-    text = value.strip()
-    if not text:
-        return None
-    for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%Y.%m.%d"):
-        try:
-            return datetime.strptime(text, fmt)
-        except Exception:
-            pass
-    if re.fullmatch(r"\d{8}", text):
-        try:
-            return datetime.strptime(text, "%Y%m%d")
-        except Exception:
-            return None
-    return None
-
-
-def is_recent(dt: Optional[datetime], max_age_days: int) -> bool:
-    if dt is None:
-        return False
-    return dt >= (datetime.now() - timedelta(days=max_age_days))
 
 
 def qwen_match_themes(
     themes: List[ThemeItem], candidates: pd.DataFrame, cache_path: Path
 ) -> pd.DataFrame:
+    """
+    Match stocks to themes using Qwen LLM for semantic understanding.
+
+    Args:
+        themes: List of market themes to match against
+        candidates: DataFrame of candidate stocks
+        cache_path: Path to cache file for results
+
+    Returns:
+        DataFrame with additional 'matched_themes' column
+    """
     if not USE_QWEN_THEME_MATCH or not themes or candidates.empty or not qwen_chat:
         return candidates
 
-    cache: Dict[str, object] = {}
+    cache: Dict[str, Any] = {}
     try:
         if cache_path.exists():
             cache = json.loads(cache_path.read_text(encoding="utf-8"))
-    except Exception:
+    except (OSError, ValueError, json.JSONDecodeError) as e:
+        logger.warning(f"Failed to load theme match cache: {e}")
         cache = {}
 
     theme_list = [
@@ -211,19 +215,16 @@ def qwen_match_themes(
         return candidates
 
     def row_fingerprint(row: pd.Series) -> str:
-        text = " ".join(
-            [
-                str(row.get("name", "")),
-                str(row.get("industry", "")),
-                str(row.get("main_business", "")),
-                str(row.get("business_scope", "")),
-                str(row.get("introduction", "")),
-            ]
+        """Create fingerprint for caching theme matches."""
+        from utils import create_row_fingerprint
+
+        return create_row_fingerprint(
+            row.to_dict(),
+            ["name", "industry", "main_business", "business_scope", "introduction"],
         )
-        h = hashlib.sha256(text.encode("utf-8", errors="ignore")).hexdigest()[:16]
-        return f"{row.get('ts_code','')}::{h}"
 
     def get_text(row: pd.Series) -> str:
+        """Get text representation of stock for theme matching."""
         return " | ".join(
             [
                 f"name={row.get('name','')}",
@@ -245,14 +246,18 @@ def qwen_match_themes(
         if key in cache:
             val = cache.get(key)
             if isinstance(val, dict) and isinstance(val.get("matched"), list):
-                matched_map[row["ts_code"]] = [str(x) for x in val["matched"] if str(x) in [t["name"] for t in theme_list]]
+                matched_map[row["ts_code"]] = [
+                    str(x) for x in val["matched"] if str(x) in [t["name"] for t in theme_list]
+                ]
             continue
         batch.append({"ts_code": row["ts_code"], "text": get_text(row)})
         batch_keys.append(key)
 
     def flush(batch_items: List[dict], batch_fp: List[str]) -> None:
+        """Flush batch of stocks to LLM for theme matching."""
         if not batch_items:
             return
+
         messages = [
             {
                 "role": "system",
@@ -270,10 +275,12 @@ def qwen_match_themes(
                 ),
             },
         ]
+
         content = qwen_chat(messages) if qwen_chat else None
         parsed = safe_json_loads(content or "")
         matches = parsed.get("matches", {}) if isinstance(parsed, dict) else {}
         notes = parsed.get("notes", {}) if isinstance(parsed, dict) else {}
+
         for fp, item in zip(batch_fp, batch_items):
             ts_code = item.get("ts_code")
             picked = matches.get(ts_code, []) if isinstance(matches, dict) else []
@@ -281,9 +288,12 @@ def qwen_match_themes(
                 picked = []
             picked = [str(x) for x in picked if str(x) in [t["name"] for t in theme_list]]
             matched_map[ts_code] = picked
-            cache[fp] = {"matched": picked, "note": notes.get(ts_code) if isinstance(notes, dict) else ""}
+            cache[fp] = {
+                "matched": picked,
+                "note": notes.get(ts_code) if isinstance(notes, dict) else ""
+            }
 
-    # chunk into small batches
+    # Process in batches
     chunk = []
     chunk_keys = []
     for item, fp in zip(batch, batch_keys):
@@ -295,39 +305,20 @@ def qwen_match_themes(
             chunk_keys = []
     flush(chunk, chunk_keys)
 
+    # Save cache
     try:
         cache_path.parent.mkdir(parents=True, exist_ok=True)
-        cache_path.write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
-    except Exception:
-        pass
+        cache_path.write_text(
+            json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+    except (OSError, IOError) as e:
+        logger.warning(f"Failed to save theme match cache: {e}")
 
     updated["matched_themes"] = updated["ts_code"].map(lambda c: matched_map.get(c, []))
     return updated
 
 
-def safe_json_loads(text: str) -> Dict:
-    match = re.search(r"\{.*\}", text, re.DOTALL)
-    payload = match.group(0) if match else text
-    payload = payload.strip().strip("```").strip()
-    try:
-        return json.loads(payload)
-    except json.JSONDecodeError:
-        return {}
-
-
-def normalize_verdict(value: object) -> str:
-    text = str(value or "").strip().lower()
-    if "fail" in text or "否决" in text:
-        return "fail"
-    if "warn" in text or "warning" in text or "存疑" in text or "谨慎" in text:
-        return "warn"
-    if "pass" in text or "通过" in text:
-        return "pass"
-    if text in {"fail", "warn", "pass"}:
-        return text
-    return "warn"
-
-
+# Constants for theme expansion and filtering
 PRIMARY_SOURCE_DOMAINS = (
     "cninfo.com.cn",
     "sse.com.cn",
@@ -337,31 +328,51 @@ PRIMARY_SOURCE_DOMAINS = (
 THEME_SYNONYMS: Dict[str, List[str]] = {
     "芯片": ["半导体", "集成电路", "国产替代", "IC", "EDA", "光刻", "存储"],
     "半导体": ["芯片", "集成电路", "国产替代", "IC", "EDA", "光刻", "存储"],
-    "医药": ["医疗", "创新药", "生物制药", "疫苗", "CRO", "医药生物"],
-    "医疗": ["医药", "创新药", "生物制药", "疫苗", "CRO", "医药生物"],
-    "军工": ["航空", "航天", "军工电子", "航材", "兵装", "武器"],
-    "AI": ["人工智能", "算力", "大模型", "数据中心", "服务器", "光模块", "CPO"],
-    "新能源": ["光伏", "风电", "锂电", "储能", "新能源车", "充电桩"],
+    "医药": ["医疗", "创新药", "生物制药", "疫苗", "CRO", "医药生物", "生物", "诊断", "IVD", "体外诊断"],
+    "医疗": ["医药", "创新药", "生物制药", "疫苗", "CRO", "医药生物", "生物", "诊断", "IVD", "体外诊断"],
+    "生物": ["医药", "医疗", "创新药", "生物制药", "疫苗", "CRO", "医药生物", "诊断", "IVD"],
+    "航天": ["军工", "航空", "商业航天", "军工电子", "航材", "卫星", "航空航天", "航天电子", "中国卫通"],
+    "航空": ["军工", "航天", "商业航天", "军工电子", "航材", "卫星", "航空航天"],
+    "商业航天": ["军工", "航天", "航空", "军工电子", "航材", "卫星", "航空航天", "航天电子"],
+    "军工": ["航空", "航天", "军工电子", "航材", "兵装", "武器", "商业航天", "卫星"],
+    "AI": ["人工智能", "算力", "大模型", "数据中心", "服务器", "光模块", "CPO", "AI应用"],
+    "科技": ["AI", "人工智能", "算力", "大模型", "芯片", "半导体", "科技成长"],
+    "新能源": ["光伏", "风电", "锂电", "储能", "新能源车", "充电桩", "电池"],
+    "消费": ["零售", "食品饮料", "白酒", "家电", "旅游", "酒店"],
+    "券商": ["证券", "非银金融", "保险"],
 }
 
 
 def expand_theme_keywords(theme: ThemeItem) -> List[str]:
+    """
+    Expand theme keywords with synonyms.
+
+    Args:
+        theme: Theme item with name and keywords
+
+    Returns:
+        Expanded list of keywords including synonyms
+    """
     keywords = set([theme.name] + list(theme.keywords or []))
     expanded = set()
     for kw in list(keywords):
         expanded.add(kw)
+        # Check if any THEME_SYNONYMS key is in this keyword
         for key, syns in THEME_SYNONYMS.items():
             if key and key in kw:
                 for s in syns:
                     expanded.add(s)
+        # Check if this keyword is a THEME_SYNONYMS key
         if kw in THEME_SYNONYMS:
             for s in THEME_SYNONYMS[kw]:
                 expanded.add(s)
+        # Check if this keyword matches any synonym value (reverse lookup)
+        for syns in THEME_SYNONYMS.values():
+            if kw in syns:
+                # Add all related terms from this synonym group
+                for s in syns:
+                    expanded.add(s)
     return [k for k in expanded if isinstance(k, str) and k.strip()]
-
-
-def stock_symbol(ts_code: str) -> str:
-    return str(ts_code or "").split(".")[0]
 
 
 def is_relevant_search_hit(name: str, symbol: str, hit: dict) -> bool:
@@ -395,7 +406,20 @@ def local_brief_for_audit(row: pd.Series) -> str:
 
 
 def run_python(code: str, context: Dict) -> str:
+    """
+    Execute Python code in a restricted environment.
+
+    Note: This function executes arbitrary code. Use with caution.
+
+    Args:
+        code: Python code to execute
+        context: Variables to inject into execution context
+
+    Returns:
+        Output from code execution or error message
+    """
     def safe_import(name, globals=None, locals=None, fromlist=(), level=0):
+        """Restrict imports to safe modules only."""
         allowed = {
             "pandas",
             "numpy",
@@ -443,7 +467,9 @@ def run_python(code: str, context: Dict) -> str:
         with contextlib.redirect_stdout(stdout):
             exec(code, local_ctx, local_ctx)
     except Exception as exc:
+        logger.debug(f"Python execution error: {exc}")
         return f"python_error: {exc}"
+
     output = stdout.getvalue().strip()
     result = local_ctx.get("result")
     if result is not None:
@@ -452,13 +478,25 @@ def run_python(code: str, context: Dict) -> str:
 
 
 def run_duckdb_sql(sql: str, context: Dict[str, pd.DataFrame]) -> str:
+    """
+    Execute DuckDB SQL query on registered DataFrames.
+
+    Args:
+        sql: SQL query to execute
+        context: Dictionary of DataFrame names to DataFrames
+
+    Returns:
+        Query results as markdown table or error message
+    """
     con = duckdb.connect()
     for name, df in context.items():
         con.register(name, df)
+
     try:
         df = con.execute(sql).df()
         return df.head(20).to_markdown(index=False)
     except Exception as exc:
+        logger.warning(f"DuckDB query failed: {exc}")
         return f"duckdb_error: {exc}"
 
 
@@ -467,15 +505,29 @@ def init_llm() -> ChatZhipuAI:
 
 
 def phase1_market_intel(llm: ChatZhipuAI) -> List[ThemeItem]:
+    """
+    Phase 1: Extract market themes from web search.
+
+    Args:
+        llm: Language model for processing search results
+
+    Returns:
+        List of market themes with keywords and sources
+    """
+    logger.info("Starting Phase 1: Market Intelligence")
+
+    current_year_month = datetime.now().strftime("%Y年%m月")
+    current_month = datetime.now().strftime("%Y年%m月")
     queries = [
-        "A股 近两周 核心题材",
-        "近期 龙虎榜 机构游资 重点板块",
-        f"{datetime.now():%Y年%m月} A股 涨停复盘",
+        f"A股 {current_month} 核心题材 最新热点",
+        f"龙虎榜 {current_month} 机构游资 重点板块 最新动向",
+        f"A股 {current_year_month} 涨停复盘 市场热点",
     ]
 
     raw_results = []
     all_urls = []
     for query in queries:
+        logger.debug(f"Searching: {query}")
         raw = run_search(query)
         parsed = parse_search_payload(raw)
         urls = parsed.get("urls", [])
@@ -491,11 +543,13 @@ def phase1_market_intel(llm: ChatZhipuAI) -> List[ThemeItem]:
             if url not in all_urls:
                 all_urls.append(url)
 
+    logger.debug(f"Collected {len(all_urls)} unique URLs from searches")
+
     prompt = ChatPromptTemplate.from_messages(
         [
             (
                 "system",
-                "你是A股游资策略师，遵循“重势重质”原则，提炼当前市场3-5个核心主线并给出关键词。",
+                "你是A股游资策略师，遵循\"重势重质\"原则，提炼当前市场3-5个核心主线并给出关键词。",
             ),
             (
                 "user",
@@ -529,6 +583,7 @@ def phase1_market_intel(llm: ChatZhipuAI) -> List[ThemeItem]:
         )
 
     def is_actionable_theme(theme: ThemeItem) -> bool:
+        """Check if theme is actionable (not generic noise)."""
         if not theme.name:
             return False
         bad_tokens = ["股票", "辨识度", "传统经济", "蓝筹", "龙虎榜", "游资", "机构", "复盘", "涨停"]
@@ -539,12 +594,25 @@ def phase1_market_intel(llm: ChatZhipuAI) -> List[ThemeItem]:
         return True
 
     filtered = [t for t in themes if is_actionable_theme(t)]
+    logger.info(f"Extracted {len(filtered)} market themes")
     return filtered or themes
 
 
 def phase2_quant_filter(themes: List[ThemeItem]) -> pd.DataFrame:
+    """
+    Phase 2: Screen stocks using quantitative technical criteria.
+
+    Args:
+        themes: List of market themes for matching
+
+    Returns:
+        DataFrame of filtered candidate stocks
+    """
+    logger.info("Starting Phase 2: Quantitative Filtering")
+
     screen_df = screen_all_stocks()
     if screen_df is None or screen_df.empty:
+        logger.warning("No screening results from screen_all_stocks()")
         return pd.DataFrame()
 
     con = duckdb.connect()
@@ -562,7 +630,9 @@ def phase2_quant_filter(themes: List[ThemeItem]) -> pd.DataFrame:
         """
     ).df()
 
-    # Optional: use Qwen (small LLM) to match themes semantically to avoid brittle keyword matching.
+    logger.info(f"Filtered to {len(filtered)} candidates by technical criteria")
+
+    # Optional: use Qwen (small LLM) to match themes semantically
     filtered = qwen_match_themes(themes, filtered, cache_path=Path(".cache/qwen_theme_match.json"))
     if "matched_themes" in filtered.columns:
         filtered = filtered.rename(columns={"matched_themes": "matched_themes_llm"})
@@ -574,6 +644,7 @@ def phase2_quant_filter(themes: List[ThemeItem]) -> pd.DataFrame:
             theme_keywords.append((theme.name, expanded))
 
     def match_row(row: pd.Series) -> Dict[str, List[str]]:
+        """Match row to themes by keyword search."""
         text = " ".join(
             [
                 str(row.get("name", "")),
@@ -597,6 +668,7 @@ def phase2_quant_filter(themes: List[ThemeItem]) -> pd.DataFrame:
         filtered["matched_themes_kw"] = [[] for _ in range(len(filtered))]
 
     def merge_matches(row: pd.Series) -> List[str]:
+        """Merge LLM and keyword matches."""
         merged = []
         for key in ("matched_themes_llm", "matched_themes_kw"):
             val = row.get(key, [])
@@ -612,18 +684,31 @@ def phase2_quant_filter(themes: List[ThemeItem]) -> pd.DataFrame:
 
     has_match = filtered["matched_themes"].apply(bool).sum() if "matched_themes" in filtered.columns else 0
     if has_match == 0:
-        print("⚠️ 形态符合的标的中没有命中当前主线白名单，返回 Top15 形态股（标记为 off_theme）供复核。")
+        logger.warning(
+            "No candidates match current themes, returning top 15 by technical score (off_theme=True)"
+        )
         filtered["off_theme"] = True
         return filtered.head(15)
 
     filtered = filtered[filtered["matched_themes"].apply(bool)]
     filtered["off_theme"] = False
+    logger.info(f"Phase 2 complete: {len(filtered.head(15))} candidates with theme matches")
     return filtered.head(15)
 
 
 def apply_audit_filter(
     candidates: pd.DataFrame, audits: List[AuditResult]
 ) -> tuple[pd.DataFrame, List[AuditResult]]:
+    """
+    Filter candidates based on audit results.
+
+    Args:
+        candidates: DataFrame of candidate stocks
+        audits: List of audit results
+
+    Returns:
+        Tuple of (filtered candidates, filtered audits)
+    """
     verdict_rank = {"fail": 2, "warn": 1, "pass": 0}
     worst = {}
     for audit in audits:
@@ -633,6 +718,7 @@ def apply_audit_filter(
             worst[audit.ts_code] = rank
 
     def verdict_label(rank: int) -> str:
+        """Convert rank to verdict label."""
         for key, val in verdict_rank.items():
             if val == rank:
                 return key
@@ -642,12 +728,16 @@ def apply_audit_filter(
     candidates["audit_verdict"] = candidates["ts_code"].map(
         lambda code: verdict_label(worst.get(code, 1))
     )
+
     if "audit_verdict" in candidates.columns:
         counts = candidates["audit_verdict"].value_counts().to_dict()
-        print(f"Audit verdict distribution: {counts}")
+        logger.info(f"Audit verdict distribution: {counts}")
+
     filtered = candidates[candidates["audit_verdict"] != "fail"]
     allowed_codes = set(filtered["ts_code"])
     filtered_audits = [audit for audit in audits if audit.ts_code in allowed_codes]
+
+    logger.info(f"Applied audit filter: {len(filtered)} candidates passed")
     return filtered, filtered_audits
 
 
@@ -677,7 +767,7 @@ def phase3_deep_audit(
         symbol = stock_symbol(row["ts_code"])
         themes = row.get("matched_themes", []) or ["未明确题材"]
         for theme in themes:
-            ds_print(f"audit_start stock={name} theme={theme}")
+            logger.debug(f"Audit start: stock={name} theme={theme}")
             trace_append(trace_path, "audit_start", {"ts_code": row["ts_code"], "name": name, "theme": theme})
             merged = {}
             evidence_snippets = [f"[local]\n{local_brief_for_audit(row)}"]
@@ -729,10 +819,10 @@ def phase3_deep_audit(
                         pass_id=pass_id,
                     )
                     if plan is not None:
-                        ds_print(f"audit_plan pass={pass_id} plan=\n{_truncate(_pretty(plan), 1200)}")
+                        logger.debug(f"Audit plan pass={pass_id}: {truncate(pretty_print(plan), 1200)}")
                         trace_append(trace_path, "audit_plan", {"ts_code": row["ts_code"], "name": name, "theme": theme, "pass_id": pass_id, "plan": plan})
                     if plan and plan.get("stop"):
-                        ds_print(f"audit_plan_stop pass={pass_id} reason={plan.get('reason','')}")
+                        logger.debug(f"Audit plan stop pass={pass_id} reason={plan.get('reason','')}")
                         break
                     queries = plan.get("queries") if plan else None
                     if not queries:
@@ -748,7 +838,7 @@ def phase3_deep_audit(
                     if query in used_queries:
                         continue
                     used_queries.add(query)
-                    ds_print(f"audit_search pass={pass_id} q={query}")
+                    logger.debug(f"Audit search pass={pass_id} q={query}")
                     raw = run_search(query)
                     parsed = parse_search_payload(raw)
                     urls = parsed.get("urls", [])
@@ -797,7 +887,7 @@ def phase3_deep_audit(
                             "theme": theme,
                             "pass_id": pass_id,
                             "query": query,
-                            "raw_snippet": _truncate(raw_clean, 1200),
+                            "raw_snippet": truncate(raw_clean, 1200),
                         },
                     )
                     evidence_snippets.append(raw_clean[:800])
@@ -841,7 +931,7 @@ def phase3_deep_audit(
                         "触发一票否决关键词（立案/重大诉讼/巨额减持/退市风险等），直接剔除。"
                     )
                     sources = flat_urls[:5]
-                    ds_print("audit_hard_fail matched_patterns")
+                    logger.debug("Audit hard fail: matched patterns")
                     trace_append(trace_path, "audit_hard_fail", {"ts_code": row["ts_code"], "name": name, "theme": theme, "sources": sources})
                     break
 
@@ -864,7 +954,7 @@ def phase3_deep_audit(
                 verdict = normalize_verdict(data.get("verdict", verdict))
                 rationale = str(data.get("rationale", rationale) or "").strip()
                 sources = data.get("sources", sources)
-                ds_print(f"audit_llm verdict={verdict} rationale={_truncate(rationale, 400)}")
+                logger.debug(f"Audit LLM verdict={verdict} rationale={truncate(rationale, 400)}")
                 trace_append(trace_path, "audit_llm", {"ts_code": row["ts_code"], "name": name, "theme": theme, "verdict": verdict, "rationale": rationale, "sources": sources})
                 if not sources or any(src.strip().lower() == "url1" for src in sources):
                     flat_urls = []
@@ -917,7 +1007,7 @@ def phase3_deep_audit(
                     sources=sources,
                 )
             )
-            ds_print(f"audit_done stock={name} theme={theme} verdict={verdict}")
+            logger.debug(f"Audit done: stock={name} theme={theme} verdict={verdict}")
             trace_append(trace_path, "audit_done", {"ts_code": row["ts_code"], "name": name, "theme": theme, "verdict": verdict})
 
     return audit_results
@@ -954,9 +1044,24 @@ def detect_turnover_spikes(
 
 
 def phase4_plot_charts(candidates: pd.DataFrame) -> Dict[str, List[str]]:
+    """
+    Generate K-line charts with technical indicators.
+
+    Args:
+        candidates: DataFrame of candidate stocks
+
+    Returns:
+        Dictionary mapping stock codes to spike dates
+    """
     CHART_DIR.mkdir(parents=True, exist_ok=True)
     chart_notes = {}
     setup_matplotlib_chinese_fonts()
+
+    # Configure high DPI for better quality
+    mpl.rcParams["figure.dpi"] = 150
+    mpl.rcParams["savefig.dpi"] = 150
+    mpl.rcParams["savefig.bbox"] = "tight"
+
     for _, row in candidates.head(8).iterrows():
         ts_code = row["ts_code"]
         df = load_price_data(ts_code)
@@ -991,10 +1096,19 @@ def phase4_plot_charts(candidates: pd.DataFrame) -> Dict[str, List[str]]:
             addplot=add_plots,
             style="yahoo",
             title=f"{row['name']} {ts_code}",
-            savefig=str(chart_path),
+            savefig=dict(
+                fname=str(chart_path),
+                dpi=150,
+                facecolor="white",
+                edgecolor="none",
+                bbox_inches="tight",
+                pad_inches=0.1,
+            ),
             warn_too_much_data=CHART_DAYS + 10,
+            figsize=(16, 10),
         )
         chart_notes[ts_code] = spike_dates
+        logger.debug(f"Generated chart: {chart_path}")
     return chart_notes
 
 
@@ -1172,15 +1286,47 @@ def phase5_report_with_deepseek(
     }
 
     system_prompt = (
-        "你是由A股游资策略师、量化研究员和数据可视化专家组成的投研团队负责人，遵循“重势、通过滤、待时机”。你可以请求工具来补充证据。"
-        "工具调用格式为JSON："
-        '{"tool":"web_search|duckdb|python","input":"..."}'
-        "python 工具环境：已预置 pd(pandas), np(numpy)，以及变量 candidates_df(DataFrame), audits_df(DataFrame), signals(dict), candidates_records(list[dict])；同时提供 context(dict)。尽量不要 import；如需 import 仅允许 pandas/numpy/duckdb/math/datetime/re/json。"
-        "python 工具返回：请把最终结构放入变量 result（例如 dict 或 markdown 字符串）。"
-        "当你准备好输出最终报告时，返回JSON："
-        '{"final_report":"# Markdown ..."}'
-        "注意：引用来源必须使用提供的真实URL，不要写占位符。"
-        "报告必须落到“待时机”的交易触发：箱体上沿附近 + 温和放量(1.2-3.0x) + 均线粘合。"
+        "你是资深A股投研团队负责人，遵循\"重势、通过滤、待时机\"理念。"
+        ""
+        "## 报告结构："
+        ""
+        "### 【市场风向标】"
+        "每个主题分析：主题逻辑、资金验证、持续观察指标"
+        ""
+        "### 【核心金股】表格"
+        "列：股票、所属主线、形态特征、推荐理由（投资逻辑）"
+        ""
+        "### 【深度图解】（每个标的必须包含）："
+        "**【投资逻辑】**<font color='blue'>"
+        "- 观察现象：量能异动、技术形态、题材契合"
+        "- 分析意义：资金态度、趋势方向、突破可能"
+        "- 验证方式：龙虎榜、财报、公告"
+        "- 结论：交易机会评级（强烈推荐/推荐/谨慎）"
+        "</font>"
+        ""
+        "**【技术分析】**横盘时长/波动率、量能信号、均线排列、箱体位置"
+        ""
+        "**【资金验证】**<font color='purple'>机构游资动向、估值水平、市值适合度</font>"
+        ""
+        "**【核心催化】**<font color='red'>政策/事件/市场催化</font>"
+        ""
+        "**【交易建议】**<font color='green'>买入时机/仓位/止盈止损/持仓周期</font>"
+        ""
+        "**【风险提示】**<font color='orange'>核心风险及应对</font>"
+        ""
+        "- 量能异动日：[列表]\\n"
+        "![股票名称 代码](../charts/代码.png)\\n"
+        "- 尽调结论：pass/fail（说明+来源）"
+        ""
+        "### 【风险提示】"
+        "用<font color='orange'>橙色</font>标注核心风险"
+        ""
+        "## 要求："
+        "- 输出JSON：{\"final_report\":\"# Markdown...\"}"
+        "- 引用真实URL，不使用占位符"
+        "- 突出\"待时机\"：箱体上沿+温和放量(1.2-3.0x)+均线粘合"
+        ""
+        "记住：展示思考过程，而非仅结论。"
     )
 
     messages = [
@@ -1194,8 +1340,8 @@ def phase5_report_with_deepseek(
             ),
         },
     ]
-    ds_print(f"report_trace_path={trace_path}")
-    trace_append(trace_path, "report_init", {"system": _truncate(system_prompt, 2000)})
+    logger.debug(f"Report trace: {trace_path}")
+    trace_append(trace_path, "report_init", {"system": truncate(system_prompt, 2000)})
     trace_append(trace_path, "report_context", {"summary_keys": list(summary.keys())})
 
     report_md = None
@@ -1207,47 +1353,47 @@ def phase5_report_with_deepseek(
     }
 
     for _ in range(5):
-        ds_print(f"report_round messages={len(messages)} last_user={_truncate(str(messages[-1].get('content','')), 600)}")
-        trace_append(trace_path, "report_request", {"messages": [{"role": m.get("role"), "content": _truncate(str(m.get("content","")), 1200)} for m in messages[-3:]]})
+        logger.debug(f"Report round: {len(messages)} messages")
+        trace_append(trace_path, "report_request", {"messages": [{"role": m.get("role"), "content": truncate(str(m.get("content","")), 1200)} for m in messages[-3:]]})
         content = deepseek_chat(messages) if deepseek_chat else None
         if not content:
-            ds_print("report_no_response")
+            logger.debug("Report: no response from DeepSeek")
             trace_append(trace_path, "report_no_response", {})
             break
-        ds_print(f"report_raw_response={_truncate(content, 1200)}")
-        trace_append(trace_path, "report_raw_response", {"content": _truncate(content, 12000)})
+        logger.debug(f"Report raw response: {truncate(content, 1200)}")
+        trace_append(trace_path, "report_raw_response", {"content": truncate(content, 12000)})
         parsed = safe_json_loads(content)
         tool = parsed.get("tool")
         if tool:
             if tool == "web_search":
                 tool_input = parsed.get("input", "")
-                ds_print(f"report_tool_call tool=web_search input={_truncate(str(tool_input), 400)}")
+                logger.debug(f"Report tool: web_search input={truncate(str(tool_input), 400)}")
                 trace_append(trace_path, "report_tool_call", {"tool": "web_search", "input": tool_input})
                 result = run_search(tool_input)
             elif tool == "duckdb":
                 tool_input = parsed.get("input", "")
-                ds_print(f"report_tool_call tool=duckdb input={_truncate(str(tool_input), 400)}")
+                logger.debug(f"Report tool: duckdb input={truncate(str(tool_input), 400)}")
                 trace_append(trace_path, "report_tool_call", {"tool": "duckdb", "input": tool_input})
                 result = run_duckdb_sql(tool_input, tool_context)
             elif tool == "python":
                 tool_input = parsed.get("input", "")
-                ds_print(f"report_tool_call tool=python input={_truncate(str(tool_input), 400)}")
+                logger.debug(f"Report tool: python input={truncate(str(tool_input), 400)}")
                 trace_append(trace_path, "report_tool_call", {"tool": "python", "input": tool_input})
                 result = run_python(tool_input, tool_context)
             else:
                 result = "unknown_tool"
-            ds_print(f"report_tool_result={_truncate(result, 800)}")
-            trace_append(trace_path, "report_tool_result", {"tool": tool, "result": _truncate(result, 20000)})
+            logger.debug(f"Report tool result: {truncate(result, 800)}")
+            trace_append(trace_path, "report_tool_result", {"tool": tool, "result": truncate(result, 20000)})
             messages.append({"role": "user", "content": f"TOOL_RESULT:\n{result}"})
             continue
         report_md = parsed.get("final_report")
         if report_md:
-            ds_print("report_final_received")
+            logger.debug("Report: final received")
             trace_append(trace_path, "report_final_received", {"length": len(report_md)})
             break
         if content.lstrip().startswith("#"):
             report_md = content
-            ds_print("report_markdown_fallback")
+            logger.debug("Report: markdown fallback")
             trace_append(trace_path, "report_markdown_fallback", {"length": len(report_md)})
             break
         messages.append({"role": "user", "content": "请按JSON格式返回。"})
@@ -1269,69 +1415,266 @@ def phase5_report_with_deepseek(
     return md_path
 
 
+def postprocess_markdown(md_path: Path) -> Path:
+    """
+    Post-process markdown to fix formatting issues for better PDF output.
+
+    Args:
+        md_path: Path to original Markdown file
+
+    Returns:
+        Path to processed Markdown file
+    """
+    import re
+    from urllib.parse import urlparse
+
+    content = md_path.read_text(encoding="utf-8")
+    processed_path = md_path.parent / f"{md_path.stem}_processed.md"
+
+    lines = content.split("\n")
+    processed_lines = []
+
+    for line in lines:
+        # Fix long comma-separated date lists - break them into multiple lines
+        if "量能异动日：" in line and "," in line:
+            match = re.search(r"(.*?)量能异动日：(.*?)(?:$|!)", line)
+            if match:
+                prefix = match.group(1)
+                dates_str = match.group(2).strip()
+                dates = [d.strip() for d in dates_str.split(",")]
+                processed_lines.append(f"{prefix}量能异动日：")
+                # Group dates into lines of 8
+                for i in range(0, len(dates), 8):
+                    processed_lines.append(", ".join(dates[i:i+8]))
+                continue
+
+        # Fix long source lines - break into multiple lines BEFORE URL processing
+        if "- 来源：" in line:
+            match = re.search(r"(.*?- 来源：)(.*?)(?:$)", line)
+            if match:
+                prefix = match.group(1)
+                sources_str = match.group(2).strip()
+
+                # Extract URLs from the sources
+                url_pattern = r"https?://[^\s,]+"
+                urls = re.findall(url_pattern, sources_str)
+
+                if urls:
+                    processed_lines.append(prefix)
+                    # Create clickable links, 2 per line
+                    for i in range(0, len(urls), 2):
+                        link_parts = []
+                        for url in urls[i:i+2]:
+                            parsed = urlparse(url)
+                            domain = parsed.netloc or parsed.path[:30]
+                            link_parts.append(f"[{domain}]({url})")
+                        processed_lines.append("  " + "  ".join(link_parts))
+                    continue
+
+        # Fix bare URLs in other lines - make them clickable
+        url_pattern = r"(https?://[^\s\]\),]+)"
+        def replace_url(match):
+            url = match.group(1)
+            # Skip if already in markdown link format
+            if f"]({url})" in line or f"](<{url}>)" in line:
+                return url
+            # Extract domain for link text
+            parsed = urlparse(url)
+            domain = parsed.netloc or parsed.path[:30]
+            return f"[{domain}]({url})"
+
+        line = re.sub(url_pattern, replace_url, line)
+
+        processed_lines.append(line)
+
+    processed_content = "\n".join(processed_lines)
+
+    # Convert HTML font color tags to LaTeX color commands for PDF
+    # Pattern: <font color='red'>text</font> or <font color="red">text</font>
+    def convert_font_color(match):
+        color_name = match.group(1).strip('"\'')
+        text = match.group(2)
+        # Map HTML color names to LaTeX colors
+        color_map = {
+            'red': 'highlightred',
+            'green': 'highlightgreen',
+            'blue': 'highlightblue',
+            'orange': 'highlightorange',
+            'purple': 'highlightpurple',
+        }
+        latex_color = color_map.get(color_name.lower(), color_name)
+        return f'\\textcolor{{{latex_color}}}{{{text}}}'
+    # Use a more robust regex that handles nested structures
+    processed_content = re.sub(
+        r"<font\s+color=['\"]([^'\"]+)['\"]>([^<]+)</font>",
+        convert_font_color,
+        processed_content,
+        flags=re.IGNORECASE
+    )
+
+    # Add spacing improvements
+    processed_content = re.sub(r"\n{3,}", "\n\n", processed_content)  # Fix excessive blank lines
+
+    processed_path.write_text(processed_content, encoding="utf-8")
+    return processed_path
+
+
 def build_pdf(md_path: Path) -> Optional[Path]:
+    """
+    Build PDF from Markdown using pandoc with improved formatting.
+
+    Args:
+        md_path: Path to Markdown file
+
+    Returns:
+        Path to generated PDF, or None if generation failed
+    """
+    # Post-process markdown for better formatting
+    processed_md = postprocess_markdown(md_path)
+
     pdf_path = md_path.with_suffix(".pdf")
+
+    # Create LaTeX header for better styling
+    latex_header = r"""\usepackage{geometry}
+\usepackage{hyperref}
+\usepackage{longtable}
+\usepackage{booktabs}
+\usepackage{xcolor}
+\usepackage{graphicx}
+
+% Page geometry
+\geometry{
+    a4paper,
+    left=25mm,
+    right=25mm,
+    top=25mm,
+    bottom=25mm,
+}
+
+% Hyperlink setup
+\hypersetup{
+    colorlinks=true,
+    linkcolor=blue,
+    urlcolor=blue,
+    citecolor=blue,
+    pdftitle={A股趋势跟踪研报},
+    pdfauthor={Trend Agent},
+}
+
+% Table styling
+\renewcommand{\arraystretch}{1.3}
+
+% Image styling - center all images
+\makeatletter
+\def\maxwidth{\ifdim\Gin@nat@width>\linewidth\linewidth\else\Gin@nat@width\fi}
+\def\maxheight{\ifdim\Gin@nat@height>\textheight\textheight\else\Gin@nat@height\fi}
+\makeatother
+
+% Center images and scale if needed
+\setkeys{Gin}{width=\maxwidth,height=\maxheight,keepaspectratio}
+\makeatletter
+\g@addto@macro\@floatboxreset\centering
+\makeatother
+
+% Define colors for highlights
+\definecolor{highlightred}{RGB}{220, 50, 50}
+\definecolor{highlightgreen}{RGB}{50, 160, 50}
+\definecolor{highlightblue}{RGB}{50, 100, 220}
+\definecolor{highlightorange}{RGB}{220, 120, 20}
+\definecolor{highlightpurple}{RGB}{140, 50, 180}
+"""
+
+    # Write header to temp file
+    header_path = md_path.parent / "header.tex"
+    header_path.write_text(latex_header, encoding="utf-8")
+
     build_sh = md_path.parent / "build.sh"
     build_sh.write_text(
-        f"#!/usr/bin/env bash\npandoc {md_path} -o {pdf_path} --pdf-engine=xelatex -V CJKmainfont=\"{CHART_FONT}\"\n",
+        f'#!/usr/bin/env bash\ncd "{md_path.parent}" && pandoc "{processed_md.name}" -o "{pdf_path.name}" --pdf-engine=xelatex -H header.tex -V CJKmainfont="{CHART_FONT}" --toc --number-sections\n',
         encoding="utf-8",
     )
     build_sh.chmod(0o755)
 
     try:
+        # Run pandoc with improved options for better formatting
         subprocess.run(
             [
                 "pandoc",
-                str(md_path),
+                processed_md.name,
                 "-o",
-                str(pdf_path),
+                pdf_path.name,
                 "--pdf-engine=xelatex",
-                "-V",
-                f"CJKmainfont={CHART_FONT}",
+                "-H", "header.tex",
+                "-V", f"CJKmainfont={CHART_FONT}",
+                "--toc",
+                "--number-sections",
+                "--wrap=none",  # Don't wrap lines automatically
+                "--columns=80",  # Set line length
             ],
+            cwd=str(md_path.parent),
             check=True,
+            capture_output=True,
         )
+        logger.info(f"PDF generated: {pdf_path}")
         return pdf_path
-    except Exception as exc:
-        print(f"⚠️ Pandoc 生成失败: {exc}")
+    except (subprocess.CalledProcessError, FileNotFoundError) as exc:
+        logger.warning(f"Pandoc PDF generation failed: {exc}")
+        if hasattr(exc, "stderr") and exc.stderr:
+            logger.debug(f"Pandoc stderr: {exc.stderr.decode('utf-8', errors='ignore')}")
         return None
 
 
 def main() -> None:
+    """Main entry point for the trend agent pipeline."""
+    # Setup logging
+    log_level = logging.DEBUG if DEBUG_DEEPSEEK else logging.INFO
+    setup_logging(level=log_level, log_file=REPORT_DIR / "trend_agent.log")
+
+    logger.info("=" * 60)
+    logger.info("Starting Trend Agent Pipeline")
+    logger.info("=" * 60)
+
     llm = init_llm()
-    print("Phase 1: Market Intelligence...")
+
+    # Phase 1
+    logger.info("Phase 1: Market Intelligence...")
     themes = phase1_market_intel(llm)
     if not themes:
-        print("⚠️ 未生成题材列表，请检查搜索工具或LLM输出。")
+        logger.warning("No themes generated, check search tool or LLM output")
 
-    print("Phase 2: Quantitative Mining...")
+    # Phase 2
     candidates = phase2_quant_filter(themes)
     if candidates.empty:
-        print("⚠️ 初筛无结果：技术过滤或题材白名单匹配导致为空。")
+        logger.error("Phase 2: No candidates after filtering")
         return
 
-    print("Phase 3: Deep Research...")
+    # Phase 3
+    logger.info("Phase 3: Deep Research (Audit)...")
     audit_trace = REPORT_DIR / f"audit_trace_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jsonl"
-    ds_print(f"audit_trace_path={audit_trace}")
+    logger.debug(f"Audit trace: {audit_trace}")
     audits = phase3_deep_audit(llm, candidates, trace_path=audit_trace)
     candidates, audits = apply_audit_filter(candidates, audits)
     if candidates.empty:
-        print("⚠️ 尽调后无合格标的。")
+        logger.warning("No candidates passed audit filter")
         return
 
-    print("Phase 4: Visualization...")
+    # Phase 4
+    logger.info("Phase 4: Visualization...")
     chart_notes = phase4_plot_charts(candidates)
     signals = compute_signals(candidates)
 
-    print("Phase 5: Report...")
+    # Phase 5
+    logger.info("Phase 5: Report Generation...")
     md_path = phase5_report_with_deepseek(themes, candidates, audits, chart_notes, signals)
     pdf_path = build_pdf(md_path)
 
-    print(f"✅ 报告已生成: {md_path}")
+    logger.info("=" * 60)
+    logger.info(f"Report generated: {md_path}")
     if pdf_path:
-        print(f"✅ PDF 已生成: {pdf_path}")
+        logger.info(f"PDF generated: {pdf_path}")
     else:
-        print("⚠️ PDF 未生成，请检查 Pandoc。")
+        logger.info("PDF not generated (pandoc may not be available)")
+    logger.info("=" * 60)
 
 
 if __name__ == "__main__":

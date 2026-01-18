@@ -4,11 +4,15 @@ A股潜力成长组合筛选脚本
 基于"基本面成长+资金面博弈"双重分析体系
 """
 
+import logging
 import pandas as pd
 import numpy as np
 from pathlib import Path
 from datetime import datetime, timedelta
 import json
+
+# Setup logging
+logger = logging.getLogger(__name__)
 
 # ============ 筛选参数配置 ============
 MARKET_CAP_MIN = 20e8   # 50亿市值
@@ -24,21 +28,21 @@ EXCLUDE_ST = False       # 排除ST股票
 EXCLUDE_HIGH_PE = 100   # 排除PE过高的股票
 
 
-def load_stock_basic():
-    """加载股票基本信息"""
-    print("Loading stock basic info...")
+def load_stock_basic() -> pd.DataFrame:
+    """Load stock basic information."""
+    logger.info("Loading stock basic info...")
     df = pd.read_parquet('data/stock_basic/stock_basic.parquet')
     return df
 
 
-def load_stock_company():
-    """加载公司信息"""
-    print("Loading stock company info...")
+def load_stock_company() -> pd.DataFrame:
+    """Load company information."""
+    logger.info("Loading stock company info...")
     try:
         df = pd.read_parquet('data/stock_company/stock_company.parquet')
         return df
-    except Exception as e:
-        print(f"Warning: Could not load company info: {e}")
+    except (OSError, IOError) as e:
+        logger.warning(f"Could not load company info: {e}")
         return pd.DataFrame()
 
 
@@ -136,13 +140,16 @@ def analyze_stock_technical(df, current_date=None):
     return scores
 
 
-def screen_all_stocks():
+def screen_all_stocks() -> pd.DataFrame:
     """
-    对所有股票进行筛选
+    Screen all stocks using technical criteria.
+
+    Returns:
+        DataFrame of screened stocks with technical scores
     """
-    print("\n" + "="*60)
-    print("STEP 1: 初步筛选 - 30-50只宽名单")
-    print("="*60 + "\n")
+    logger.info("="*60)
+    logger.info("STEP 1: Initial screening - 30-50 candidates")
+    logger.info("="*60)
 
     # 加载基础数据
     stock_basic = load_stock_basic()
@@ -152,7 +159,7 @@ def screen_all_stocks():
     tick_dir = Path('data/stock_ticks')
     tick_files = list(tick_dir.glob('*.parquet'))
 
-    print(f"Found {len(tick_files)} stock data files")
+    logger.info(f"Found {len(tick_files)} stock data files")
 
     results = []
     skipped = {
@@ -163,7 +170,7 @@ def screen_all_stocks():
 
     for i, tick_file in enumerate(tick_files):
         if (i + 1) % 500 == 0:
-            print(f"Processed {i + 1}/{len(tick_files)} files...")
+            logger.info(f"Processed {i + 1}/{len(tick_files)} files...")
 
         ts_code = tick_file.stem
 
@@ -213,17 +220,15 @@ def screen_all_stocks():
 
         results.append(result)
 
-    print(f"\nProcessing complete!")
-    print(f"  Qualified: {len(results)}")
-    print(f"  Skipped: {sum(skipped.values())}")
+    logger.info(f"Processing complete! Qualified: {len(results)}, Skipped: {sum(skipped.values())}")
     for k, v in skipped.items():
-        print(f"    - {k}: {v}")
+        logger.debug(f"  - {k}: {v}")
 
     # 转换为DataFrame
     results_df = pd.DataFrame(results)
 
     if results_df.empty:
-        print("\nNo stocks passed the initial filter!")
+        logger.warning("No stocks passed the initial filter!")
         return None
 
     # 排序：按横盘得分 + 换手率综合排序
@@ -252,7 +257,7 @@ def screen_all_stocks():
 
 
 def save_results(df, output_file='screening_results.json'):
-    """保存筛选结果"""
+    """Save screening results to file."""
     # 转换为可序列化的格式
     records = df.head(50).to_dict('records')
 
@@ -266,14 +271,14 @@ def save_results(df, output_file='screening_results.json'):
     with open(output_file, 'w', encoding='utf-8') as f:
         json.dump(records, f, ensure_ascii=False, indent=2, default=str)
 
-    print(f"\nResults saved to {output_file}")
+    logger.info(f"Results saved to {output_file}")
 
 
 def print_summary(df, top_n=30):
-    """打印筛选结果摘要"""
-    print("\n" + "="*100)
-    print(f"TOP {top_n} 潜力成长股 - 初筛宽名单")
-    print("="*100)
+    """Print summary of screening results."""
+    logger.info("="*100)
+    logger.info(f"TOP {top_n} 潜力成长股 - 初筛宽名单")
+    logger.info("="*100)
 
     summary = df.head(top_n)[[
         'ts_code', 'name', 'industry', 'market_cap',
@@ -285,13 +290,13 @@ def print_summary(df, top_n=30):
     summary['market_cap_fmt'] = summary['market_cap'].apply(lambda x: f"{x/1e8:.2f}亿" if pd.notna(x) else "N/A")
     summary['pe_fmt'] = summary['pe'].apply(lambda x: f"{x:.2f}" if pd.notna(x) else "N/A")
 
-    print("\n{:<12} {:<8} {:<12} {:<10} {:<8} {:<8} {:<8} {:<8} {:<8} {:<6}".format(
+    logger.info("{:<12} {:<8} {:<12} {:<10} {:<8} {:<8} {:<8} {:<8} {:<8} {:<6}".format(
         "代码", "名称", "行业", "市值", "PE", "横盘分", "量能倍", "换手", "趋势", "交易所"
     ))
-    print("-" * 100)
+    logger.info("-" * 100)
 
     for _, row in summary.iterrows():
-        print("{:<12} {:<8} {:<12} {:<10} {:<8} {:<8} {:<8} {:<8} {:<8} {:<6}".format(
+        logger.info("{:<12} {:<8} {:<12} {:<10} {:<8} {:<8} {:<8} {:<8} {:<8} {:<6}".format(
             row['ts_code'], row['name'], row['industry'][:10],
             row['market_cap_fmt'], row['pe_fmt'],
             f"{row['consolidation_score']:.0f}",
@@ -301,38 +306,44 @@ def print_summary(df, top_n=30):
         ))
 
     # 统计信息
-    print("\n" + "="*100)
-    print("统计摘要")
-    print("="*100)
+    logger.info("="*100)
+    logger.info("统计摘要")
+    logger.info("="*100)
 
-    print(f"\n行业分布:")
+    logger.info(f"行业分布:")
     industry_dist = df.head(top_n)['industry'].value_counts().head(10)
     for industry, count in industry_dist.items():
-        print(f"  {industry}: {count}只")
+        logger.info(f"  {industry}: {count}只")
 
-    print(f"\n交易所分布:")
+    logger.info(f"交易所分布:")
     exchange_dist = df.head(top_n)['exchange'].value_counts()
     for exchange, count in exchange_dist.items():
-        print(f"  {exchange}: {count}只")
+        logger.info(f"  {exchange}: {count}只")
 
-    print(f"\n市值分布:")
+    logger.info(f"市值分布:")
     mc_bins = [50, 100, 200, 300]
     mc_labels = ['50-100亿', '100-200亿', '200-300亿']
     df['mc_bin'] = pd.cut(df['market_cap'] / 1e8, bins=mc_bins, labels=mc_labels, include_lowest=True)
     mc_dist = df.head(top_n)['mc_bin'].value_counts().sort_index()
     for mc_range, count in mc_dist.items():
-        print(f"  {mc_range}: {count}只")
+        logger.info(f"  {mc_range}: {count}只")
 
-    print(f"\n横盘得分分布:")
+    logger.info(f"横盘得分分布:")
     score_bins = [0, 40, 60, 80, 100]
     score_labels = ['0-40分', '40-60分', '60-80分', '80-100分']
     df['score_bin'] = pd.cut(df['consolidation_score'], bins=score_bins, labels=score_labels, include_lowest=True)
     score_dist = df.head(top_n)['score_bin'].value_counts().sort_index()
     for score_range, count in score_dist.items():
-        print(f"  {score_range}: {count}只")
+        logger.info(f"  {score_range}: {count}只")
 
 
 if __name__ == '__main__':
+    # Setup logging when run as script
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    )
+
     # 执行筛选
     results_df = screen_all_stocks()
 
@@ -346,6 +357,6 @@ if __name__ == '__main__':
         # 导出详细数据
         output_csv = f'screening_results_{datetime.now().strftime("%Y%m%d_%H%M%S")}.csv'
         results_df.head(50).to_csv(output_csv, index=False, encoding='utf-8-sig')
-        print(f"\n详细数据已导出至: {output_csv}")
+        logger.info(f"详细数据已导出至: {output_csv}")
     else:
-        print("\n筛选失败或无符合条件的股票")
+        logger.error("筛选失败或无符合条件的股票")
