@@ -35,6 +35,7 @@ from langchain_core.prompts import ChatPromptTemplate
 from deep_researcher import deepseek_chat, deepseek_plan_queries, qwen_chat, zhipu_search
 from screen_growth_stocks import screen_all_stocks
 from utils import (
+    DragonTigerList,
     extract_urls,
     is_recent,
     normalize_verdict,
@@ -46,6 +47,7 @@ from utils import (
     trace_append,
     truncate,
 )
+from llm_provider import get_llm_provider, LLMProvider
 
 # Setup logging
 logger = logging.getLogger(__name__)
@@ -117,6 +119,9 @@ class ThemeItem:
     keywords: List[str]
     summary: str
     sources: List[str]
+    validation_status: str = "unknown"  # confirmed/web_only/capital_only/weak
+    capital_signal: str = ""  # Capital flow summary from Dragon Tiger List
+    evidence: str = ""  # Combined evidence from web + capital
 
 
 @dataclass
@@ -501,7 +506,161 @@ def run_duckdb_sql(sql: str, context: Dict[str, pd.DataFrame]) -> str:
 
 
 def init_llm() -> ChatZhipuAI:
-    return ChatZhipuAI(model="glm-4-flash", temperature=0.2)
+    return ChatZhipuAI(model="glm-4-flash", temperature=0.2, timeout=300)
+
+
+def deepseek_merge_themes(
+    web_themes: List[ThemeItem],
+    capital_themes: Dict[str, Dict],
+    llm_provider: LLMProvider,
+) -> List[ThemeItem]:
+    """
+    Use DeepSeek to merge web search and Dragon Tiger List data.
+
+    This is the key multi-source fusion function that combines:
+    - Web Search: News sentiment, policy catalysts, market narratives
+    - Dragon Tiger List: Real capital flows, hot money preferences, institutional activity
+
+    Args:
+        web_themes: Themes from web search (phase 1a)
+        capital_themes: Themes from Dragon Tiger List analysis
+        llm_provider: LLM provider for DeepSeek
+
+    Returns:
+        List of merged ThemeItem with validation_status and capital_signal
+    """
+    from langchain_core.prompts import ChatPromptTemplate
+    from langchain_core.output_parsers import StrOutputParser
+
+    logger.info("Starting multi-source theme fusion with DeepSeek")
+
+    # Format capital themes for LLM
+    capital_summary = []
+    for theme_name, stats in capital_themes.items():
+        capital_summary.append(
+            f"""
+**{theme_name}**
+- 上榜次数: {stats['hit_count']}次
+- 累计净买入: {stats['net_buy'] / 1e8:.2f}亿元
+- 热门股票: {', '.join(stats['hot_stocks'][:5])}
+- 资金结构: 北上{stats['institution_mix']['north']*100:.0f}% + 机构{stats['institution_mix']['inst']*100:.0f}% + 游资{stats['institution_mix']['hot_money']*100:.0f}%
+- 趋势: {stats['trend']}
+"""
+        )
+
+    # Format web themes for LLM
+    web_summary = []
+    for theme in web_themes:
+        web_summary.append(
+            f"""
+**{theme.name}**
+- 关键词: {', '.join(theme.keywords)}
+- 摘要: {theme.summary}
+- 来源: {len(theme.sources)}个相关网页
+"""
+        )
+
+    prompt = ChatPromptTemplate.from_messages(
+        [
+            (
+                "system",
+                "你是资深A股策略分析师，擅长多源数据融合。请综合Web Search热点和龙虎榜资金流向，判断真正的市场主线。",
+            ),
+            (
+                "user",
+                """## 数据源1: Web Search热点（新闻情绪、政策催化）
+{web_summary}
+
+## 数据源2: 龙虎榜资金流向（真实行为、游资偏好）
+{capital_summary}
+
+## 融合原则
+1. **confirmed (主线题材)**: Web+龙虎榜都确认，重点布局
+2. **web_only (观察中)**: Web热点但无资金验证，需等待资金入场
+3. **capital_only (潜在机会)**: 有资金但无热点，深入挖掘背后的逻辑
+4. **weak (不关注)**: 两者都弱，不关注
+
+## 输出要求
+输出JSON格式，包含融合后的主题列表：
+```json
+{{
+  "themes": [
+    {{
+      "name": "主题名称",
+      "validation_status": "confirmed|web_only|capital_only|weak",
+      "keywords": ["关键词1", "关键词2"],
+      "summary": "整合后的证据（Web + 龙虎榜数据综合）",
+      "capital_signal": "资金信号总结（上榜次数、净买入、资金结构、趋势）",
+      "sources": ["url1", "url2"]
+    }}
+  ]
+}}
+```
+
+注意：
+- validation_status只选择4个值之一
+- summary要综合Web和龙虎榜双方面信息
+- capital_signal重点描述资金行为和趋势
+- 只保留最重要的3-5个主题
+""",
+            ),
+        ]
+    )
+
+    chain = prompt | llm_provider.get_llm("deepseek", temperature=0.2) | StrOutputParser()
+    result = chain.invoke({
+        "web_summary": "\n".join(web_summary),
+        "capital_summary": "\n".join(capital_summary) if capital_summary else "暂无龙虎榜数据",
+    })
+
+    logger.debug(f"DeepSeek fusion raw result: {truncate(result, 2000)}")
+
+    # Parse result
+    data = safe_json_loads(result)
+    logger.debug(f"DeepSeek fusion parsed data keys: {list(data.keys()) if isinstance(data, dict) else 'not a dict'}")
+    logger.debug(f"DeepSeek fusion themes count: {len(data.get('themes', [])) if isinstance(data, dict) else 0}")
+
+    merged_themes = []
+
+    # Map to keep sources from original web themes
+    sources_map = {t.name: t.sources for t in web_themes}
+
+    for item in data.get("themes", []):
+        name = item.get("name", "").strip()
+        if not name:
+            continue
+
+        # Use sources from original web theme if available
+        sources = item.get("sources", [])
+        if not sources and name in sources_map:
+            sources = sources_map[name]
+
+        merged_themes.append(
+            ThemeItem(
+                name=name,
+                keywords=[kw.strip() for kw in item.get("keywords", []) if kw.strip()],
+                summary=item.get("summary", "").strip(),
+                sources=sources,
+                validation_status=item.get("validation_status", "unknown"),
+                capital_signal=item.get("capital_signal", ""),
+                evidence=item.get("summary", ""),
+            )
+        )
+
+    logger.info(f"Multi-source fusion complete: {len(merged_themes)} themes")
+    for theme in merged_themes:
+        logger.info(f"  - {theme.name}: {theme.validation_status} | {theme.capital_signal[:50]}...")
+
+    # Fallback: if no themes returned, use web themes with default validation
+    if not merged_themes:
+        logger.warning("DeepSeek fusion returned 0 themes, falling back to web themes")
+        for theme in web_themes:
+            theme.validation_status = "web_only"
+            theme.capital_signal = "暂无龙虎榜数据验证"
+            theme.evidence = theme.summary
+        return web_themes
+
+    return merged_themes
 
 
 def phase1_market_intel(llm: ChatZhipuAI) -> List[ThemeItem]:
@@ -517,10 +676,9 @@ def phase1_market_intel(llm: ChatZhipuAI) -> List[ThemeItem]:
     logger.info("Starting Phase 1: Market Intelligence")
 
     current_year_month = datetime.now().strftime("%Y年%m月")
-    current_month = datetime.now().strftime("%Y年%m月")
     queries = [
-        f"A股 {current_month} 核心题材 最新热点",
-        f"龙虎榜 {current_month} 机构游资 重点板块 最新动向",
+        f"A股 {current_year_month} 核心题材 最新热点",
+        f"龙虎榜 {current_year_month} 机构游资 重点板块 最新动向",
         f"A股 {current_year_month} 涨停复盘 市场热点",
     ]
 
@@ -545,6 +703,10 @@ def phase1_market_intel(llm: ChatZhipuAI) -> List[ThemeItem]:
 
     logger.debug(f"Collected {len(all_urls)} unique URLs from searches")
 
+    # Use DeepSeek for theme extraction (to avoid Zhipu rate limits)
+    llm_provider = get_llm_provider()
+    deepseek_llm = llm_provider.get_llm("deepseek", temperature=0.2)
+
     prompt = ChatPromptTemplate.from_messages(
         [
             (
@@ -560,7 +722,7 @@ def phase1_market_intel(llm: ChatZhipuAI) -> List[ThemeItem]:
         ]
     )
 
-    chain = prompt | llm | StrOutputParser()
+    chain = prompt | deepseek_llm | StrOutputParser()
     result = chain.invoke({"results": json.dumps(raw_results, ensure_ascii=False)})
     data = safe_json_loads(result)
 
@@ -594,8 +756,21 @@ def phase1_market_intel(llm: ChatZhipuAI) -> List[ThemeItem]:
         return True
 
     filtered = [t for t in themes if is_actionable_theme(t)]
-    logger.info(f"Extracted {len(filtered)} market themes")
-    return filtered or themes
+    web_themes = filtered or themes
+    logger.info(f"Web search extracted {len(web_themes)} market themes")
+
+    # Phase 1b: Load Dragon Tiger List data for capital flow analysis
+    logger.info("Loading Dragon Tiger List data for multi-source fusion...")
+    dtl = DragonTigerList()
+    capital_themes = dtl.identify_hot_themes(days=30)
+    logger.info(f"Dragon Tiger List identified {len(capital_themes)} themes")
+
+    # Phase 1c: Multi-source fusion with DeepSeek
+    logger.info("Merging web search and Dragon Tiger List themes...")
+    llm_provider = get_llm_provider()
+    merged_themes = deepseek_merge_themes(web_themes, capital_themes, llm_provider)
+
+    return merged_themes
 
 
 def phase2_quant_filter(themes: List[ThemeItem]) -> pd.DataFrame:
@@ -603,17 +778,43 @@ def phase2_quant_filter(themes: List[ThemeItem]) -> pd.DataFrame:
     Phase 2: Screen stocks using quantitative technical criteria.
 
     Args:
-        themes: List of market themes for matching
+        themes: List of market themes for matching (should have validation_status)
 
     Returns:
         DataFrame of filtered candidate stocks
     """
     logger.info("Starting Phase 2: Quantitative Filtering")
 
+    # Filter to only confirmed themes (web + capital both confirmed)
+    confirmed_themes = [t for t in themes if t.validation_status == "confirmed"]
+    web_only_themes = [t for t in themes if t.validation_status == "web_only"]
+
+    # If no confirmed themes, fall back to web_only
+    if not confirmed_themes and web_only_themes:
+        logger.warning("No confirmed themes, falling back to web_only themes")
+        confirmed_themes = web_only_themes
+
+    if not confirmed_themes:
+        logger.warning("No confirmed or web_only themes, using all themes")
+        confirmed_themes = themes
+
+    logger.info(f"Phase 2 filtering with {len(confirmed_themes)} confirmed themes: {[t.name for t in confirmed_themes]}")
+
+    # Get stocks to exclude (recently on Dragon Tiger List)
+    dtl = DragonTigerList()
+    exclude_stocks = set(dtl.get_recent_toplist_stocks(days=60))
+    logger.info(f"Excluding {len(exclude_stocks)} stocks recently on Dragon Tiger List")
+
     screen_df = screen_all_stocks()
     if screen_df is None or screen_df.empty:
         logger.warning("No screening results from screen_all_stocks()")
         return pd.DataFrame()
+
+    # Exclude stocks recently on toplist
+    if exclude_stocks and "ts_code" in screen_df.columns:
+        before_count = len(screen_df)
+        screen_df = screen_df[~screen_df["ts_code"].isin(exclude_stocks)]
+        logger.info(f"Excluded {before_count - len(screen_df)} stocks recently on Dragon Tiger List")
 
     con = duckdb.connect()
     con.register("screen", screen_df)
@@ -633,12 +834,12 @@ def phase2_quant_filter(themes: List[ThemeItem]) -> pd.DataFrame:
     logger.info(f"Filtered to {len(filtered)} candidates by technical criteria")
 
     # Optional: use Qwen (small LLM) to match themes semantically
-    filtered = qwen_match_themes(themes, filtered, cache_path=Path(".cache/qwen_theme_match.json"))
+    filtered = qwen_match_themes(confirmed_themes, filtered, cache_path=Path(".cache/qwen_theme_match.json"))
     if "matched_themes" in filtered.columns:
         filtered = filtered.rename(columns={"matched_themes": "matched_themes_llm"})
 
     theme_keywords = []
-    for theme in themes:
+    for theme in confirmed_themes:
         expanded = expand_theme_keywords(theme)
         if theme.name and expanded:
             theme_keywords.append((theme.name, expanded))
@@ -1276,6 +1477,9 @@ def phase5_report_with_deepseek(
                 "keywords": t.keywords,
                 "summary": t.summary,
                 "sources": t.sources,
+                "validation_status": t.validation_status,
+                "capital_signal": t.capital_signal,
+                "evidence": t.evidence,
             }
             for t in themes
         ],
@@ -1291,7 +1495,11 @@ def phase5_report_with_deepseek(
         "## 报告结构："
         ""
         "### 【市场风向标】"
-        "每个主题分析：主题逻辑、资金验证、持续观察指标"
+        "每个主题分析："
+        "- 主题名称和验证状态（confirmed/web_only/capital_only/weak）"
+        "- 主题逻辑（从web search获取的新闻情绪、政策催化）"
+        "- **资金验证**<font color='purple'>（从龙虎榜获取的资金信号：上榜次数、净买入额、资金结构、趋势）</font>"
+        "- 持续观察指标"
         ""
         "### 【核心金股】表格"
         "列：股票、所属主线、形态特征、推荐理由（投资逻辑）"
@@ -1325,6 +1533,7 @@ def phase5_report_with_deepseek(
         "- 输出JSON：{\"final_report\":\"# Markdown...\"}"
         "- 引用真实URL，不使用占位符"
         "- 突出\"待时机\"：箱体上沿+温和放量(1.2-3.0x)+均线粘合"
+        "- **在【市场风向标】中展示资金验证信息**：对于confirmed主题，必须展示龙虎榜资金信号"
         ""
         "记住：展示思考过程，而非仅结论。"
     )

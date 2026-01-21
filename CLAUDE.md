@@ -139,6 +139,8 @@ Efficient columnar storage in `data/` directory:
 | `stock_company/` | Company details (introduction, business scope) |
 | `stock_ticks/` | Historical price data per stock |
 | `financial/` | Financial statements and metrics |
+| `top_list/` | Dragon Tiger List aggregated data (daily) |
+| `top_inst/` | Dragon Tiger List institutional details (daily) |
 
 ### Output Files
 
@@ -305,6 +307,63 @@ pip install pandas numpy duckdb mplfinance matplotlib \
 | matched_themes | AI-matched market themes |
 
 ---
+
+### 6. Dragon Tiger List (`data/top_list/YYYYMMDD.parquet`)
+
+**Source:** `pro.top_list()` API - Aggregated daily data
+
+| Column | Type | Description | Example | Alpha Signal |
+|--------|------|-------------|---------|--------------|
+| ts_code | string | Stock code | `000400.SZ` | - |
+| trade_date | string | Trade date (YYYYMMDD) | `20260119` | Time series |
+| name | string | Stock name | `许继电气` | - |
+| close | float | Closing price | `15.42` | - |
+| pct_change | float | Price change (%) | `10.03` | Strength signal |
+| turnover_rate | float | Turnover rate (%) | `15.42` | Activity level |
+| l_sell | float | Top5 sell total (RMB) | `1.46e+08` | - |
+| l_buy | float | Top5 buy total (RMB) | `3.03e+08` | - |
+| l_amount | float | Buy+Sell total (RMB) | `4.49e+08` | - |
+| net_amount | float | Net buy (buy-sell, RMB) | `1.57e+08` | **Capital direction** |
+| net_rate | float | Net buy rate (%) | `3.50` | **Capital intensity** |
+| amount_rate | float | Buy/total volume (%) | `7.63` | **Capital ratio** |
+| float_values | float | Float market cap | `1.56e+10` | - |
+| reason | string | Listing reason | `日涨幅偏离值达到7%` | Trigger condition |
+
+**Daily Records:** ~84 records/day
+
+**ETL:** `TopListManager.fetch_top_list_daily()` - Fetched via `python main.py toplist`
+
+**Alpha Signals:**
+- `net_amount`: Positive = net inflow, Negative = net outflow
+- `net_rate`: Higher = stronger capital conviction
+- `amount_rate`: Buy side dominance > 5% indicates institutional interest
+- Aggregate by industry over 30-day window to identify hot themes
+
+---
+
+### 7. Dragon Tiger List Institutional (`data/top_inst/YYYYMMDD.parquet`)
+
+**Source:** `pro.top_inst()` API - Per-institution trading details
+
+| Column | Type | Description | Example |
+|--------|------|-------------|---------|
+| trade_date | string | Trade date (YYYYMMDD) | `20260119` |
+| ts_code | string | Stock code | `000400.SZ` |
+| exalter | string | Institution/Branch name | `深股通专用` |
+| buy | float | Buy amount (RMB) | `3.03e+08` |
+| buy_rate | float | Buy / total volume (%) | `7.63` |
+| sell | float | Sell amount (RMB) | `1.46e+08` |
+| sell_rate | float | Sell / total volume (%) | `3.68` |
+| net_buy | float | Net amount (buy - sell) | `1.57e+08` |
+| side | int | 0=buy top5, 1=sell top5 | `0` |
+| reason | string | Listing reason | `日涨幅偏离值达到7%的前5只证券` |
+
+**ETL:** `TopListManager.fetch_top_inst_daily()` - Fetched via `python main.py toplist` (skip with `--no-inst`)
+
+**Alpha Signals:**
+- `exalter`: Track specific "smart money" institutions (e.g., 北向资金)
+- `net_buy`: Per-institution accumulation/distribution
+- Build institution reputation scoring
 
 ## Audit & Risk Assessment
 
