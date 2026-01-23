@@ -11,6 +11,8 @@ from pathlib import Path
 from datetime import datetime, timedelta
 import json
 
+from utils import EPSILON
+
 # Setup logging
 logger = logging.getLogger(__name__)
 
@@ -76,7 +78,7 @@ def analyze_stock_technical(df, current_date=None):
     # 波动率/振幅分析（120日箱体振幅）
     recent_high = recent["high"].max()
     recent_low = recent["low"].min()
-    recent_volatility = (recent_high - recent_low) / (recent_low + 1e-9)
+    recent_volatility = (recent_high - recent_low) / (recent_low + EPSILON)
 
     # 均线系统（MA20/60/120 纠缠度：最近20天的平均粘合程度）
     df["ma20"] = df["close"].rolling(20).mean()
@@ -85,7 +87,7 @@ def analyze_stock_technical(df, current_date=None):
     ma_recent = df[["ma20", "ma60", "ma120"]].tail(20).dropna()
     if ma_recent.empty:
         return None
-    daily_spread = (ma_recent.max(axis=1) - ma_recent.min(axis=1)) / (ma_recent.min(axis=1) + 1e-9)
+    daily_spread = (ma_recent.max(axis=1) - ma_recent.min(axis=1)) / (ma_recent.min(axis=1) + EPSILON)
     ma_spread = float(daily_spread.mean())
     ma_spread_std = float(daily_spread.std(ddof=0)) if len(daily_spread) > 1 else 0.0
     ma20 = float(df["ma20"].iloc[-1])
@@ -95,10 +97,10 @@ def analyze_stock_technical(df, current_date=None):
     # 量能分析
     avg_turnover = recent['turnover_rate'].mean()
     recent_turnover = df['turnover_rate'].tail(10).mean()
-    volume_boost = recent_turnover / (avg_turnover + 0.001)
+    volume_boost = recent_turnover / (avg_turnover + EPSILON)
 
     # 价格位置
-    price_position = (latest['close'] - recent_low) / (recent_high - recent_low + 0.001)
+    price_position = (latest['close'] - recent_low) / (recent_high - recent_low + EPSILON)
 
     # 3. 计算综合得分
     scores = {

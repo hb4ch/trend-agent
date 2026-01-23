@@ -16,6 +16,9 @@ from typing import Any, Dict, List, Optional
 # Configure logging for the entire project
 logger = logging.getLogger(__name__)
 
+# Numerical constants for safe division
+EPSILON = 1e-9  # Small value to prevent division by zero
+
 
 def setup_logging(
     level: int = logging.INFO,

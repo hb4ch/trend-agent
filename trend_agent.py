@@ -28,14 +28,15 @@ from matplotlib import font_manager
 import mplfinance as mpf
 import numpy as np
 import pandas as pd
-from langchain_community.chat_models import ChatZhipuAI
+from langchain_core.language_models import BaseChatModel
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
 
-from deep_researcher import deepseek_chat, deepseek_plan_queries, qwen_chat, zhipu_search
+from deep_researcher import deepseek_chat, deepseek_plan_queries, zhipu_search
 from screen_growth_stocks import screen_all_stocks
 from utils import (
     DragonTigerList,
+    EPSILON,
     extract_urls,
     is_recent,
     normalize_verdict,
@@ -47,7 +48,7 @@ from utils import (
     trace_append,
     truncate,
 )
-from llm_provider import get_llm_provider, LLMProvider
+from llm_provider import get_llm_provider, LLMProvider, invoke_llm_messages
 
 # Setup logging
 logger = logging.getLogger(__name__)
@@ -70,7 +71,6 @@ CHART_FONT_FALLBACKS = [
 
 # Configuration from environment
 DEBUG_DEEPSEEK = os.environ.get("DEBUG_DEEPSEEK", "").strip() in {"1", "true", "True", "YES", "yes"}
-USE_QWEN_THEME_MATCH = os.environ.get("USE_QWEN_THEME_MATCH", "").strip() in {"1", "true", "True", "YES", "yes"}
 REGULATORY_MAX_AGE_DAYS = int(os.environ.get("REGULATORY_MAX_AGE_DAYS", "730"))
 
 def setup_matplotlib_chinese_fonts() -> None:
@@ -200,7 +200,7 @@ def qwen_match_themes(
     Returns:
         DataFrame with additional 'matched_themes' column
     """
-    if not USE_QWEN_THEME_MATCH or not themes or candidates.empty or not qwen_chat:
+    if not themes or candidates.empty:
         return candidates
 
     cache: Dict[str, Any] = {}
@@ -281,7 +281,7 @@ def qwen_match_themes(
             },
         ]
 
-        content = qwen_chat(messages) if qwen_chat else None
+        content = invoke_llm_messages("qwen", messages, temperature=0.1)
         parsed = safe_json_loads(content or "")
         matches = parsed.get("matches", {}) if isinstance(parsed, dict) else {}
         notes = parsed.get("notes", {}) if isinstance(parsed, dict) else {}
@@ -323,61 +323,12 @@ def qwen_match_themes(
     return updated
 
 
-# Constants for theme expansion and filtering
+# Constants for regulatory audit
 PRIMARY_SOURCE_DOMAINS = (
     "cninfo.com.cn",
     "sse.com.cn",
     "szse.cn",
 )
-
-THEME_SYNONYMS: Dict[str, List[str]] = {
-    "芯片": ["半导体", "集成电路", "国产替代", "IC", "EDA", "光刻", "存储"],
-    "半导体": ["芯片", "集成电路", "国产替代", "IC", "EDA", "光刻", "存储"],
-    "医药": ["医疗", "创新药", "生物制药", "疫苗", "CRO", "医药生物", "生物", "诊断", "IVD", "体外诊断"],
-    "医疗": ["医药", "创新药", "生物制药", "疫苗", "CRO", "医药生物", "生物", "诊断", "IVD", "体外诊断"],
-    "生物": ["医药", "医疗", "创新药", "生物制药", "疫苗", "CRO", "医药生物", "诊断", "IVD"],
-    "航天": ["军工", "航空", "商业航天", "军工电子", "航材", "卫星", "航空航天", "航天电子", "中国卫通"],
-    "航空": ["军工", "航天", "商业航天", "军工电子", "航材", "卫星", "航空航天"],
-    "商业航天": ["军工", "航天", "航空", "军工电子", "航材", "卫星", "航空航天", "航天电子"],
-    "军工": ["航空", "航天", "军工电子", "航材", "兵装", "武器", "商业航天", "卫星"],
-    "AI": ["人工智能", "算力", "大模型", "数据中心", "服务器", "光模块", "CPO", "AI应用"],
-    "科技": ["AI", "人工智能", "算力", "大模型", "芯片", "半导体", "科技成长"],
-    "新能源": ["光伏", "风电", "锂电", "储能", "新能源车", "充电桩", "电池"],
-    "消费": ["零售", "食品饮料", "白酒", "家电", "旅游", "酒店"],
-    "券商": ["证券", "非银金融", "保险"],
-}
-
-
-def expand_theme_keywords(theme: ThemeItem) -> List[str]:
-    """
-    Expand theme keywords with synonyms.
-
-    Args:
-        theme: Theme item with name and keywords
-
-    Returns:
-        Expanded list of keywords including synonyms
-    """
-    keywords = set([theme.name] + list(theme.keywords or []))
-    expanded = set()
-    for kw in list(keywords):
-        expanded.add(kw)
-        # Check if any THEME_SYNONYMS key is in this keyword
-        for key, syns in THEME_SYNONYMS.items():
-            if key and key in kw:
-                for s in syns:
-                    expanded.add(s)
-        # Check if this keyword is a THEME_SYNONYMS key
-        if kw in THEME_SYNONYMS:
-            for s in THEME_SYNONYMS[kw]:
-                expanded.add(s)
-        # Check if this keyword matches any synonym value (reverse lookup)
-        for syns in THEME_SYNONYMS.values():
-            if kw in syns:
-                # Add all related terms from this synonym group
-                for s in syns:
-                    expanded.add(s)
-    return [k for k in expanded if isinstance(k, str) and k.strip()]
 
 
 def is_relevant_search_hit(name: str, symbol: str, hit: dict) -> bool:
@@ -505,8 +456,14 @@ def run_duckdb_sql(sql: str, context: Dict[str, pd.DataFrame]) -> str:
         return f"duckdb_error: {exc}"
 
 
-def init_llm() -> ChatZhipuAI:
-    return ChatZhipuAI(model="glm-4-flash", temperature=0.2, timeout=300)
+def init_llm():
+    """
+    Initialize and return the DeepSeek LLM for audit tasks.
+
+    Returns:
+        LangChain BaseChatModel configured for DeepSeek
+    """
+    return get_llm_provider().get_llm("deepseek", temperature=0.2)
 
 
 def deepseek_merge_themes(
@@ -663,7 +620,7 @@ def deepseek_merge_themes(
     return merged_themes
 
 
-def phase1_market_intel(llm: ChatZhipuAI) -> List[ThemeItem]:
+def phase1_market_intel(llm: BaseChatModel) -> List[ThemeItem]:
     """
     Phase 1: Extract market themes from web search.
 
@@ -833,55 +790,8 @@ def phase2_quant_filter(themes: List[ThemeItem]) -> pd.DataFrame:
 
     logger.info(f"Filtered to {len(filtered)} candidates by technical criteria")
 
-    # Optional: use Qwen (small LLM) to match themes semantically
+    # Use Qwen LLM for semantic theme matching
     filtered = qwen_match_themes(confirmed_themes, filtered, cache_path=Path(".cache/qwen_theme_match.json"))
-    if "matched_themes" in filtered.columns:
-        filtered = filtered.rename(columns={"matched_themes": "matched_themes_llm"})
-
-    theme_keywords = []
-    for theme in confirmed_themes:
-        expanded = expand_theme_keywords(theme)
-        if theme.name and expanded:
-            theme_keywords.append((theme.name, expanded))
-
-    def match_row(row: pd.Series) -> Dict[str, List[str]]:
-        """Match row to themes by keyword search."""
-        text = " ".join(
-            [
-                str(row.get("name", "")),
-                str(row.get("industry", "")),
-                str(row.get("main_business", "")),
-                str(row.get("business_scope", "")),
-                str(row.get("introduction", "")),
-            ]
-        )
-        matches = []
-        for theme_name, keywords in theme_keywords:
-            if any(kw in text for kw in keywords):
-                matches.append(theme_name)
-        return {"matched_themes": matches}
-
-    if theme_keywords:
-        filtered["matched_themes_kw"] = filtered.apply(
-            lambda row: match_row(row)["matched_themes"], axis=1
-        )
-    else:
-        filtered["matched_themes_kw"] = [[] for _ in range(len(filtered))]
-
-    def merge_matches(row: pd.Series) -> List[str]:
-        """Merge LLM and keyword matches."""
-        merged = []
-        for key in ("matched_themes_llm", "matched_themes_kw"):
-            val = row.get(key, [])
-            if not isinstance(val, list):
-                continue
-            for item in val:
-                item = str(item).strip()
-                if item and item not in merged:
-                    merged.append(item)
-        return merged
-
-    filtered["matched_themes"] = filtered.apply(merge_matches, axis=1)
 
     has_match = filtered["matched_themes"].apply(bool).sum() if "matched_themes" in filtered.columns else 0
     if has_match == 0:
@@ -943,7 +853,7 @@ def apply_audit_filter(
 
 
 def phase3_deep_audit(
-    llm: ChatZhipuAI, candidates: pd.DataFrame, trace_path: Optional[Path] = None
+    llm: BaseChatModel, candidates: pd.DataFrame, trace_path: Optional[Path] = None
 ) -> List[AuditResult]:
     top = candidates.head(15)
     audit_results: List[AuditResult] = []
@@ -1324,10 +1234,10 @@ def compute_signals(candidates: pd.DataFrame) -> Dict[str, Dict[str, object]]:
             continue
         box_top = float(df_120["high"].max())
         box_bottom = float(df_120["low"].min())
-        amplitude = (box_top - box_bottom) / (box_bottom + 1e-9)
+        amplitude = (box_top - box_bottom) / (box_bottom + EPSILON)
         close = float(df_120["close"].iloc[-1])
-        dist_to_top = (box_top - close) / (box_top + 1e-9)
-        pos = (close - box_bottom) / ((box_top - box_bottom) + 1e-9)
+        dist_to_top = (box_top - close) / (box_top + EPSILON)
+        pos = (close - box_bottom) / ((box_top - box_bottom) + EPSILON)
 
         ma20 = df["close"].rolling(20).mean()
         ma60 = df["close"].rolling(60).mean()
@@ -1337,18 +1247,18 @@ def compute_signals(candidates: pd.DataFrame) -> Dict[str, Dict[str, object]]:
             ma_spread_mean = None
             ma_spread_std = None
         else:
-            spread = (ma_recent.max(axis=1) - ma_recent.min(axis=1)) / (ma_recent.min(axis=1) + 1e-9)
+            spread = (ma_recent.max(axis=1) - ma_recent.min(axis=1)) / (ma_recent.min(axis=1) + EPSILON)
             ma_spread_mean = float(spread.mean())
             ma_spread_std = float(spread.std(ddof=0)) if len(spread) > 1 else 0.0
 
         if "turnover_rate" in df_120.columns and df_120["turnover_rate"].notna().any():
             base_turn = float(df_120["turnover_rate"].mean())
             recent_turn = float(df["turnover_rate"].tail(10).mean())
-            turn_mult = recent_turn / (base_turn + 1e-9)
+            turn_mult = recent_turn / (base_turn + EPSILON)
         else:
             base_vol = float(df_120["volume"].mean())
             recent_vol = float(df["volume"].tail(10).mean())
-            turn_mult = recent_vol / (base_vol + 1e-9)
+            turn_mult = recent_vol / (base_vol + EPSILON)
 
         ignition = 1.2 <= turn_mult <= 3.0
         ready = ignition and dist_to_top <= 0.03 and close >= float(df["close"].rolling(20).mean().iloc[-1])
