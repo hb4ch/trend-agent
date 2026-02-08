@@ -11,6 +11,7 @@ Implements a 5-phase pipeline:
 """
 
 import io
+import hashlib
 import json
 import logging
 import os
@@ -23,11 +24,10 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import duckdb
-import matplotlib as mpl
-from matplotlib import font_manager
-import mplfinance as mpf
 import numpy as np
 import pandas as pd
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 from langchain_core.language_models import BaseChatModel
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
@@ -72,43 +72,42 @@ CHART_FONT_FALLBACKS = [
 # Configuration from environment
 DEBUG_DEEPSEEK = os.environ.get("DEBUG_DEEPSEEK", "").strip() in {"1", "true", "True", "YES", "yes"}
 REGULATORY_MAX_AGE_DAYS = int(os.environ.get("REGULATORY_MAX_AGE_DAYS", "730"))
-
-def setup_matplotlib_chinese_fonts() -> None:
-    """Configure Chinese fonts for matplotlib and mplfinance."""
-    candidate_font_files = [
-        "/usr/share/fonts/adobe-source-han-sans/SourceHanSansCN-Regular.otf",
-        "/usr/share/fonts/adobe-source-han-sans/SourceHanSansCN-Normal.otf",
-        "/usr/share/fonts/adobe-source-han-sans/SourceHanSansCN-Light.otf",
-        "/usr/share/fonts/adobe-source-han-sans/SourceHanSansCN-Heavy.otf",
-    ]
-    for file_path in candidate_font_files:
-        try:
-            if Path(file_path).exists():
-                font_manager.fontManager.addfont(file_path)
-        except Exception:
-            pass
-
-    # Configure matplotlib for Chinese text
-    mpl.rcParams["font.family"] = "sans-serif"
-    mpl.rcParams["font.sans-serif"] = CHART_FONT_FALLBACKS
-    mpl.rcParams["axes.unicode_minus"] = False
-    mpl.rcParams["figure.figsize"] = (16, 10)
-
-    # mplfinance uses matplotlib's rcParams internally, so the above settings
-    # should apply. However, mplfinance's built-in styles override some settings.
-    # We need to explicitly override the style's font configuration.
-    try:
-        from mplfinance import _styles
-        # Modify the base styles dictionary directly
-        if hasattr(_styles, "_base_styles"):
-            for style_name in _styles._base_styles:
-                _styles._base_styles[style_name]["font.family"] = CHART_FONT
-                _styles._base_styles[style_name]["font.unicode_minus"] = False
-    except Exception:
-        pass
+THEME_CACHE_SCHEMA_VERSION = "2"
 
 
-setup_matplotlib_chinese_fonts()
+@dataclass
+class StrategyConfig:
+    """Runtime strategy configuration for alpha-sensitive controls."""
+
+    holding_horizon: str = "swing_2_8w"
+    toplist_exclusion_mode: str = "penalty"  # penalty|exclude_crowded|none
+    toplist_penalty_weight: float = 0.25
+    toplist_lookback_days: int = 60
+    toplist_crowded_min_hits: int = 4
+    hard_fail_require_recency: bool = True
+    hard_fail_max_age_days: int = REGULATORY_MAX_AGE_DAYS
+    hard_fail_reduce_materiality_threshold: float = 0.03
+    theme_cache_version: str = THEME_CACHE_SCHEMA_VERSION
+    max_names_per_theme: int = 4
+    max_names_per_industry: int = 4
+
+    @classmethod
+    def from_env(cls) -> "StrategyConfig":
+        """Build configuration from environment variables."""
+        return cls(
+            holding_horizon=os.environ.get("HOLDING_HORIZON", "swing_2_8w"),
+            toplist_exclusion_mode=os.environ.get("TOPLIST_EXCLUSION_MODE", "penalty"),
+            toplist_penalty_weight=float(os.environ.get("TOPLIST_PENALTY_WEIGHT", "0.25")),
+            toplist_lookback_days=int(os.environ.get("TOPLIST_LOOKBACK_DAYS", "60")),
+            toplist_crowded_min_hits=int(os.environ.get("TOPLIST_CROWDED_MIN_HITS", "4")),
+            hard_fail_require_recency=os.environ.get("HARD_FAIL_REQUIRE_RECENCY", "1").strip() in {"1", "true", "True", "YES", "yes"},
+            hard_fail_max_age_days=int(os.environ.get("HARD_FAIL_MAX_AGE_DAYS", str(REGULATORY_MAX_AGE_DAYS))),
+            hard_fail_reduce_materiality_threshold=float(os.environ.get("HARD_FAIL_REDUCE_MATERIALITY_THRESHOLD", "0.03")),
+            theme_cache_version=os.environ.get("THEME_CACHE_VERSION", THEME_CACHE_SCHEMA_VERSION),
+            max_names_per_theme=int(os.environ.get("MAX_NAMES_PER_THEME", "4")),
+            max_names_per_industry=int(os.environ.get("MAX_NAMES_PER_INDUSTRY", "4")),
+        )
+
 
 
 @dataclass
@@ -125,6 +124,28 @@ class ThemeItem:
 
 
 @dataclass
+class PositiveFinding:
+    """Positive finding from opportunity discovery research."""
+
+    category: str  # "contract", "customer", "policy", "technology", "expansion"
+    description: str
+    evidence: str
+    confidence: float  # 0.0-1.0
+    source_url: str
+    date: Optional[str] = None
+
+
+@dataclass
+class GrowthCatalyst:
+    """Growth catalyst identified during research."""
+
+    catalyst_type: str  # "policy", "tech_breakthrough", "market_expansion", "competitive_moat"
+    description: str
+    timeframe: str  # "near_term", "medium_term", "long_term"
+    confidence: float
+
+
+@dataclass
 class AuditResult:
     """Audit result for a stock-theme pair."""
 
@@ -134,6 +155,18 @@ class AuditResult:
     verdict: str
     rationale: str
     sources: List[str]
+    # New fields for opportunity discovery
+    positive_findings: List[PositiveFinding] = None
+    growth_catalysts: List[GrowthCatalyst] = None
+    confidence_score: float = 0.5
+    research_depth: str = "standard"
+    capital_signal_summary: str = ""
+
+    def __post_init__(self):
+        if self.positive_findings is None:
+            self.positive_findings = []
+        if self.growth_catalysts is None:
+            self.growth_catalysts = []
 
 
 def run_search(query: str) -> str:
@@ -187,7 +220,7 @@ def parse_search_payload(raw: Any) -> Dict[str, Any]:
 
 
 def qwen_match_themes(
-    themes: List[ThemeItem], candidates: pd.DataFrame, cache_path: Path
+    themes: List[ThemeItem], candidates: pd.DataFrame, cache_path: Path, cache_version: str = THEME_CACHE_SCHEMA_VERSION
 ) -> pd.DataFrame:
     """
     Match stocks to themes using Qwen LLM for semantic understanding.
@@ -218,6 +251,14 @@ def qwen_match_themes(
     ]
     if not theme_list:
         return candidates
+    theme_fingerprint_text = json.dumps(
+        sorted(
+            [{"name": t["name"], "keywords": sorted(t.get("keywords", [])), "summary": t.get("summary", "")} for t in theme_list],
+            key=lambda x: x["name"],
+        ),
+        ensure_ascii=False,
+    )
+    theme_set_hash = hashlib.sha256(theme_fingerprint_text.encode("utf-8", errors="ignore")).hexdigest()[:16]
 
     def row_fingerprint(row: pd.Series) -> str:
         """Create fingerprint for caching theme matches."""
@@ -235,9 +276,9 @@ def qwen_match_themes(
                 f"name={row.get('name','')}",
                 f"code={row.get('ts_code','')}",
                 f"industry={row.get('industry','')}",
-                f"main_business={str(row.get('main_business',''))[:200]}",
-                f"business_scope={str(row.get('business_scope',''))[:200]}",
-                f"intro={str(row.get('introduction',''))[:200]}",
+                f"main_business={str(row.get('main_business',''))}",  # Full text for semantic matching
+                f"business_scope={str(row.get('business_scope',''))}",  # Full text for semantic matching
+                f"intro={str(row.get('introduction',''))}",  # Full text for semantic matching
             ]
         )
 
@@ -247,7 +288,7 @@ def qwen_match_themes(
     batch = []
     batch_keys = []
     for _, row in updated.iterrows():
-        key = row_fingerprint(row)
+        key = f"{cache_version}:{theme_set_hash}:{row_fingerprint(row)}"
         if key in cache:
             val = cache.get(key)
             if isinstance(val, dict) and isinstance(val.get("matched"), list):
@@ -267,9 +308,20 @@ def qwen_match_themes(
             {
                 "role": "system",
                 "content": (
-                    "你是A股题材归属分类器。给定题材白名单和股票业务简介，判断该股票是否属于白名单题材。"
-                    "只允许从白名单里选择0-2个题材；不确定就返回空数组。输出严格JSON："
-                    '{"matches":{"ts_code":["theme1","theme2"]},"notes":{"ts_code":"reason"}}'
+                    "你是A股题材归属分类器，采用多层次关系分析。\n\n"
+                    "**匹配层次（按优先级）：**\n"
+                    "1. **直接匹配**：公司业务直接属于题材\n"
+                    "2. **间接关联**：\n"
+                    "   - 产业链上下游（供应商/客户关系）\n"
+                    "   - 技术生态关联（技术兼容、生态位）\n"
+                    "   - 市场传导逻辑（需求传导、政策联动）\n"
+                    "3. **概念延伸**：符合题材叙事逻辑或市场预期的标的\n\n"
+                    "**要求：**\n"
+                    "- 从白名单中选择0-2个最相关题材\n"
+                    "- 即使关联不直接，只要逻辑合理就可以选择\n"
+                    "- 完全无关才返回空数组\n"
+                    "- 输出严格JSON：{\"matches\":{\"ts_code\":[\"theme1\",\"theme2\"]},\"notes\":{\"ts_code\":\"reason\"}}\n"
+                    "- notes中说明关联逻辑（直接/间接/概念延伸）"
                 ),
             },
             {
@@ -294,6 +346,8 @@ def qwen_match_themes(
             picked = [str(x) for x in picked if str(x) in [t["name"] for t in theme_list]]
             matched_map[ts_code] = picked
             cache[fp] = {
+                "schema_version": cache_version,
+                "theme_set_hash": theme_set_hash,
                 "matched": picked,
                 "note": notes.get(ts_code) if isinstance(notes, dict) else ""
             }
@@ -323,12 +377,43 @@ def qwen_match_themes(
     return updated
 
 
-# Constants for regulatory audit
+# Constants for regulatory audit - Expanded source domains for opportunity discovery
+# Tier 1: Official Disclosures (highest credibility)
 PRIMARY_SOURCE_DOMAINS = (
-    "cninfo.com.cn",
-    "sse.com.cn",
-    "szse.cn",
+    "cninfo.com.cn",    # 巨潮资讯网 (official announcements)
+    "sse.com.cn",       # 上交所
+    "szse.cn",          # 深交所
 )
+
+# Tier 2: Financial News & Analysis (high credibility)
+SECONDARY_SOURCE_DOMAINS = (
+    "eastmoney.com",    # 东方财富
+    "10jqka.com.cn",    # 同花顺
+    "cls.cn",           # 财联社 (fast news)
+    "yicai.com",        # 第一财经
+    "caixin.com",       # 财新网
+    "wallstreetcn.com", # 华尔街见闻
+    "sina.com.cn",      # 新浪财经
+    "gelonghui.com",    # 格隆汇
+    "xueqiu.com",       # 雪球
+)
+
+# Tier 3: Government & Policy (for policy catalysts)
+POLICY_SOURCE_DOMAINS = (
+    "gov.cn",           # 政府门户
+    "ndrc.gov.cn",      # 发改委
+    "miit.gov.cn",      # 工信部
+    "most.gov.cn",      # 科技部
+)
+
+# Tier 4: Company Background (for due diligence)
+BACKGROUND_SOURCE_DOMAINS = (
+    "tianyancha.com",   # 天眼查
+    "qichacha.com",     # 企查查
+)
+
+# Combined for broader opportunity searches
+ALL_SOURCE_DOMAINS = PRIMARY_SOURCE_DOMAINS + SECONDARY_SOURCE_DOMAINS + POLICY_SOURCE_DOMAINS + BACKGROUND_SOURCE_DOMAINS
 
 
 def is_relevant_search_hit(name: str, symbol: str, hit: dict) -> bool:
@@ -343,6 +428,76 @@ def is_relevant_search_hit(name: str, symbol: str, hit: dict) -> bool:
     if symbol and symbol in text:
         return True
     return False
+
+
+def parse_reduce_ratio(text: str) -> Optional[float]:
+    """Parse reduce percentage from text (e.g. 3.5%)."""
+    if not text:
+        return None
+    for m in re.findall(r"(\d+(?:\.\d+)?)\s*%", text):
+        try:
+            return float(m) / 100.0
+        except ValueError:
+            continue
+    return None
+
+
+def is_material_reduce_event(text: str, threshold: float) -> bool:
+    """
+    Determine if a减持 event is materially large.
+
+    Treat clear liquidation language as material even without explicit ratio.
+    """
+    if not text:
+        return False
+    ratio = parse_reduce_ratio(text)
+    if ratio is not None and ratio >= threshold:
+        return True
+    liquidation_terms = ("清仓", "全部减持", "大比例减持", "集中竞价减持")
+    return any(term in text for term in liquidation_terms)
+
+
+def detect_hard_fail_reason(
+    hit: dict,
+    name: str,
+    symbol: str,
+    require_recency: bool,
+    max_age_days: int,
+    reduce_threshold: float,
+) -> Optional[str]:
+    """Classify a search hit into a hard-fail reason, if any."""
+    if not isinstance(hit, dict):
+        return None
+    if not is_relevant_search_hit(name, symbol, hit):
+        return None
+
+    if require_recency:
+        dt = parse_result_date(hit.get("date"))
+        if not is_recent(dt, max_age_days):
+            return None
+
+    title = str(hit.get("title", ""))
+    snippet = str(hit.get("snippet", ""))
+    text = f"{title} {snippet}"
+
+    if re.search(r"(被|遭|因|涉嫌).{0,12}(立案|立案调查)", text):
+        return "recent_investigation"
+    if re.search(r"(重大诉讼|未决诉讼|仲裁|诉讼事项)", text):
+        return "major_litigation"
+    if re.search(r"(终止上市|退市风险警示|暂停上市|强制退市)", text):
+        return "delisting_risk"
+    if re.search(r"(拟|计划).{0,12}减持|减持计划", text) and is_material_reduce_event(text, reduce_threshold):
+        return "material_reduction"
+    return None
+
+
+def extract_toplist_hit_counts(dtl: DragonTigerList, days: int) -> Dict[str, int]:
+    """Build per-stock toplist hit counts in a lookback window."""
+    df = dtl.load_recent_toplist(days=days)
+    if df is None or df.empty or "ts_code" not in df.columns:
+        return {}
+    counts = df["ts_code"].value_counts()
+    return {str(code): int(cnt) for code, cnt in counts.items()}
 
 
 def local_brief_for_audit(row: pd.Series) -> str:
@@ -429,6 +584,7 @@ def run_python(code: str, context: Dict) -> str:
     output = stdout.getvalue().strip()
     result = local_ctx.get("result")
     if result is not None:
+        logger.info(f"Python execution result: {result}")
         return f"{output}\nresult: {result}".strip()
     return output or "ok"
 
@@ -730,9 +886,15 @@ def phase1_market_intel(llm: BaseChatModel) -> List[ThemeItem]:
     return merged_themes
 
 
-def phase2_quant_filter(themes: List[ThemeItem]) -> pd.DataFrame:
+def phase2_quant_filter(themes: List[ThemeItem], config: Optional[StrategyConfig] = None) -> pd.DataFrame:
     """
-    Phase 2: Screen stocks using quantitative technical criteria.
+    Phase 2: Screen stocks using quantitative technical criteria with progressive relaxation.
+
+    Implements progressive relaxation when no theme matches are found:
+    1. Strict tier - highest quality criteria
+    2. Relaxed tier - moderate criteria
+    3. Loose tier - most lenient criteria
+    4. OFF_THEME_FALLBACK - best technical stocks (clearly marked)
 
     Args:
         themes: List of market themes for matching (should have validation_status)
@@ -740,7 +902,8 @@ def phase2_quant_filter(themes: List[ThemeItem]) -> pd.DataFrame:
     Returns:
         DataFrame of filtered candidate stocks
     """
-    logger.info("Starting Phase 2: Quantitative Filtering")
+    logger.info("Starting Phase 2: Quantitative Filtering with Progressive Relaxation")
+    config = config or StrategyConfig.from_env()
 
     # Filter to only confirmed themes (web + capital both confirmed)
     confirmed_themes = [t for t in themes if t.validation_status == "confirmed"]
@@ -757,53 +920,143 @@ def phase2_quant_filter(themes: List[ThemeItem]) -> pd.DataFrame:
 
     logger.info(f"Phase 2 filtering with {len(confirmed_themes)} confirmed themes: {[t.name for t in confirmed_themes]}")
 
-    # Get stocks to exclude (recently on Dragon Tiger List)
+    # Build toplist recency features for overcrowding control
     dtl = DragonTigerList()
-    exclude_stocks = set(dtl.get_recent_toplist_stocks(days=60))
-    logger.info(f"Excluding {len(exclude_stocks)} stocks recently on Dragon Tiger List")
+    toplist_hit_counts = extract_toplist_hit_counts(dtl, days=config.toplist_lookback_days)
+    logger.info(f"Loaded toplist hit counts for {len(toplist_hit_counts)} stocks")
 
     screen_df = screen_all_stocks()
     if screen_df is None or screen_df.empty:
         logger.warning("No screening results from screen_all_stocks()")
         return pd.DataFrame()
 
-    # Exclude stocks recently on toplist
-    if exclude_stocks and "ts_code" in screen_df.columns:
-        before_count = len(screen_df)
-        screen_df = screen_df[~screen_df["ts_code"].isin(exclude_stocks)]
-        logger.info(f"Excluded {before_count - len(screen_df)} stocks recently on Dragon Tiger List")
+    if "ts_code" in screen_df.columns:
+        screen_df = screen_df.copy()
+        screen_df["toplist_hit_count"] = screen_df["ts_code"].map(lambda x: toplist_hit_counts.get(str(x), 0))
+        screen_df["toplist_recency_score"] = screen_df["toplist_hit_count"].map(lambda x: min(1.0, float(x) / 5.0))
+
+        if config.toplist_exclusion_mode == "exclude_crowded":
+            before_count = len(screen_df)
+            screen_df = screen_df[screen_df["toplist_hit_count"] < config.toplist_crowded_min_hits]
+            logger.info(f"Excluded {before_count - len(screen_df)} ultra-crowded toplist stocks")
+        elif config.toplist_exclusion_mode == "none":
+            screen_df["toplist_recency_score"] = 0.0
 
     con = duckdb.connect()
     con.register("screen", screen_df)
-    filtered = con.execute(
-        """
+    theme_strength_map = {}
+    for theme in themes:
+        base = 0.35
+        if theme.validation_status == "confirmed":
+            base = 1.0
+        elif theme.validation_status == "web_only":
+            base = 0.75
+        elif theme.validation_status == "capital_only":
+            base = 0.7
+        elif theme.validation_status == "weak":
+            base = 0.4
+        if theme.capital_signal:
+            base = min(1.1, base + 0.05)
+        theme_strength_map[theme.name] = base
+
+    # Define progressive relaxation tiers
+    filter_tiers = [
+        {
+            "name": "Strict",
+            "consolidation": 70,
+            "ma_spread": 0.15,
+            "ma_spread_std": 0.03,
+            "volume_min": 1.2,
+            "volume_max": 3.0,
+        },
+        {
+            "name": "Relaxed",
+            "consolidation": 60,
+            "ma_spread": 0.20,
+            "ma_spread_std": 0.05,
+            "volume_min": 1.0,
+            "volume_max": 4.0,
+        },
+        {
+            "name": "Loose",
+            "consolidation": 50,
+            "ma_spread": 0.30,
+            "ma_spread_std": 0.08,
+            "volume_min": 0.8,
+            "volume_max": 5.0,
+        },
+    ]
+
+    # Try each tier until we find theme matches
+    for tier in filter_tiers:
+        filtered = con.execute(f"""
+            SELECT *
+            FROM screen
+            WHERE consolidation_score >= {tier['consolidation']}
+              AND ma_spread <= {tier['ma_spread']}
+              AND ma_spread_std <= {tier['ma_spread_std']}
+              AND volume_boost >= {tier['volume_min']}
+              AND volume_boost <= {tier['volume_max']}
+            ORDER BY composite_score DESC
+        """).df()
+
+        logger.info(f"Tier '{tier['name']}': {len(filtered)} candidates passed technical filter")
+
+        # Use Qwen LLM for semantic theme matching
+        filtered = qwen_match_themes(
+            confirmed_themes,
+            filtered,
+            cache_path=Path(".cache/qwen_theme_match.json"),
+            cache_version=config.theme_cache_version,
+        )
+
+        has_match = filtered["matched_themes"].apply(bool).sum() if "matched_themes" in filtered.columns else 0
+        logger.info(f"Tier '{tier['name']}': {has_match} candidates matched themes")
+
+        if has_match > 0:
+            # Found theme matches at this tier
+            filtered = filtered[filtered["matched_themes"].apply(bool)]
+            filtered["theme_strength_score"] = filtered["matched_themes"].map(
+                lambda arr: max([theme_strength_map.get(str(t), 0.5) for t in arr], default=0.0)
+            )
+            filtered["alpha_rank_score"] = (
+                filtered["composite_score"]
+                + filtered["theme_strength_score"] * 15.0
+                - filtered["toplist_recency_score"] * (config.toplist_penalty_weight * 10.0)
+            )
+            filtered["off_theme"] = False
+            filtered["filter_tier"] = tier['name']
+            filtered = filtered.sort_values("alpha_rank_score", ascending=False)
+            logger.info(f"Phase 2 complete: Using tier '{tier['name']}', {len(filtered.head(15))} candidates with theme matches")
+            return filtered.head(15)
+
+    # Final fallback - clearly mark as off-theme
+    logger.warning("No theme matches after all tiers, returning best technical stocks (OFF-THEME FALLBACK)")
+    # Get the best candidates from the loosest tier
+    filtered = con.execute(f"""
         SELECT *
         FROM screen
-        WHERE consolidation_score >= 70
-          AND ma_spread <= 0.15
-          AND ma_spread_std <= 0.03
-          AND volume_boost >= 1.2
-          AND volume_boost <= 3.0
+        WHERE consolidation_score >= 50
         ORDER BY composite_score DESC
-        """
-    ).df()
-
-    logger.info(f"Filtered to {len(filtered)} candidates by technical criteria")
-
-    # Use Qwen LLM for semantic theme matching
-    filtered = qwen_match_themes(confirmed_themes, filtered, cache_path=Path(".cache/qwen_theme_match.json"))
-
-    has_match = filtered["matched_themes"].apply(bool).sum() if "matched_themes" in filtered.columns else 0
-    if has_match == 0:
-        logger.warning(
-            "No candidates match current themes, returning top 15 by technical score (off_theme=True)"
-        )
-        filtered["off_theme"] = True
-        return filtered.head(15)
-
-    filtered = filtered[filtered["matched_themes"].apply(bool)]
-    filtered["off_theme"] = False
-    logger.info(f"Phase 2 complete: {len(filtered.head(15))} candidates with theme matches")
+    """).df()
+    filtered = qwen_match_themes(
+        confirmed_themes,
+        filtered,
+        cache_path=Path(".cache/qwen_theme_match.json"),
+        cache_version=config.theme_cache_version,
+    )
+    filtered["theme_strength_score"] = filtered["matched_themes"].map(
+        lambda arr: max([theme_strength_map.get(str(t), 0.5) for t in arr], default=0.0)
+    )
+    filtered["alpha_rank_score"] = (
+        filtered["composite_score"]
+        + filtered["theme_strength_score"] * 15.0
+        - filtered["toplist_recency_score"] * (config.toplist_penalty_weight * 10.0)
+    )
+    filtered["off_theme"] = filtered["matched_themes"].map(lambda arr: len(arr) == 0)
+    filtered["filter_tier"] = "OFF_THEME_FALLBACK"
+    filtered = filtered.sort_values("alpha_rank_score", ascending=False)
+    logger.info(f"Phase 2 complete: OFF_THEME_FALLBACK mode, returning top 15 technical candidates")
     return filtered.head(15)
 
 
@@ -852,16 +1105,217 @@ def apply_audit_filter(
     return filtered, filtered_audits
 
 
+def clamp01(value: float) -> float:
+    """Clamp numeric value to [0, 1]."""
+    return max(0.0, min(1.0, float(value)))
+
+
+def apply_diversification_constraints(
+    ranked: pd.DataFrame,
+    max_per_theme: int,
+    max_per_industry: int,
+    target_n: int = 15,
+) -> pd.DataFrame:
+    """Select top candidates while limiting concentration by theme/industry."""
+    selected_rows = []
+    theme_count: Dict[str, int] = {}
+    industry_count: Dict[str, int] = {}
+
+    for _, row in ranked.iterrows():
+        industry = str(row.get("industry", "") or "Unknown")
+        matched = row.get("matched_themes", [])
+        themes = matched if isinstance(matched, list) and matched else ["OFF_THEME"]
+        primary_theme = str(themes[0])
+        if theme_count.get(primary_theme, 0) >= max_per_theme:
+            continue
+        if industry_count.get(industry, 0) >= max_per_industry:
+            continue
+        selected_rows.append(row)
+        theme_count[primary_theme] = theme_count.get(primary_theme, 0) + 1
+        industry_count[industry] = industry_count.get(industry, 0) + 1
+        if len(selected_rows) >= target_n:
+            break
+
+    if len(selected_rows) < target_n:
+        selected_codes = {str(r["ts_code"]) for r in selected_rows}
+        for _, row in ranked.iterrows():
+            if str(row.get("ts_code", "")) in selected_codes:
+                continue
+            selected_rows.append(row)
+            if len(selected_rows) >= target_n:
+                break
+
+    return pd.DataFrame(selected_rows) if selected_rows else ranked.head(target_n)
+
+
+def rank_candidates_for_alpha(
+    candidates: pd.DataFrame,
+    audits: List[AuditResult],
+    signals: Dict[str, Dict[str, object]],
+    config: Optional[StrategyConfig] = None,
+) -> pd.DataFrame:
+    """
+    Build alpha-oriented ranking fields and return diversified top candidates.
+    """
+    if candidates is None or candidates.empty:
+        return candidates
+    config = config or StrategyConfig.from_env()
+    ranked = candidates.copy()
+
+    from deep_researcher import get_source_tier_weight
+
+    audit_by_code: Dict[str, List[AuditResult]] = {}
+    for audit in audits:
+        audit_by_code.setdefault(audit.ts_code, []).append(audit)
+
+    verdict_risk = {"pass": 0.1, "warn": 0.45, "fail": 0.95}
+
+    def audit_features(ts_code: str) -> Dict[str, float]:
+        items = audit_by_code.get(ts_code, [])
+        if not items:
+            return {
+                "audit_risk_score": 0.5,
+                "positive_finding_count": 0.0,
+                "source_quality_score": 0.0,
+                "catalyst_diversity": 0.0,
+            }
+        worst = max(verdict_risk.get(item.verdict, 0.45) for item in items)
+        findings = []
+        catalyst_types = set()
+        source_scores = []
+        for item in items:
+            findings.extend(item.positive_findings or [])
+            for c in (item.growth_catalysts or []):
+                catalyst_types.add(c.catalyst_type)
+            for src in (item.sources or []):
+                source_scores.append(get_source_tier_weight(src))
+        source_quality = float(np.mean(source_scores)) if source_scores else 0.0
+        return {
+            "audit_risk_score": worst,
+            "positive_finding_count": float(len(findings)),
+            "source_quality_score": source_quality,
+            "catalyst_diversity": float(len(catalyst_types)),
+        }
+
+    alpha_rows = []
+    for _, row in ranked.iterrows():
+        ts_code = str(row["ts_code"])
+        sig = signals.get(ts_code, {})
+        af = audit_features(ts_code)
+        breakout_window_ok = 1.0 if sig.get("breakout_window_ok") else 0.0
+        already_breakout = 1.0 if sig.get("already_breakout") else 0.0
+        extended_breakout = 1.0 if sig.get("extended_breakout") else 0.0
+        turnover_mult = float(sig.get("turnover_mult", row.get("volume_boost", 1.0)) or 1.0)
+        volume_quality = clamp01(1.0 - abs(turnover_mult - 1.8) / 1.8)
+        ma_spread = float(row.get("ma_spread", 0.3) or 0.3)
+        ma_comp = clamp01(1.0 - ma_spread / 0.30)
+        theme_strength = clamp01(float(row.get("theme_strength_score", 0.0)))
+        source_quality = clamp01(af["source_quality_score"])
+        finding_score = clamp01(af["positive_finding_count"] / 4.0)
+        catalyst_score = clamp01(af["catalyst_diversity"] / 3.0)
+        audit_safe = 1.0 - clamp01(af["audit_risk_score"])
+        toplist_recency = clamp01(float(row.get("toplist_recency_score", 0.0) or 0.0))
+        blowoff_penalty = clamp01(max(0.0, turnover_mult - 3.0) / 2.0)
+        breakout_penalty = 0.20 if extended_breakout > 0 else (0.08 if already_breakout > 0 else 0.0)
+        overcrowding_penalty = clamp01(0.65 * toplist_recency + 0.35 * blowoff_penalty)
+
+        score_01 = (
+            0.22 * breakout_window_ok +
+            0.17 * volume_quality +
+            0.16 * ma_comp +
+            0.15 * theme_strength +
+            0.10 * finding_score +
+            0.07 * catalyst_score +
+            0.06 * source_quality +
+            0.07 * audit_safe
+            - 0.12 * overcrowding_penalty
+            - breakout_penalty
+        )
+        score_01 = clamp01(score_01)
+        alpha_rows.append(
+            {
+                "ts_code": ts_code,
+                "audit_risk_score": af["audit_risk_score"],
+                "positive_finding_count": af["positive_finding_count"],
+                "source_quality_score": source_quality,
+                "catalyst_diversity": af["catalyst_diversity"],
+                "alpha_rank_score": score_01 * 100.0,
+            }
+        )
+
+    alpha_df = pd.DataFrame(alpha_rows)
+    ranked = ranked.merge(alpha_df, on="ts_code", how="left", suffixes=("", "_new"))
+    if "alpha_rank_score_new" in ranked.columns:
+        ranked["alpha_rank_score"] = ranked["alpha_rank_score_new"]
+        ranked = ranked.drop(columns=["alpha_rank_score_new"])
+
+    ranked = ranked.sort_values("alpha_rank_score", ascending=False)
+    ranked = apply_diversification_constraints(
+        ranked,
+        max_per_theme=config.max_names_per_theme,
+        max_per_industry=config.max_names_per_industry,
+        target_n=15,
+    )
+    return ranked.reset_index(drop=True)
+
+
 def phase3_deep_audit(
-    llm: BaseChatModel, candidates: pd.DataFrame, trace_path: Optional[Path] = None
+    llm: BaseChatModel,
+    candidates: pd.DataFrame,
+    trace_path: Optional[Path] = None,
+    themes: Optional[List[ThemeItem]] = None,
+    config: Optional[StrategyConfig] = None,
 ) -> List[AuditResult]:
+    """
+    Phase 3: Deep Research with Opportunity-First, Then Adversarial Audit.
+
+    Two-pass research strategy:
+    1. **Opportunity Discovery Pass**: Find positive catalysts (contracts, tech, policy, expansion)
+    2. **Adversarial Veto Pass**: Due diligence to check for hard fails
+
+    Args:
+        llm: Language model for processing
+        candidates: DataFrame of candidate stocks
+        trace_path: Optional path for audit trace
+        themes: Optional list of themes with capital signals
+
+    Returns:
+        List of AuditResult with both positive findings and veto status
+    """
+    from deep_researcher import (
+        generate_opportunity_queries,
+        extract_positive_findings,
+        get_source_tier_weight,
+    )
+
+    config = config or StrategyConfig.from_env()
     top = candidates.head(15)
     audit_results: List[AuditResult] = []
-    prompt = ChatPromptTemplate.from_messages(
+
+    # Build theme capital signal map
+    theme_capital_map = {}
+    if themes:
+        for t in themes:
+            if t.name and t.capital_signal:
+                theme_capital_map[t.name] = t.capital_signal
+
+    audit_prompt = ChatPromptTemplate.from_messages(
         [
             (
                 "system",
-                "你是A股审计级尽调员（红蓝军对抗），必须严守一票否决：立案调查/未结重大诉讼/巨额减持/伪概念（无订单无客户）= fail。",
+                "你是A股尽调员，评估股票风险。\n"
+                "**一票否决（fail）条件（必须有明确证据）：**\n"
+                "- 正在被立案调查（不是历史已结案）\n"
+                "- 正在进行的重大诉讼（不是历史诉讼）\n"
+                "- 近期公告的大规模减持计划\n"
+                "- 退市风险警示（*ST）\n\n"
+                "**存疑（warn）条件：**\n"
+                "- 监管函、问询函（但已回复）\n"
+                "- 业绩不确定性\n"
+                "- 证据不足无法验证\n\n"
+                "**通过（pass）条件：**\n"
+                "- 无明显风险，有正面业务证据\n\n"
+                "注意：缺少证据≠fail，应判warn。只有明确的重大风险才判fail。",
             ),
             (
                 "user",
@@ -871,15 +1325,120 @@ def phase3_deep_audit(
             ),
         ]
     )
-    chain = prompt | llm | StrOutputParser()
+    audit_chain = audit_prompt | llm | StrOutputParser()
 
     for _, row in top.iterrows():
         name = row["name"]
         symbol = stock_symbol(row["ts_code"])
-        themes = row.get("matched_themes", []) or ["未明确题材"]
-        for theme in themes:
-            logger.debug(f"Audit start: stock={name} theme={theme}")
-            trace_append(trace_path, "audit_start", {"ts_code": row["ts_code"], "name": name, "theme": theme})
+        matched_themes = row.get("matched_themes", []) or ["未明确题材"]
+
+        for theme in matched_themes:
+            logger.debug(f"Research start: stock={name} theme={theme}")
+            trace_append(trace_path, "research_start", {"ts_code": row["ts_code"], "name": name, "theme": theme})
+
+            # Get capital signal for this theme
+            capital_signal = theme_capital_map.get(theme, "")
+
+            # ============ PASS 1: Opportunity Discovery ============
+            logger.debug(f"Opportunity discovery pass: stock={name}")
+            trace_append(trace_path, "opportunity_pass_start", {"ts_code": row["ts_code"], "name": name, "theme": theme})
+
+            positive_findings: List[PositiveFinding] = []
+            growth_catalysts: List[GrowthCatalyst] = []
+            opportunity_urls = []
+            opportunity_evidence = []
+
+            # Generate opportunity queries (without site: restrictions for broader coverage)
+            opportunity_queries = generate_opportunity_queries(name, theme)
+
+            for q_info in opportunity_queries:
+                query = q_info["query"]
+                category = q_info["category"]
+                logger.debug(f"Opportunity search: category={category} q={query}")
+
+                raw = run_search(query)
+                parsed = parse_search_payload(raw)
+                urls = parsed.get("urls", [])
+                search_results = parsed.get("results", [])
+
+                trace_append(trace_path, "opportunity_search", {
+                    "ts_code": row["ts_code"],
+                    "name": name,
+                    "theme": theme,
+                    "category": category,
+                    "query": query,
+                    "urls": urls,
+                })
+
+                # Extract positive findings
+                findings = extract_positive_findings(search_results, name, category)
+                for f in findings:
+                    positive_findings.append(PositiveFinding(
+                        category=f["category"],
+                        description=f["description"],
+                        evidence=f["evidence"],
+                        confidence=f["confidence"],
+                        source_url=f["source_url"],
+                        date=f.get("date"),
+                    ))
+                    if f["source_url"] not in opportunity_urls:
+                        opportunity_urls.append(f["source_url"])
+
+                # Collect evidence snippets for catalyst synthesis
+                for result in search_results[:3]:
+                    if isinstance(result, dict):
+                        snippet = result.get("snippet", "")
+                        if snippet and name in snippet:
+                            opportunity_evidence.append(f"[{category}] {snippet[:200]}")
+
+            # Synthesize growth catalysts from findings
+            if positive_findings:
+                catalyst_categories = {}
+                for f in positive_findings:
+                    if f.category not in catalyst_categories:
+                        catalyst_categories[f.category] = []
+                    catalyst_categories[f.category].append(f)
+
+                for cat, findings_list in catalyst_categories.items():
+                    if len(findings_list) >= 1:
+                        avg_confidence = sum(f.confidence for f in findings_list) / len(findings_list)
+                        # Map category to catalyst type
+                        catalyst_type_map = {
+                            "policy_driver": "policy",
+                            "tech_breakthrough": "tech_breakthrough",
+                            "market_expansion": "market_expansion",
+                            "competitive_moat": "competitive_moat",
+                            "contract_evidence": "contract_evidence",
+                        }
+                        catalyst_type = catalyst_type_map.get(cat, cat)
+
+                        # Determine timeframe based on evidence
+                        timeframe = "medium_term"  # Default
+                        if any("近期" in f.description or "已" in f.description for f in findings_list):
+                            timeframe = "near_term"
+                        elif any("规划" in f.description or "计划" in f.description for f in findings_list):
+                            timeframe = "long_term"
+
+                        growth_catalysts.append(GrowthCatalyst(
+                            catalyst_type=catalyst_type,
+                            description=findings_list[0].description,
+                            timeframe=timeframe,
+                            confidence=avg_confidence,
+                        ))
+
+            logger.info(f"Opportunity discovery: {len(positive_findings)} findings, {len(growth_catalysts)} catalysts for {name}")
+            trace_append(trace_path, "opportunity_pass_done", {
+                "ts_code": row["ts_code"],
+                "name": name,
+                "theme": theme,
+                "finding_count": len(positive_findings),
+                "catalyst_count": len(growth_catalysts),
+            })
+
+            # ============ PASS 2: Adversarial Veto Audit ============
+            logger.debug(f"Adversarial veto pass: stock={name}")
+            trace_append(trace_path, "veto_pass_start", {"ts_code": row["ts_code"], "name": name, "theme": theme})
+
             merged = {}
             evidence_snippets = [f"[local]\n{local_brief_for_audit(row)}"]
             used_queries = set()
@@ -887,12 +1446,6 @@ def phase3_deep_audit(
             rationale = ""
             sources = []
 
-            hard_fail_patterns = [
-                re.compile(r"(被|遭|因|涉嫌).{0,12}(立案|立案调查)"),
-                re.compile(r"(重大诉讼|未决诉讼|仲裁|诉讼事项)"),
-                re.compile(r"(拟|计划).{0,12}减持|减持计划"),
-                re.compile(r"(终止上市|退市风险警示|暂停上市|强制退市)"),
-            ]
             severe_regulatory_patterns = [
                 re.compile(r"(行政处罚|处罚决定书|纪律处分|公开谴责|市场禁入)"),
             ]
@@ -900,27 +1453,21 @@ def phase3_deep_audit(
                 re.compile(r"(监管函|问询函|关注函|责令改正|监管措施决定书)"),
             ]
             positive_terms = [
-                "订单",
-                "中标",
-                "客户",
-                "签约",
-                "签署",
-                "签订",
-                "合同",
-                "协议",
-                "合作",
-                "供货",
-                "落地",
-                "框架协议",
+                "订单", "中标", "客户", "签约", "签署", "签订",
+                "合同", "协议", "合作", "供货", "落地", "框架协议",
             ]
+
             executed_passes = 0
             for pass_id in range(1, 4):
                 if pass_id == 1:
-                    theme_hint = "" if theme in {"未明确题材", "未匹配主线"} else f" {theme}"
+                    # First pass: balanced check - positive verification + focused risk check
                     queries = [
-                        f"{name}{theme_hint} 实锤 订单 客户 概念",
-                        f"site:cninfo.com.cn {symbol} {name} 重大合同",
-                        f"site:cninfo.com.cn {symbol} {name} 监管函 问询函 处罚",
+                        # Positive verification (2 queries)
+                        f"site:cninfo.com.cn {symbol} {name} 重大合同 中标 签约",
+                        f"site:cninfo.com.cn {symbol} {name} 投资者关系",
+                        # Focused risk check (2 queries - only critical risks)
+                        f"site:cninfo.com.cn {symbol} {name} 立案调查",
+                        f"site:cninfo.com.cn {symbol} {name} 退市 风险警示",
                     ]
                 else:
                     plan = deepseek_plan_queries(
@@ -930,26 +1477,24 @@ def phase3_deep_audit(
                         pass_id=pass_id,
                     )
                     if plan is not None:
-                        logger.debug(f"Audit plan pass={pass_id}: {truncate(pretty_print(plan), 1200)}")
-                        trace_append(trace_path, "audit_plan", {"ts_code": row["ts_code"], "name": name, "theme": theme, "pass_id": pass_id, "plan": plan})
+                        logger.debug(f"Veto plan pass={pass_id}: {truncate(pretty_print(plan), 1200)}")
+                        trace_append(trace_path, "veto_plan", {"ts_code": row["ts_code"], "name": name, "theme": theme, "pass_id": pass_id, "plan": plan})
                     if plan and plan.get("stop"):
-                        logger.debug(f"Audit plan stop pass={pass_id} reason={plan.get('reason','')}")
+                        logger.debug(f"Veto plan stop pass={pass_id} reason={plan.get('reason','')}")
+                        executed_passes = pass_id
                         break
                     queries = plan.get("queries") if plan else None
                     if not queries:
                         queries = [
                             f"site:cninfo.com.cn {symbol} {name} 投资者关系 活动记录表",
                             f"site:cninfo.com.cn {symbol} {name} 中标 公告",
-                            f"site:cninfo.com.cn {symbol} {name} 立案 调查",
-                            f"site:cninfo.com.cn {symbol} {name} 重大诉讼 仲裁",
-                            f"site:cninfo.com.cn {symbol} {name} 减持 计划",
                         ]
 
                 for query in queries:
                     if query in used_queries:
                         continue
                     used_queries.add(query)
-                    logger.debug(f"Audit search pass={pass_id} q={query}")
+                    logger.debug(f"Veto search pass={pass_id} q={query}")
                     raw = run_search(query)
                     parsed = parse_search_payload(raw)
                     urls = parsed.get("urls", [])
@@ -965,7 +1510,6 @@ def phase3_deep_audit(
                         if relevant_hits:
                             search_results = relevant_hits
                         else:
-                            # Don't let strict filtering zero-out the evidence; keep top hits for planning.
                             search_results = [hit for hit in search_results if isinstance(hit, dict)]
                         parts = []
                         for item in search_results[:5]:
@@ -981,31 +1525,17 @@ def phase3_deep_audit(
                     raw_clean = "\n".join([str(summary or "").strip(), items_text]).strip()
                     if not raw_clean:
                         url_preview = ", ".join(urls[:3]) if isinstance(urls, list) else ""
-                        raw_clean = f"未找到可用摘要/结果（可能被过滤）。query={query} urls={url_preview}"
+                        raw_clean = f"未找到可用摘要/结果。query={query} urls={url_preview}"
                     merged[f"pass{pass_id}_{len(merged)+1}"] = {
                         "query": query,
                         "raw": raw_clean,
                         "urls": urls,
                         "results": search_results if isinstance(search_results, list) else [],
                     }
-                    trace_append(trace_path, "audit_search", {"ts_code": row["ts_code"], "name": name, "theme": theme, "pass_id": pass_id, "query": query, "urls": urls})
-                    trace_append(
-                        trace_path,
-                        "audit_search_snippet",
-                        {
-                            "ts_code": row["ts_code"],
-                            "name": name,
-                            "theme": theme,
-                            "pass_id": pass_id,
-                            "query": query,
-                            "raw_snippet": truncate(raw_clean, 1200),
-                        },
-                    )
+                    trace_append(trace_path, "veto_search", {"ts_code": row["ts_code"], "name": name, "theme": theme, "pass_id": pass_id, "query": query, "urls": urls})
                     evidence_snippets.append(raw_clean[:800])
 
-                merged_text = "\n".join(
-                    [str(item.get("raw", "")) for item in merged.values()]
-                )
+                merged_text = "\n".join([str(item.get("raw", "")) for item in merged.values()])
                 flat_urls = []
                 for item in merged.values():
                     for url in item.get("urls", []):
@@ -1022,57 +1552,76 @@ def phase3_deep_audit(
                         if not isinstance(hit, dict):
                             continue
                         dt = parse_result_date(hit.get("date"))
-                        if not is_recent(dt, REGULATORY_MAX_AGE_DAYS):
+                        if not is_recent(dt, config.hard_fail_max_age_days):
                             continue
-                        hay = " ".join(
-                            [
-                                str(hit.get("title", "")),
-                                str(hit.get("snippet", "")),
-                            ]
-                        )
+                        hay = " ".join([str(hit.get("title", "")), str(hit.get("snippet", ""))])
                         if any(p.search(hay) for p in severe_regulatory_patterns):
                             recent_severe_reg = True
                         if any(p.search(hay) for p in minor_regulatory_patterns):
                             recent_minor_reg = True
 
-                # Hard veto: investigation / delisting / major litigation / huge reduction (not time-scoped here)
-                if flat_urls and any(p.search(merged_text) for p in hard_fail_patterns):
+                # Hard veto checks - only with relevant and (optionally) recent evidence
+                hard_fail_reason = None
+                hard_fail_sources: List[str] = []
+                for item in merged.values():
+                    hits = item.get("results", [])
+                    if not isinstance(hits, list):
+                        continue
+                    for hit in hits:
+                        reason = detect_hard_fail_reason(
+                            hit=hit,
+                            name=name,
+                            symbol=symbol,
+                            require_recency=config.hard_fail_require_recency,
+                            max_age_days=config.hard_fail_max_age_days,
+                            reduce_threshold=config.hard_fail_reduce_materiality_threshold,
+                        )
+                        if reason:
+                            hard_fail_reason = reason
+                            url = str(hit.get("url", "")).strip()
+                            if url:
+                                hard_fail_sources.append(url)
+                    if hard_fail_reason:
+                        break
+
+                if hard_fail_reason:
                     verdict = "fail"
-                    rationale = (
-                        "触发一票否决关键词（立案/重大诉讼/巨额减持/退市风险等），直接剔除。"
-                    )
-                    sources = flat_urls[:5]
-                    logger.debug("Audit hard fail: matched patterns")
-                    trace_append(trace_path, "audit_hard_fail", {"ts_code": row["ts_code"], "name": name, "theme": theme, "sources": sources})
+                    reason_map = {
+                        "recent_investigation": "近期开启立案调查，按审计口径直接剔除。",
+                        "major_litigation": "近期重大诉讼/仲裁风险明确，按审计口径直接剔除。",
+                        "delisting_risk": "近期出现退市风险信号，按审计口径直接剔除。",
+                        "material_reduction": "近期大比例减持计划明确，按审计口径直接剔除。",
+                    }
+                    rationale = reason_map.get(hard_fail_reason, "触发一票否决条件，直接剔除。")
+                    dedup_urls = []
+                    for u in hard_fail_sources + flat_urls:
+                        if u and u not in dedup_urls:
+                            dedup_urls.append(u)
+                    sources = dedup_urls[:5]
+                    logger.debug(f"Veto hard fail: reason={hard_fail_reason}")
+                    trace_append(trace_path, "veto_hard_fail", {"ts_code": row["ts_code"], "name": name, "theme": theme, "reason": hard_fail_reason, "sources": sources})
                     break
 
-                # Regulatory letters/penalties: must be recent to count as veto evidence
                 if recent_severe_reg:
                     verdict = "fail"
-                    rationale = f"检索到近{REGULATORY_MAX_AGE_DAYS}天内的行政处罚/纪律处分等严重监管事件，按审计口径剔除。"
+                    rationale = f"检索到近{config.hard_fail_max_age_days}天内的行政处罚/纪律处分等严重监管事件，按审计口径剔除。"
                     sources = flat_urls[:5]
-                    trace_append(trace_path, "audit_hard_fail", {"ts_code": row["ts_code"], "name": name, "theme": theme, "sources": sources})
+                    trace_append(trace_path, "veto_hard_fail", {"ts_code": row["ts_code"], "name": name, "theme": theme, "sources": sources})
                     break
 
-                output = chain.invoke(
-                    {
-                        "name": name,
-                        "theme": theme,
-                        "results": json.dumps(merged, ensure_ascii=False),
-                    }
-                )
+                output = audit_chain.invoke({
+                    "name": name,
+                    "theme": theme,
+                    "results": json.dumps(merged, ensure_ascii=False),
+                })
                 data = safe_json_loads(output)
                 verdict = normalize_verdict(data.get("verdict", verdict))
                 rationale = str(data.get("rationale", rationale) or "").strip()
                 sources = data.get("sources", sources)
-                logger.debug(f"Audit LLM verdict={verdict} rationale={truncate(rationale, 400)}")
-                trace_append(trace_path, "audit_llm", {"ts_code": row["ts_code"], "name": name, "theme": theme, "verdict": verdict, "rationale": rationale, "sources": sources})
+                logger.debug(f"Veto LLM verdict={verdict} rationale={truncate(rationale, 400)}")
+                trace_append(trace_path, "veto_llm", {"ts_code": row["ts_code"], "name": name, "theme": theme, "verdict": verdict, "rationale": rationale, "sources": sources})
+
                 if not sources or any(src.strip().lower() == "url1" for src in sources):
-                    flat_urls = []
-                    for item in merged.values():
-                        for url in item.get("urls", []):
-                            if url not in flat_urls:
-                                flat_urls.append(url)
                     if flat_urls:
                         sources = flat_urls[:5]
                 if verdict == "pass":
@@ -1087,26 +1636,58 @@ def phase3_deep_audit(
                     if url not in flat_urls:
                         flat_urls.append(url)
             primary_urls = [u for u in flat_urls if any(dom in u for dom in PRIMARY_SOURCE_DOMAINS)]
-            has_positive = any(term in final_text for term in positive_terms)
+
+            # Check if we found positive evidence from opportunity pass
+            # Lower threshold: any finding or evidence snippet counts
+            has_positive_from_opportunity = len(positive_findings) >= 1 or len(opportunity_evidence) >= 2
+            has_positive = any(term in final_text for term in positive_terms) or has_positive_from_opportunity
+
+            # Override LLM verdict if we have opportunity findings (LLM may be too harsh)
+            if verdict == "fail" and has_positive_from_opportunity:
+                verdict = "warn"
+                rationale = (rationale + "；LLM判定失败但发现正面催化信息，降级为存疑。").strip("；")
 
             if verdict != "fail" and not has_positive:
-                if not flat_urls:
+                if not flat_urls and not opportunity_urls:
                     verdict = "warn"
                     rationale = (rationale + "；检索未返回可核验URL，无法完成审计式验真，暂按存疑处理。").strip("；")
                 elif executed_passes >= 2 or len(used_queries) >= 4:
-                    verdict = "fail"
-                    rationale = (rationale + "；多轮检索仍未找到明确订单/客户/中标等硬证据，按伪概念一票否决。").strip("；")
+                    # More lenient: only fail if we have zero opportunity evidence
+                    if len(positive_findings) >= 1 or len(opportunity_evidence) >= 1:
+                        verdict = "warn"
+                        rationale = (rationale + "；官方源证据不足，但发现部分正面信息，暂按存疑处理。").strip("；")
+                    else:
+                        verdict = "warn"  # Changed from fail - let research phase be more lenient
+                        rationale = (rationale + "；未找到明确硬证据，暂按存疑处理（需进一步验证）。").strip("；")
                 else:
                     verdict = "warn"
                     rationale = (rationale + "；当前检索未找到明确订单/客户/中标等硬证据，暂按存疑处理。").strip("；")
+
             if verdict != "fail" and recent_minor_reg:
-                rationale = (rationale + f"；检索到近{REGULATORY_MAX_AGE_DAYS}天内监管函/问询函等事项，需额外关注。").strip("；")
+                rationale = (rationale + f"；检索到近{config.hard_fail_max_age_days}天内监管函/问询函等事项，需额外关注。").strip("；")
             if verdict == "pass" and not primary_urls:
                 verdict = "warn"
                 rationale = (rationale + "；缺少交易所/巨潮等一手来源链接，按审计口径降级。").strip("；")
 
-            if not sources or any(str(src).strip().lower() == "url1" for src in sources):
-                sources = (primary_urls or flat_urls)[:5]
+            # Combine sources from both passes
+            all_sources = list(set((primary_urls or flat_urls)[:3] + opportunity_urls[:2]))
+            if not all_sources or any(str(src).strip().lower() == "url1" for src in all_sources):
+                all_sources = (primary_urls or flat_urls or opportunity_urls)[:5]
+
+            # Calculate confidence score based on findings
+            confidence = 0.5  # Base
+            if positive_findings:
+                avg_finding_confidence = sum(f.confidence for f in positive_findings) / len(positive_findings)
+                confidence = 0.3 + avg_finding_confidence * 0.5
+            if verdict == "pass":
+                confidence = min(1.0, confidence + 0.2)
+            elif verdict == "fail":
+                confidence = max(0.0, confidence - 0.3)
+
+            # Add opportunity findings to rationale if verdict is pass/warn
+            if verdict != "fail" and positive_findings:
+                finding_summary = "；".join([f"{f.category}:{f.description[:30]}" for f in positive_findings[:3]])
+                rationale = f"发现正面催化：{finding_summary}。{rationale}"
 
             audit_results.append(
                 AuditResult(
@@ -1115,11 +1696,24 @@ def phase3_deep_audit(
                     theme=theme,
                     verdict=verdict,
                     rationale=rationale,
-                    sources=sources,
+                    sources=all_sources,
+                    positive_findings=positive_findings,
+                    growth_catalysts=growth_catalysts,
+                    confidence_score=round(confidence, 2),
+                    research_depth="deep" if len(positive_findings) >= 3 else "standard",
+                    capital_signal_summary=capital_signal,
                 )
             )
-            logger.debug(f"Audit done: stock={name} theme={theme} verdict={verdict}")
-            trace_append(trace_path, "audit_done", {"ts_code": row["ts_code"], "name": name, "theme": theme, "verdict": verdict})
+            logger.debug(f"Research done: stock={name} theme={theme} verdict={verdict} findings={len(positive_findings)}")
+            trace_append(trace_path, "research_done", {
+                "ts_code": row["ts_code"],
+                "name": name,
+                "theme": theme,
+                "verdict": verdict,
+                "finding_count": len(positive_findings),
+                "catalyst_count": len(growth_catalysts),
+                "confidence": confidence,
+            })
 
     return audit_results
 
@@ -1156,7 +1750,7 @@ def detect_turnover_spikes(
 
 def phase4_plot_charts(candidates: pd.DataFrame) -> Dict[str, List[str]]:
     """
-    Generate K-line charts with technical indicators.
+    Generate K-line charts with technical indicators using Plotly.
 
     Args:
         candidates: DataFrame of candidate stocks
@@ -1166,60 +1760,156 @@ def phase4_plot_charts(candidates: pd.DataFrame) -> Dict[str, List[str]]:
     """
     CHART_DIR.mkdir(parents=True, exist_ok=True)
     chart_notes = {}
-    setup_matplotlib_chinese_fonts()
-
-    # Configure high DPI for better quality
-    mpl.rcParams["figure.dpi"] = 150
-    mpl.rcParams["savefig.dpi"] = 150
-    mpl.rcParams["savefig.bbox"] = "tight"
 
     for _, row in candidates.head(8).iterrows():
         ts_code = row["ts_code"]
         df = load_price_data(ts_code)
+        if df is None or df.empty:
+            logger.warning(f"No price data available for {ts_code}, skipping chart")
+            continue
         if len(df) > CHART_DAYS:
             df = df.tail(CHART_DAYS)
-        df["ma20"] = df["close"].rolling(20).mean()
-        df["ma60"] = df["close"].rolling(60).mean()
-        df["ma120"] = df["close"].rolling(120).mean()
+        # Skip if not enough data for meaningful chart
+        if len(df) < 60:
+            logger.warning(f"Insufficient data for {ts_code}: {len(df)} rows, need at least 60")
+            continue
+
+        # Create subplot layout: candlestick on top (70%), volume on bottom (30%)
+        fig = make_subplots(
+            rows=2, cols=1,
+            shared_xaxes=True,
+            vertical_spacing=0.03,
+            row_heights=[0.7, 0.3],
+            subplot_titles=(f"{row['name']} ({ts_code})", "成交量"),
+        )
+
+        # Candlestick chart
+        fig.add_trace(
+            go.Candlestick(
+                x=df.index,
+                open=df["open"],
+                high=df["high"],
+                low=df["low"],
+                close=df["close"],
+                name="K线",
+                increasing_line_color="#ef5350",  # Red for up (Chinese convention)
+                decreasing_line_color="#26a69a",  # Green for down
+                increasing_fillcolor="#ef5350",
+                decreasing_fillcolor="#26a69a",
+            ),
+            row=1, col=1,
+        )
+
+        # Moving averages
+        if len(df) >= 60:
+            df["ma60"] = df["close"].rolling(60).mean()
+            if df["ma60"].notna().any():
+                fig.add_trace(
+                    go.Scatter(
+                        x=df.index, y=df["ma60"],
+                        mode="lines", name="MA60",
+                        line=dict(color="orange", width=1.5),
+                    ),
+                    row=1, col=1,
+                )
+        if len(df) >= 120:
+            df["ma120"] = df["close"].rolling(120).mean()
+            if df["ma120"].notna().any():
+                fig.add_trace(
+                    go.Scatter(
+                        x=df.index, y=df["ma120"],
+                        mode="lines", name="MA120",
+                        line=dict(color="dodgerblue", width=1.5),
+                    ),
+                    row=1, col=1,
+                )
+        if len(df) >= 250:
+            df["ma250"] = df["close"].rolling(250).mean()
+            if df["ma250"].notna().any():
+                fig.add_trace(
+                    go.Scatter(
+                        x=df.index, y=df["ma250"],
+                        mode="lines", name="MA250",
+                        line=dict(color="purple", width=1.5),
+                    ),
+                    row=1, col=1,
+                )
+
+        # Turnover spike markers
         spikes = detect_turnover_spikes(df)
         spike_dates = df.index[spikes].strftime("%Y-%m-%d").tolist()
-        add_plots = [
-            mpf.make_addplot(df["ma20"], color="orange"),
-            mpf.make_addplot(df["ma60"], color="blue"),
-            mpf.make_addplot(df["ma120"], color="purple"),
-        ]
         if spikes.any():
-            add_plots.append(
-                mpf.make_addplot(
-                    df["high"].where(spikes),
-                    type="scatter",
-                    markersize=50,
-                    marker="^",
-                    color="red",
-                )
+            spike_df = df[spikes]
+            fig.add_trace(
+                go.Scatter(
+                    x=spike_df.index,
+                    y=spike_df["high"] * 1.02,  # Slightly above high
+                    mode="markers",
+                    name="放量信号",
+                    marker=dict(
+                        symbol="triangle-down",
+                        size=12,
+                        color="red",
+                    ),
+                    hovertemplate="%{x}<br>放量异动<extra></extra>",
+                ),
+                row=1, col=1,
             )
 
-        chart_path = CHART_DIR / f"{ts_code}.png"
-        mpf.plot(
-            df,
-            type="candle",
-            volume=True,
-            addplot=add_plots,
-            style="yahoo",
-            title=f"{row['name']} {ts_code}",
-            savefig=dict(
-                fname=str(chart_path),
-                dpi=150,
-                facecolor="white",
-                edgecolor="none",
-                bbox_inches="tight",
-                pad_inches=0.1,
+        # Volume bars with color based on price direction
+        vol_col = "volume" if "volume" in df.columns else "vol"
+        colors = ["#ef5350" if c >= o else "#26a69a"
+                  for c, o in zip(df["close"], df["open"])]
+        fig.add_trace(
+            go.Bar(
+                x=df.index,
+                y=df[vol_col],
+                name="成交量",
+                marker_color=colors,
+                opacity=0.7,
             ),
-            warn_too_much_data=CHART_DAYS + 10,
-            figsize=(16, 10),
+            row=2, col=1,
         )
+
+        # Layout configuration
+        fig.update_layout(
+            template="plotly_white",
+            showlegend=True,
+            legend=dict(
+                orientation="h",
+                yanchor="bottom",
+                y=1.02,
+                xanchor="right",
+                x=1,
+            ),
+            xaxis_rangeslider_visible=False,
+            margin=dict(l=60, r=40, t=80, b=40),
+            height=800,
+            width=1600,
+            font=dict(family="Noto Sans CJK SC, Source Han Sans CN, SimHei, sans-serif"),
+        )
+
+        # Hide weekend gaps
+        fig.update_xaxes(
+            rangebreaks=[
+                dict(bounds=["sat", "mon"]),  # Hide weekends
+            ],
+            showgrid=True,
+            gridwidth=1,
+            gridcolor="rgba(128,128,128,0.2)",
+        )
+        fig.update_yaxes(
+            showgrid=True,
+            gridwidth=1,
+            gridcolor="rgba(128,128,128,0.2)",
+        )
+
+        # Save chart
+        chart_path = CHART_DIR / f"{ts_code}.png"
+        fig.write_image(str(chart_path), scale=2)
         chart_notes[ts_code] = spike_dates
         logger.debug(f"Generated chart: {chart_path}")
+
     return chart_notes
 
 
@@ -1234,9 +1924,10 @@ def compute_signals(candidates: pd.DataFrame) -> Dict[str, Dict[str, object]]:
             continue
         box_top = float(df_120["high"].max())
         box_bottom = float(df_120["low"].min())
+        box_top_prev = float(df_120["high"].iloc[:-1].max()) if len(df_120) > 1 else box_top
         amplitude = (box_top - box_bottom) / (box_bottom + EPSILON)
         close = float(df_120["close"].iloc[-1])
-        dist_to_top = (box_top - close) / (box_top + EPSILON)
+        dist_to_top = (box_top_prev - close) / (box_top_prev + EPSILON)
         pos = (close - box_bottom) / ((box_top - box_bottom) + EPSILON)
 
         ma20 = df["close"].rolling(20).mean()
@@ -1261,11 +1952,15 @@ def compute_signals(candidates: pd.DataFrame) -> Dict[str, Dict[str, object]]:
             turn_mult = recent_vol / (base_vol + EPSILON)
 
         ignition = 1.2 <= turn_mult <= 3.0
-        ready = ignition and dist_to_top <= 0.03 and close >= float(df["close"].rolling(20).mean().iloc[-1])
+        already_breakout = close > box_top_prev
+        extended_breakout = close >= (box_top_prev * 1.03)
+        breakout_window_ok = (not already_breakout) and (0.0 <= dist_to_top <= 0.03)
+        ready = ignition and breakout_window_ok and close >= float(df["close"].rolling(20).mean().iloc[-1])
 
         signals[ts_code] = {
             "name": name,
             "box_top": box_top,
+            "box_top_prev": box_top_prev,
             "box_bottom": box_bottom,
             "amplitude_120": amplitude,
             "close": close,
@@ -1275,6 +1970,9 @@ def compute_signals(candidates: pd.DataFrame) -> Dict[str, Dict[str, object]]:
             "ma_spread_mean_20": ma_spread_mean,
             "ma_spread_std_20": ma_spread_std,
             "ignition": ignition,
+            "breakout_window_ok": breakout_window_ok,
+            "already_breakout": already_breakout,
+            "extended_breakout": extended_breakout,
             "ready_to_break": ready,
         }
     return signals
@@ -1379,7 +2077,50 @@ def phase5_report_with_deepseek(
     md_path = REPORT_DIR / f"report_{timestamp}.md"
     trace_path = REPORT_DIR / f"deepseek_trace_{timestamp}.jsonl"
 
-    audit_df = pd.DataFrame([audit.__dict__ for audit in audits])
+    # Convert audits to dict, handling dataclass fields properly
+    audit_records = []
+    for audit in audits:
+        record = {
+            "ts_code": audit.ts_code,
+            "name": audit.name,
+            "theme": audit.theme,
+            "verdict": audit.verdict,
+            "rationale": audit.rationale,
+            "sources": audit.sources,
+            "confidence_score": audit.confidence_score,
+            "research_depth": audit.research_depth,
+            "capital_signal_summary": audit.capital_signal_summary,
+            "positive_findings": [
+                {
+                    "category": f.category,
+                    "description": f.description,
+                    "evidence": f.evidence[:200],
+                    "confidence": f.confidence,
+                    "source_url": f.source_url,
+                    "date": f.date,
+                }
+                for f in (audit.positive_findings or [])
+            ],
+            "growth_catalysts": [
+                {
+                    "catalyst_type": c.catalyst_type,
+                    "description": c.description,
+                    "timeframe": c.timeframe,
+                    "confidence": c.confidence,
+                }
+                for c in (audit.growth_catalysts or [])
+            ],
+        }
+        audit_records.append(record)
+    audit_df = pd.DataFrame(audit_records)
+
+    # Ensure off_theme and filter_tier columns exist in candidates
+    candidates_with_flag = candidates.head(12).copy()
+    if "off_theme" not in candidates_with_flag.columns:
+        candidates_with_flag["off_theme"] = False
+    if "filter_tier" not in candidates_with_flag.columns:
+        candidates_with_flag["filter_tier"] = "Unknown"
+
     summary = {
         "themes": [
             {
@@ -1393,8 +2134,8 @@ def phase5_report_with_deepseek(
             }
             for t in themes
         ],
-        "candidates": candidates.head(12).to_dict("records"),
-        "audits": audit_df.to_dict("records"),
+        "candidates": candidates_with_flag.to_dict("records"),
+        "audits": audit_records,  # Use the enhanced audit records with findings
         "chart_notes": chart_notes,
         "signals": signals,
     }
@@ -1412,9 +2153,20 @@ def phase5_report_with_deepseek(
         "- 持续观察指标"
         ""
         "### 【核心金股】表格"
-        "列：股票、所属主线、形态特征、推荐理由（投资逻辑）"
+        "列：股票、所属主线、形态特征、置信度、推荐理由"
+        ""
+        "**置信度说明（confidence_score）：**\n"
+        "- 0.8-1.0: 高置信度，多源验证充分\n"
+        "- 0.6-0.8: 中等置信度，部分验证\n"
+        "- 0.4-0.6: 低置信度，需要更多验证\n\n"
+        ""
+        "**重要：如果股票的off_theme字段为True，必须：**\n"
+        "- 在\"所属主线\"列开头标注 **⚠️ OFF-THEME（无题材匹配）**\n"
+        "- 在推荐理由中说明：\"该股票未匹配当前热点题材，仅基于技术形态入选\"\n"
+        "- 在报告末尾添加【风险提示】说明OFF-THEME股票风险\n\n"
         ""
         "### 【深度图解】（每个标的必须包含）："
+        ""
         "**【投资逻辑】**<font color='blue'>"
         "- 观察现象：量能异动、技术形态、题材契合"
         "- 分析意义：资金态度、趋势方向、突破可能"
@@ -1422,11 +2174,27 @@ def phase5_report_with_deepseek(
         "- 结论：交易机会评级（强烈推荐/推荐/谨慎）"
         "</font>"
         ""
+        "**【正面催化发现】**<font color='green'>（从positive_findings提取）\n"
+        "- 列出发现的正面信息（订单、客户、政策、技术突破、产能扩张等）\n"
+        "- 每个发现标注类别和置信度\n"
+        "- 引用来源URL\n"
+        "</font>"
+        ""
+        "**【增长催化剂】**<font color='red'>（从growth_catalysts提取）\n"
+        "- 催化剂类型：policy/tech_breakthrough/market_expansion/competitive_moat\n"
+        "- 时间框架：near_term/medium_term/long_term\n"
+        "- 置信度评估\n"
+        "</font>"
+        ""
         "**【技术分析】**横盘时长/波动率、量能信号、均线排列、箱体位置"
+        "- ignition信号：是否处于温和放量阶段(1.2-3.0x)"
+        "- ready_to_break信号：是否接近箱体突破"
         ""
-        "**【资金验证】**<font color='purple'>机构游资动向、估值水平、市值适合度</font>"
-        ""
-        "**【核心催化】**<font color='red'>政策/事件/市场催化</font>"
+        "**【资金验证】**<font color='purple'>（从capital_signal_summary提取）\n"
+        "- 龙虎榜资金信号\n"
+        "- 机构游资动向\n"
+        "- 估值水平、市值适合度\n"
+        "</font>"
         ""
         "**【交易建议】**<font color='green'>买入时机/仓位/止盈止损/持仓周期</font>"
         ""
@@ -1434,18 +2202,29 @@ def phase5_report_with_deepseek(
         ""
         "- 量能异动日：[列表]\\n"
         "![股票名称 代码](../charts/代码.png)\\n"
-        "- 尽调结论：pass/fail（说明+来源）"
+        "- 尽调结论：pass/warn/fail（说明+来源）"
+        "- 研究深度：standard/deep"
         ""
         "### 【风险提示】"
         "用<font color='orange'>橙色</font>标注核心风险"
+        ""
+        "**如果有OFF-THEME股票，必须额外添加风险说明：**\n"
+        "<font color='orange'>\n"
+        "**OFF-THEME股票风险提示：**\n"
+        "- 该股票未匹配当前市场热点题材，仅基于技术形态入选\n"
+        "- 缺乏题材催化，上涨动力可能不足\n"
+        "- 建议谨慎对待，优先关注有题材匹配的标的\n"
+        "</font>\n\n"
         ""
         "## 要求："
         "- 输出JSON：{\"final_report\":\"# Markdown...\"}"
         "- 引用真实URL，不使用占位符"
         "- 突出\"待时机\"：箱体上沿+温和放量(1.2-3.0x)+均线粘合"
         "- **在【市场风向标】中展示资金验证信息**：对于confirmed主题，必须展示龙虎榜资金信号"
+        "- **在【深度图解】中展示正面催化发现**：从positive_findings和growth_catalysts中提取关键信息"
+        "- **展示置信度分数**：在核心金股表格中显示confidence_score"
         ""
-        "记住：展示思考过程，而非仅结论。"
+        "记住：先展示发现的机会（正面催化），再展示风险（审计结果）。"
     )
 
     messages = [
@@ -1608,7 +2387,7 @@ def postprocess_markdown(md_path: Path) -> Path:
 
     processed_content = "\n".join(processed_lines)
 
-    # Convert HTML font color tags to LaTeX color commands for PDF
+    # Convert HTML font color tags to pandoc raw LaTeX for PDF rendering
     # Pattern: <font color='red'>text</font> or <font color="red">text</font>
     def convert_font_color(match):
         color_name = match.group(1).strip('"\'')
@@ -1622,17 +2401,52 @@ def postprocess_markdown(md_path: Path) -> Path:
             'purple': 'highlightpurple',
         }
         latex_color = color_map.get(color_name.lower(), color_name)
-        return f'\\textcolor{{{latex_color}}}{{{text}}}'
+        # Escape LaTeX special characters in text (except backslash which is handled by raw attribute)
+        # Only escape characters that would break the \textcolor{} command
+        def escape_latex_text(s: str) -> str:
+            # Escape braces first to avoid interfering with other replacements
+            s = s.replace('{', '\\{').replace('}', '\\}')
+            # Escape other LaTeX special characters
+            replacements = [
+                ('#', '\\#'),
+                ('$', '\\$'),
+                ('%', '\\%'),
+                ('&', '\\&'),
+                ('_', '\\_'),
+                ('^', '\\^{}'),
+                ('~', '\\textasciitilde{}'),
+            ]
+            for orig, repl in replacements:
+                s = s.replace(orig, repl)
+            return s
+        text = escape_latex_text(text)
+        # For multiline content, use fenced code block raw LaTeX
+        # For single-line, use inline raw attribute syntax
+        if '\n' in text:
+            # Use {\color{name}...} instead of \textcolor for multiline content
+            # because \textcolor cannot contain paragraph breaks
+            return f'\n\n```{{=latex}}\n{{\\color{{{latex_color}}} {text}}}\n```\n\n'
+        else:
+            # Inline raw attribute syntax: `\textcolor{color}{text}`{=latex}
+            return f'`\\textcolor{{{latex_color}}}{{{text}}}`{{=latex}}'
     # Use a more robust regex that handles nested structures
     processed_content = re.sub(
-        r"<font\s+color=['\"]([^'\"]+)['\"]>([^<]+)</font>",
+        r"<font\s+color=['\"]([^'\"]+)['\"]>(.*?)</font>",
         convert_font_color,
         processed_content,
-        flags=re.IGNORECASE
+        flags=re.IGNORECASE | re.DOTALL
     )
 
     # Add spacing improvements
     processed_content = re.sub(r"\n{3,}", "\n\n", processed_content)  # Fix excessive blank lines
+
+    # Fix relative image paths - convert ../charts/ to absolute paths for pandoc
+    charts_abs_path = (md_path.parent.parent / "charts").resolve()
+    processed_content = re.sub(
+        r"!\[([^\]]*)\]\(\.\./charts/([^)]+)\)",
+        lambda m: f"![{m.group(1)}]({charts_abs_path / m.group(2)})",
+        processed_content
+    )
 
     processed_path.write_text(processed_content, encoding="utf-8")
     return processed_path
@@ -1709,7 +2523,7 @@ def build_pdf(md_path: Path) -> Optional[Path]:
 
     build_sh = md_path.parent / "build.sh"
     build_sh.write_text(
-        f'#!/usr/bin/env bash\ncd "{md_path.parent}" && pandoc "{processed_md.name}" -o "{pdf_path.name}" --pdf-engine=xelatex -H header.tex -V CJKmainfont="{CHART_FONT}" --toc --number-sections\n',
+        f'#!/usr/bin/env bash\ncd "{md_path.parent}" && pandoc --from=markdown+raw_attribute "{processed_md.name}" -o "{pdf_path.name}" --pdf-engine=xelatex -H header.tex -V CJKmainfont="{CHART_FONT}" --toc --number-sections\n',
         encoding="utf-8",
     )
     build_sh.chmod(0o755)
@@ -1719,6 +2533,7 @@ def build_pdf(md_path: Path) -> Optional[Path]:
         subprocess.run(
             [
                 "pandoc",
+                "--from=markdown+raw_attribute",
                 processed_md.name,
                 "-o",
                 pdf_path.name,
@@ -1752,6 +2567,8 @@ def main() -> None:
     logger.info("=" * 60)
     logger.info("Starting Trend Agent Pipeline")
     logger.info("=" * 60)
+    config = StrategyConfig.from_env()
+    logger.info(f"Strategy config: horizon={config.holding_horizon}, toplist_mode={config.toplist_exclusion_mode}")
 
     llm = init_llm()
 
@@ -1762,20 +2579,28 @@ def main() -> None:
         logger.warning("No themes generated, check search tool or LLM output")
 
     # Phase 2
-    candidates = phase2_quant_filter(themes)
+    candidates = phase2_quant_filter(themes, config=config)
     if candidates.empty:
         logger.error("Phase 2: No candidates after filtering")
         return
 
     # Phase 3
-    logger.info("Phase 3: Deep Research (Audit)...")
+    logger.info("Phase 3: Deep Research (Opportunity Discovery + Adversarial Audit)...")
     audit_trace = REPORT_DIR / f"audit_trace_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jsonl"
     logger.debug(f"Audit trace: {audit_trace}")
-    audits = phase3_deep_audit(llm, candidates, trace_path=audit_trace)
+    audits = phase3_deep_audit(llm, candidates, trace_path=audit_trace, themes=themes, config=config)
     candidates, audits = apply_audit_filter(candidates, audits)
     if candidates.empty:
         logger.warning("No candidates passed audit filter")
         return
+
+    # Alpha ranking before visualization/reporting
+    signals = compute_signals(candidates)
+    candidates = rank_candidates_for_alpha(candidates, audits, signals, config=config)
+    REPORT_DIR.mkdir(parents=True, exist_ok=True)
+    candidates_export = REPORT_DIR / f"candidates_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+    candidates.to_csv(candidates_export, index=False, encoding="utf-8-sig")
+    logger.info(f"Exported ranked candidates: {candidates_export}")
 
     # Phase 4
     logger.info("Phase 4: Visualization...")

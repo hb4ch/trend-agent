@@ -4,165 +4,150 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ---
 
-## Project Overview
+## Quick Start Commands
 
-**Trend Agent** is an A-share (Chinese stock market) investment research and stock screening system following a "momentum-focused, filter-based, timing-oriented" approach. The project implements a complete pipeline for stock analysis, research, and reporting.
+```bash
+# Activate virtual environment
+source .venv/bin/activate
 
-### Core Philosophy
+# Run full pipeline (all 5 phases)
+python trend_agent.py
 
-**"重势、通过滤、待时机"** (Emphasize momentum, apply strict filtering, wait for timing)
+# Run stock screening only (Phase 2)
+python screen_growth_stocks.py
 
-1. **定方向** (Define Direction): Web search to extract current market themes (3-5 themes)
-2. **选标的** (Select Targets): Local Parquet data mining for technical patterns
-3. **做尽调** (Due Diligence): Audit-style research to verify themes and eliminate risks
-4. **交付** (Deliver): K-line charts + Markdown/PDF research reports
+# Check environment setup
+python check_setup.py
 
-### Architecture - 5-Phase Pipeline
+# Run tests
+python -m unittest tests/test_zhipu_search.py
 
-| Phase | Name | Description |
-|-------|------|-------------|
-| Phase 1 | Market Intelligence | Extract market themes using AI + web search |
-| Phase 2 | Quantitative Mining | Screen stocks using DuckDB + technical criteria |
-| Phase 3 | Deep Research | AI-powered risk audit and due diligence |
-| Phase 4 | Visualization | Generate candlestick charts with mplfinance |
-| Phase 5 | Report Generation | Create comprehensive research reports |
+# Enable debug logging
+export DEBUG_DEEPSEEK=1
+export DEBUG_ZHIPU_SEARCH=1
+export FORCE_LLM_LOGGING=1  # Print all LLM I/O to screen
+```
 
 ---
 
-## Project Structure
+## Project Overview
 
-```
-trend-agent/
-├── trend_agent.py              # Main pipeline orchestrator (Phase 1-5)
-├── screen_growth_stocks.py     # Stock screening logic & technical analysis
-├── deep_researcher.py          # AI research engine (Zhipu search + DeepSeek/Qwen)
-├── search_tool.py             # Simple search wrapper
-├── check_setup.py             # Environment validation script
-├── CLAUDE.md                   # This file - project documentation
-├── README.md                   # User-facing documentation
-├── .env                        # Environment configuration (gitignored)
-├── .gitignore                  # Git ignore rules
-├── data/ -> ../tushare-stock-select/data  # Linked data directory
-├── charts/                     # Generated technical analysis charts
-├── reports/                    # Research reports and audit traces
-├── tests/                      # Unit tests
-│   ├── test_zhipu_search.py   # Zhipu search tests
-│   └── __init__.py
-├── .cache/                     # Cache directory
-└── .venv/                      # Python virtual environment
-```
+**Trend Agent** is an A-share (Chinese stock market) investment research and stock screening system following a "momentum-focused, filter-based, timing-oriented" approach.
+
+### Core Philosophy: **"重势、通过滤、待时机"**
+
+1. **Phase 1 - Market Intelligence**: Web search + Dragon Tiger List → market themes
+2. **Phase 2 - Quantitative Mining**: DuckDB + technical criteria → candidate stocks (relaxed filters)
+3. **Phase 3 - Deep Research**: Opportunity Discovery (first) + Adversarial Veto Audit (second)
+4. **Phase 4 - Visualization**: Generate K-line charts with Plotly
+5. **Phase 5 - Report Generation**: DeepSeek generates Markdown/PDF reports with findings
 
 ---
 
 ## Key Modules
 
-### 1. `trend_agent.py` (Main Pipeline)
+| File | Purpose |
+|------|---------|
+| `trend_agent.py` | Main pipeline orchestrator (all 5 phases) |
+| `llm_provider.py` | Unified LLM provider (DeepSeek, Zhipu, Qwen) with thinking mode |
+| `screen_growth_stocks.py` | Stock screening logic & technical analysis |
+| `deep_researcher.py` | AI research engine (Zhipu search + query planning) |
+| `utils.py` | Shared utilities (Dragon Tiger List, JSON parsing, etc.) |
 
-**Purpose**: Core orchestrator implementing all 5 phases
+### `trend_agent.py` - Key Functions
 
-**Key Classes**:
-- `ThemeItem`: Market themes with keywords, summary, sources
-- `AuditResult`: Audit findings with verdict, rationale, sources
-
-**Key Functions**:
-- `phase1_market_intel(llm)`: Extract market themes from web search
-- `phase2_quant_filter(themes)`: Technical screening with DuckDB
-- `phase3_deep_audit(llm, candidates)`: Risk audit and due diligence
+- `phase1_market_intel(llm)`: Extract market themes from web search + Dragon Tiger List
+- `phase2_quant_filter(themes)`: Technical screening with DuckDB (relaxed parameters)
+- `phase3_deep_audit(llm, candidates, themes)`: Two-pass research:
+  - **Pass 1 - Opportunity Discovery**: Find positive catalysts (contracts, tech, policy, expansion)
+  - **Pass 2 - Adversarial Veto**: Due diligence to check for hard fails
 - `phase4_plot_charts(candidates)`: Generate K-line charts
-- `phase5_report_with_deepseek(...)`: Generate AI-powered reports
+- `phase5_report_with_deepseek(...)`: Generate AI-powered reports with findings and catalysts
 
-**Utility Functions**:
-- `run_search(query)`: Execute web search via Zhipu
-- `run_duckdb_sql(sql, context)`: Execute SQL on stock data
-- `run_python(code, context)`: Safe Python code execution
-- `qwen_match_themes(themes, candidates)`: Semantic theme matching
+### `llm_provider.py` - LLM Abstraction
 
----
-
-### 2. `screen_growth_stocks.py` (Stock Screener)
-
-**Purpose**: Technical analysis and stock screening
-
-**Screening Parameters**:
 ```python
-MARKET_CAP_MIN = 20e8   # 2 billion RMB
-MARKET_CAP_MAX = 300e8  # 30 billion RMB
-MIN_DATA_DAYS = 120     # Minimum trading days
-CONSOLIDATION_DAYS = 120  # Consolidation observation period
-VOLATILITY_THRESHOLD = 0.35  # 35% volatility threshold
+from llm_provider import get_llm, invoke_llm_messages, invoke_deepseek_thinking
+
+# Get langchain LLM instance
+llm = get_llm(model="deepseek")  # or "zhipu", "qwen"
+
+# Simple invoke with message dicts
+response = invoke_llm_messages("deepseek", [
+    {"role": "system", "content": "You are a helpful assistant"},
+    {"role": "user", "content": "Hello"}
+])
+
+# DeepSeek thinking mode (reasoning_content + content)
+result = invoke_deepseek_thinking([
+    {"role": "user", "content": "Complex question..."}
+])
+# result["reasoning_content"] = chain of thought
+# result["content"] = final answer
 ```
 
-**Consolidation Score (0-100)**:
-- 40 points: 120-day volatility < 35%
-- 25 points: MA20/MA60/MA120 convergence < 15%
-- 5 points: MA spread stability (std < 3%)
-- 20 points: Price in middle of consolidation range (30%-70%)
-- 10 points: Recent volume boost > 1.2x
+### `screen_growth_stocks.py` - Screening Parameters (Relaxed)
 
-**Output Files**:
-- `screening_results.json` - Full results (JSON)
-- `screening_results_YYYYMMDD_HHMMSS.csv` - Full results (CSV)
+```python
+MARKET_CAP_MIN = 10e8       # 1 billion RMB (relaxed from 2B)
+MARKET_CAP_MAX = 500e8      # 50 billion RMB (relaxed from 30B)
+MIN_DATA_DAYS = 180         # Minimum trading days (relaxed from 250)
+VOLATILITY_THRESHOLD = 0.50 # 50% max amplitude (relaxed from 35%)
+```
 
----
+**Composite Score Weights (Rebalanced):**
+- Consolidation: 40% (from 60%)
+- Momentum: 20% (new)
+- Volume boost: 25%
+- Turnover: 15%
 
-### 3. `deep_researcher.py` (AI Research Engine)
+### `deep_researcher.py` - Search Functions
 
-**Purpose**: AI-powered research and information gathering
+- `zhipu_search(query)`: Web search with `site:domain.com` support
+- `deepseek_plan_queries(...)`: Dynamic query planning for multi-pass research
+- `generate_opportunity_queries(name, theme)`: Generate opportunity discovery queries (without site: restrictions)
+- `extract_positive_findings(results, name, category)`: Extract positive findings with confidence scoring
+- `deepseek_plan_opportunity_queries(...)`: AI-planned queries for filling evidence gaps
 
-**Integrations**:
-- **Zhipu AI**: Native SDK web search (`ZhipuAiClient`)
-- **SiliconFlow**: DeepSeek-V3.2 and Qwen3-8B models
-- **LangChain**: Tool integration for search
-
-**Key Functions**:
-- `zhipu_search(query)`: Web search with domain filtering
-- `deepseek_chat(messages)`: DeepSeek model chat
-- `qwen_chat(messages)`: Qwen model chat
-- `deepseek_plan_queries(...)`: Query planning for deep research
-
-**Search Tool**:
-- Supports `site:domain.com` shortcut for domain filtering
-- Configurable result count, recency filter, content size
-- Retry logic with exponential backoff
+**Opportunity Query Categories:**
+- `policy_driver`: Government support, subsidies, projects
+- `tech_breakthrough`: R&D, patents, innovation
+- `market_expansion`: New products, overseas, capacity
+- `competitive_moat`: Market position, advantages
+- `contract_evidence`: Orders, customers, agreements
 
 ---
 
-## Data Storage
+## Data Architecture
 
-### Parquet Format
+### Input Data (Parquet in `data/`)
 
-Efficient columnar storage in `data/` directory:
-
-| Directory | Contents |
-|-----------|----------|
+| Directory | Description |
+|-----------|-------------|
 | `stock_basic/` | Basic stock info (codes, names, industries) |
 | `stock_company/` | Company details (introduction, business scope) |
-| `stock_ticks/` | Historical price data per stock |
-| `financial/` | Financial statements and metrics |
-| `top_list/` | Dragon Tiger List aggregated data (daily) |
-| `top_inst/` | Dragon Tiger List institutional details (daily) |
+| `stock_ticks/{ts_code}.parquet` | Historical OHLCV + fundamentals per stock |
+| `top_list/YYYYMMDD.parquet` | Dragon Tiger List daily aggregates |
+| `top_inst/YYYYMMDD.parquet` | Dragon Tiger List institutional details |
 
 ### Output Files
 
-| Type | Location | Format |
-|------|----------|--------|
-| Charts | `charts/{ts_code}.png` | PNG |
-| Reports | `reports/report_YYYYMMDD_HHMMSS.md` | Markdown |
-| Reports | `reports/report_YYYYMMDD_HHMMSS.pdf` | PDF |
-| Audit Traces | `reports/audit_trace_*.jsonl` | JSONL |
-| Debug Traces | `reports/deepseek_trace_*.jsonl` | JSONL |
+| Location | Description |
+|----------|-------------|
+| `charts/{ts_code}.png` | K-line charts with MA overlays |
+| `reports/report_*.md` | Markdown research reports |
+| `reports/report_*.pdf` | PDF reports (via pandoc + xelatex) |
+| `reports/audit_trace_*.jsonl` | Audit process traces |
 
 ---
 
 ## Environment Configuration
 
-### Required Environment Variables
+### Required `.env` Variables
 
 ```env
 # Zhipu AI (Web Search)
 ZHIPUAI_API_KEY=xxx
-ZHIPU_SEARCH_COUNT=15
-DEBUG_ZHIPU_SEARCH=0
 
 # SiliconFlow (DeepSeek/Qwen)
 SILICONFLOW_BASE_URL=https://api.siliconflow.cn/v1
@@ -172,366 +157,142 @@ QWEN_MODEL=Qwen/Qwen3-8B
 
 # Debug Flags
 DEBUG_DEEPSEEK=0
-DEBUG_SILICONFLOW=0
-USE_QWEN_THEME_MATCH=1
-
-# Strategy Parameters
-REGULATORY_MAX_AGE_DAYS=730
+DEBUG_ZHIPU_SEARCH=0
+FORCE_LLM_LOGGING=0  # Print all LLM I/O to screen
 ```
 
 ### System Dependencies
 
-- **pandoc**: For Markdown to PDF conversion
-- **xelatex**: For Chinese PDF rendering
-- **Python**: 3.10+ recommended
-
-### Python Dependencies
-
 ```bash
-pip install pandas numpy duckdb mplfinance matplotlib \
-            langchain-core langchain-community python-dotenv zai
+# Arch Linux
+sudo pacman -S pandoc texlive-xetex
+
+# Debian/Ubuntu
+sudo apt-get install pandoc texlive-xetex
 ```
 
 ---
 
-## Data Schema and ETL Logic
+## Data Schema Reference
 
-### 1. Stock Basic Info (`data/stock_basic/stock_basic.parquet`)
+### Key Parquet Schemas
 
-**Source:** `pro.stock_basic()` API
+**`stock_ticks/{ts_code}.parquet`** - Daily OHLCV + fundamentals:
+- `ts_code`, `trade_date`, `open`, `high`, `low`, `close`, `vol`, `amount`
+- `turnover_rate`, `pe`, `pb`, `total_mv`, `circ_mv`
 
-| Column | Type | Description | Example |
-|--------|------|-------------|---------|
-| ts_code | string | Stock code (exchange.suffix) | `000001.SZ` |
-| symbol | string | Stock symbol | `000001` |
-| name | string | Company name | `平安银行` |
-| area | string | Geographic area | `深圳` |
-| industry | string | Industry classification | `银行` |
-| list_date | string | Listing date (YYYYMMDD) | `19910403` |
-| market | string | Market segment | `主板` |
-| exchange | string | Exchange code | `SZSE` |
+**`top_list/YYYYMMDD.parquet`** - Dragon Tiger List (~84 records/day):
+- `ts_code`, `name`, `close`, `pct_change`, `turnover_rate`
+- `l_buy`, `l_sell`, `net_amount` (capital flow signal)
+- `net_rate`, `amount_rate` (capital intensity signals)
 
----
-
-### 2. Stock Company Info (`data/stock_company/stock_company.parquet`)
-
-**Source:** `pro.stock_company()` API
-
-| Column | Type | Description | Example |
-|--------|------|-------------|---------|
-| ts_code | string | Stock code | `688322.SH` |
-| chairman | string | Chairman name | `黄源浩` |
-| manager | string | Manager name | `黄源浩` |
-| secretary | string | Secretary name | `靳尚` |
-| reg_capital | float | Registered capital | `40114.4240` |
-| setup_date | string | Setup date (YYYYMMDD) | `20130118` |
-| province | string | Province | `广东` |
-| city | string | City | `深圳市` |
-| introduction | string | Company introduction | Long text description |
-| website | string | Company website | `www.orbbec.com.cn` |
-| employees | float | Number of employees | `687.0` |
-| main_business | string | Main business description | Text description |
-| business_scope | string | Business scope | Text description |
+**`stock_company/stock_company.parquet`** - Company info:
+- `ts_code`, `name`, `industry`, `main_business`, `business_scope`, `introduction`
 
 ---
 
-### 3. Stock Ticks (`data/stock_ticks/{ts_code}.parquet`)
+## Research & Opportunity Discovery
 
-**Source:** Merged from `ts.pro_bar()` (price data) and `pro.daily_basic()` (fundamental data)
+### Phase 3 Two-Pass Strategy
 
-| Column | Type | Description | Example |
-|--------|------|-------------|---------|
-| ts_code | string | Stock code | `600036.SH` |
-| trade_date | string | Trade date (YYYYMMDD) | `20260109` |
-| open | float | Opening price | `41.54` |
-| high | float | Highest price | `41.76` |
-| low | float | Lowest price | `41.12` |
-| close | float | Closing price | `41.30` |
-| pre_close | float | Previous close | `41.58` |
-| change | float | Price change | `-0.28` |
-| pct_chg | float | Percentage change | `-0.67` |
-| vol | float | Volume (shares) | `985470.74` |
-| amount | float | Trading amount (RMB) | `4069939.125` |
-| turnover_rate | float | Turnover rate (%) | `0.4777` |
-| volume_ratio | float | Volume ratio | `NaN` |
-| pe | float | P/E ratio | `7.0192` |
-| pe_ttm | float | P/E ratio (TTM) | `6.9915` |
-| pb | float | P/B ratio | `0.9557` |
-| ps | float | P/S ratio | `3.0863` |
-| ps_ttm | float | P/S ratio (TTM) | `3.0981` |
-| dv_ratio | float | Dividend ratio (%) | `4.8426` |
-| dv_ttm | float | Dividend ratio TTM (%) | `4.8426` |
-| total_share | float | Total shares (万) | `2.52e+06` |
-| float_share | float | Float shares (万) | `2.06e+06` |
-| free_share | float | Free float shares (万) | `1.17e+06` |
-| total_mv | float | Total market cap (元) | `1.04e+08` |
-| circ_mv | float | Circulating market cap (元) | `8.52e+07` |
+1. **Opportunity Discovery Pass (First)**: Find positive catalysts
+   - Uses broad searches (no site: restrictions)
+   - Extracts: contracts, customers, policy support, tech breakthroughs, expansion
+   - Outputs: `PositiveFinding` and `GrowthCatalyst` objects
 
----
+2. **Adversarial Veto Pass (Second)**: Due diligence
+   - Uses official sources (site:cninfo.com.cn)
+   - Checks for hard fails
+   - Outputs: verdict (pass/warn/fail)
 
-### 4. Financial Data (`data/financial/income/{ts_code}.parquet`)
+### New Data Structures
 
-**Source:** `pro.income()` API
+**PositiveFinding:**
+- `category`: contract, customer, policy, technology, expansion
+- `description`, `evidence`, `confidence` (0.0-1.0)
+- `source_url`, `date`
 
-| Column | Type | Description |
-|--------|------|-------------|
-| ts_code | string | Stock code |
-| ann_date | string | Announcement date |
-| f_ann_date | string | First announcement date |
-| end_date | string | Report end date (YYYYMMDD) |
-| report_type | string | Report type (1=合并报表) |
-| basic_eps | float | Basic EPS per share |
-| diluted_eps | float | Diluted EPS per share |
-| total_revenue | float | Total revenue |
-| revenue | float | Operating revenue |
-| oper_cost | float | Operating cost |
-| operate_profit | float | Operating profit |
-| total_profit | float | Total profit |
-| n_income | float | Net income |
-| n_income_attr_p | float | Net income attributable to parent |
+**GrowthCatalyst:**
+- `catalyst_type`: policy, tech_breakthrough, market_expansion, competitive_moat
+- `timeframe`: near_term, medium_term, long_term
+- `confidence`
+
+**Enhanced AuditResult:**
+- `positive_findings`: List of positive findings
+- `growth_catalysts`: List of catalysts
+- `confidence_score`: Overall confidence (0.0-1.0)
+- `research_depth`: "standard" or "deep"
+- `capital_signal_summary`: From Dragon Tiger List
 
 ---
-
-### 5. Enriched Stock Analysis (In-Memory)
-
-**Source:** Computed during selection
-
-| Field | Description |
-|-------|-------------|
-| ts_code | Stock code |
-| current_price | Latest closing price |
-| consolidation_score | Technical consolidation score (0-100) |
-| ma_spread | MA convergence metric |
-| volume_boost | Recent volume multiple |
-| ma_trend | Trend (bullish/bearish/neutral) |
-| matched_themes | AI-matched market themes |
-
----
-
-### 6. Dragon Tiger List (`data/top_list/YYYYMMDD.parquet`)
-
-**Source:** `pro.top_list()` API - Aggregated daily data
-
-| Column | Type | Description | Example | Alpha Signal |
-|--------|------|-------------|---------|--------------|
-| ts_code | string | Stock code | `000400.SZ` | - |
-| trade_date | string | Trade date (YYYYMMDD) | `20260119` | Time series |
-| name | string | Stock name | `许继电气` | - |
-| close | float | Closing price | `15.42` | - |
-| pct_change | float | Price change (%) | `10.03` | Strength signal |
-| turnover_rate | float | Turnover rate (%) | `15.42` | Activity level |
-| l_sell | float | Top5 sell total (RMB) | `1.46e+08` | - |
-| l_buy | float | Top5 buy total (RMB) | `3.03e+08` | - |
-| l_amount | float | Buy+Sell total (RMB) | `4.49e+08` | - |
-| net_amount | float | Net buy (buy-sell, RMB) | `1.57e+08` | **Capital direction** |
-| net_rate | float | Net buy rate (%) | `3.50` | **Capital intensity** |
-| amount_rate | float | Buy/total volume (%) | `7.63` | **Capital ratio** |
-| float_values | float | Float market cap | `1.56e+10` | - |
-| reason | string | Listing reason | `日涨幅偏离值达到7%` | Trigger condition |
-
-**Daily Records:** ~84 records/day
-
-**ETL:** `TopListManager.fetch_top_list_daily()` - Fetched via `python main.py toplist`
-
-**Alpha Signals:**
-- `net_amount`: Positive = net inflow, Negative = net outflow
-- `net_rate`: Higher = stronger capital conviction
-- `amount_rate`: Buy side dominance > 5% indicates institutional interest
-- Aggregate by industry over 30-day window to identify hot themes
-
----
-
-### 7. Dragon Tiger List Institutional (`data/top_inst/YYYYMMDD.parquet`)
-
-**Source:** `pro.top_inst()` API - Per-institution trading details
-
-| Column | Type | Description | Example |
-|--------|------|-------------|---------|
-| trade_date | string | Trade date (YYYYMMDD) | `20260119` |
-| ts_code | string | Stock code | `000400.SZ` |
-| exalter | string | Institution/Branch name | `深股通专用` |
-| buy | float | Buy amount (RMB) | `3.03e+08` |
-| buy_rate | float | Buy / total volume (%) | `7.63` |
-| sell | float | Sell amount (RMB) | `1.46e+08` |
-| sell_rate | float | Sell / total volume (%) | `3.68` |
-| net_buy | float | Net amount (buy - sell) | `1.57e+08` |
-| side | int | 0=buy top5, 1=sell top5 | `0` |
-| reason | string | Listing reason | `日涨幅偏离值达到7%的前5只证券` |
-
-**ETL:** `TopListManager.fetch_top_inst_daily()` - Fetched via `python main.py toplist` (skip with `--no-inst`)
-
-**Alpha Signals:**
-- `exalter`: Track specific "smart money" institutions (e.g., 北向资金)
-- `net_buy`: Per-institution accumulation/distribution
-- Build institution reputation scoring
 
 ## Audit & Risk Assessment
 
 ### Hard Fail Conditions (One-Vote Veto)
 
-- 立案调查
-- 重大诉讼
-- 减持计划
-- 终止上市/退市风险
-- 近期行政处罚/纪律处分
+- 立案调查 (formal investigation)
+- 重大诉讼 (major litigation)
+- 减持计划 (shareholder reduction plan)
+- 退市风险 (delisting risk)
+- 近期行政处罚 (recent penalties, within `REGULATORY_MAX_AGE_DAYS=730`)
 
 ### Regulatory Pattern Matching
 
-**Severe** (within `REGULATORY_MAX_AGE_DAYS`):
-```
-行政处罚|处罚决定书|纪律处分|公开谴责|市场禁入
-```
+**Severe** (fail): `行政处罚|纪律处分|公开谴责|市场禁入`
+**Minor** (warn): `监管函|问询函|关注函|责令改正`
 
-**Minor** (warning only):
-```
-监管函|问询函|关注函|责令改正|监管措施决定书
-```
+### Source Domain Tiers (Expanded)
 
-### Primary Source Domains
-
-- `cninfo.com.cn` - 巨潮资讯网
+**Tier 1 - Primary (Official Disclosures):**
+- `cninfo.com.cn` - 巨潮资讯网 (official announcements)
 - `sse.com.cn` - 上交所
 - `szse.cn` - 深交所
 
----
+**Tier 2 - Secondary (Financial News & Analysis):**
+- `eastmoney.com` - 东方财富
+- `10jqka.com.cn` - 同花顺
+- `cls.cn` - 财联社
+- `yicai.com` - 第一财经
+- `caixin.com` - 财新网
+- `sina.com.cn` - 新浪财经
+- `gelonghui.com` - 格隆汇
+- `xueqiu.com` - 雪球
 
-## Testing
+**Tier 3 - Policy Sources:**
+- `gov.cn` - 政府门户
+- `ndrc.gov.cn` - 发改委
+- `miit.gov.cn` - 工信部
+- `most.gov.cn` - 科技部
 
-### Running Tests
-
-```bash
-python -m unittest tests/test_zhipu_search.py
-```
-
-### Test Coverage
-
-- `tests/test_zhipu_search.py`: Zhipu search functionality with mocked responses
-
----
-
-## Common Tasks
-
-### Run the Full Pipeline
-
-```bash
-source .venv/bin/activate
-python trend_agent.py
-```
-
-### Run Stock Screening Only
-
-```bash
-python screen_growth_stocks.py
-```
-
-### Check Environment Setup
-
-```bash
-python check_setup.py
-```
-
-### Enable Debug Logging
-
-```bash
-export DEBUG_DEEPSEEK=1
-export DEBUG_ZHIPU_SEARCH=1
-export DEBUG_SILICONFLOW=1
-```
+**Tier 4 - Company Background:**
+- `tianyancha.com` - 天眼查
+- `qichacha.com` - 企查查
 
 ---
 
-## AI/LLM Integration
-
-### Model Usage
+## LLM Model Configuration
 
 | Model | Provider | Purpose |
 |-------|----------|---------|
-| glm-4-flash | Zhipu AI | Theme extraction, audit analysis |
-| DeepSeek-V3.2 | SiliconFlow | Report generation, query planning |
-| Qwen3-8B | SiliconFlow | Theme matching, classification |
+| `glm-4-flash` | Zhipu AI | Web search |
+| `DeepSeek-V3.2` | SiliconFlow | Report generation, query planning, thinking mode |
+| `Qwen3-8B` | SiliconFlow | Theme matching, classification |
 
-### Tool Calling
+### DeepSeek Thinking Mode
 
-The report generation phase supports tool calling:
-- `web_search`: Search for additional information
-- `duckdb`: Execute SQL queries on data
-- `python`: Execute Python code for analysis
+DeepSeek V3.2 supports reasoning mode that returns both `reasoning_content` (chain of thought) and `content` (final answer). Configured via `llm_provider.py`:
 
----
+```python
+# Enable thinking mode for complex analysis
+result = invoke_deepseek_thinking(messages, thinking_budget=4096)
+```
 
-## Screening Criteria (Four Dimensions)
+### Tool Calling (Phase 5)
 
-### 1. Valuation & Market Cap (Safety Margin)
-- Market cap: 2-30 billion RMB
-- Exclude stocks at historical highs or 2x recent price
-
-### 2. Themes & Sentiment (Market Sentiment)
-- Match current hot market themes
-- Prefer companies with "stories not yet fully realized"
-
-### 3. Technical Patterns
-- Long-term consolidation (3-6 months, volatility < 35%)
-- MA convergence (MA20/MA60/MA120 intertwined or bullish)
-- Volume surge signals at bottom
-
-### 4. Fundamentals
-- Authentic theme targets (technology, products, market share)
-- Exclude ST, delisting risk, fraud suspects
-
----
-
-## Common Market Themes Reference
-
-| Category | Core Concepts |
-|----------|---------------|
-| AI Applications | AI营销, 端侧AI, 物理AI, AI大模型 |
-| Humanoid Robots | 减速器, 电机, 执行器 |
-| Brain-Computer Interface | 神经科技, 脑机设备 |
-| Low-Altitude Economy | eVTOL, 无人机, 低空飞行 |
-| Semiconductors | 存储芯片, 国产算力, 半导体设备 |
-| M&A Reorgs | 产业整合, 国企改革 |
-| Commercial Aerospace | 航天制造, 卫星应用 |
-| Intelligent Driving | L3级自动驾驶, 车路协同 |
-| Energy Storage | 固态电池, 储能系统 |
-
----
-
-## Investment Guidelines (For Reference)
-
-1. **Position Sizing**: Build in 3-4 batches, avoid chasing highs
-2. **Portfolio Allocation**: Core (60%) + Satellite (40%)
-3. **Profit/Loss Management**:
-   - Take profit: 30% gain in batches
-   - Stop loss: -15% strict cutoff
-4. **Holding Period**: 3-6 months medium-term
-
-### Risk Warnings
-
-- Theme speculation risk: Some stocks are concept-heavy, verify actual revenue
-- Industry cyclicality: Sensitive to macroeconomic conditions
-- Technical uncertainty: Emerging tech commercialization is uncertain
-- Small market cap: Higher volatility in 2-20B RMB range
-
----
-
-## Font Configuration for Charts
-
-The system uses Chinese fonts for chart rendering. Candidate fonts:
-- `Source Han Sans CN` (思源黑体)
-- `Noto Sans CJK SC`
-- `WenQuanYi Zen Hei`
-- `SimHei`
-
-Font files are auto-loaded from `/usr/share/fonts/adobe-source-han-sans/` if available.
-
----
-
-## Performance Notes
-
-- **Data Format**: Parquet for efficient columnar storage and querying
-- **Query Engine**: DuckDB for fast SQL on Parquet files
-- **Caching**: Theme matching results cached in `.cache/`
-- **Batch Processing**: LLM requests batched for efficiency
+Report generation supports tool calling:
+- `web_search`: Additional web searches
+- `duckdb`: SQL queries on stock data
+- `python`: Python code execution for analysis
 
 ---
 
@@ -540,24 +301,22 @@ Font files are auto-loaded from `/usr/share/fonts/adobe-source-han-sans/` if ava
 ### PDF Generation Fails
 
 ```bash
-# Install system dependencies
-# Arch Linux
-sudo pacman -S pandoc texlive-xetex
-
-# Debian/Ubuntu
-sudo apt-get install pandoc texlive-xetex
+# Install pandoc + xelatex for Chinese PDF rendering
+# Arch: sudo pacman -S pandoc texlive-xetex
+# Ubuntu: sudo apt-get install pandoc texlive-xetex
 ```
 
 ### Zhipu Search Not Working
 
-- Check `ZHIPUAI_API_KEY` is set
-- Enable debug: `DEBUG_ZHIPU_SEARCH=1`
-- Verify network connectivity to api.zhipuai.cn
+```bash
+# Check API key and enable debug
+export ZHIPUAI_API_KEY=xxx
+export DEBUG_ZHIPU_SEARCH=1
+```
 
 ### Data Files Missing
 
-- Ensure `data/` symlink points to valid data directory
-- Verify Parquet files exist in `data/stock_ticks/`
+Ensure `data/` symlink points to valid data directory with Parquet files.
 
 ---
 

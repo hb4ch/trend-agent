@@ -1,0 +1,280 @@
+import json
+
+import pandas as pd
+
+import trend_agent
+from trend_agent import (
+    AuditResult,
+    GrowthCatalyst,
+    PositiveFinding,
+    StrategyConfig,
+    ThemeItem,
+)
+
+
+def test_theme_cache_invalidation_by_theme_set(monkeypatch, tmp_path):
+    call_count = {"n": 0}
+
+    def fake_invoke(provider, messages, temperature=0.1):
+        call_count["n"] += 1
+        payload = json.loads(messages[-1]["content"])
+        theme_name = payload["themes"][0]["name"]
+        ts_code = payload["stocks"][0]["ts_code"]
+        return json.dumps({"matches": {ts_code: [theme_name]}, "notes": {ts_code: "ok"}}, ensure_ascii=False)
+
+    monkeypatch.setattr(trend_agent, "invoke_llm_messages", fake_invoke)
+
+    candidates = pd.DataFrame(
+        [
+            {
+                "ts_code": "000001.SZ",
+                "name": "平安银行",
+                "industry": "银行",
+                "main_business": "金融服务",
+                "business_scope": "银行",
+                "introduction": "介绍",
+            }
+        ]
+    )
+    cache_path = tmp_path / "qwen_cache.json"
+
+    out_a = trend_agent.qwen_match_themes(
+        themes=[ThemeItem(name="主题A", keywords=["a"], summary="", sources=[])],
+        candidates=candidates,
+        cache_path=cache_path,
+        cache_version="2",
+    )
+    out_b = trend_agent.qwen_match_themes(
+        themes=[ThemeItem(name="主题B", keywords=["b"], summary="", sources=[])],
+        candidates=candidates,
+        cache_path=cache_path,
+        cache_version="2",
+    )
+
+    assert out_a.iloc[0]["matched_themes"] == ["主题A"]
+    assert out_b.iloc[0]["matched_themes"] == ["主题B"]
+    assert call_count["n"] == 2
+
+
+def _price_df(last_close: float) -> pd.DataFrame:
+    n = 130
+    dates = pd.date_range("2025-01-01", periods=n, freq="B")
+    close = [9.5] * (n - 1) + [last_close]
+    high = [10.0] * (n - 1) + [max(10.0, last_close)]
+    low = [8.8] * n
+    open_ = [9.4] * n
+    vol = [1000] * n
+    turn = [1.0] * (n - 10) + [1.5] * 10
+    return pd.DataFrame(
+        {
+            "trade_date": dates,
+            "open": open_,
+            "high": high,
+            "low": low,
+            "close": close,
+            "volume": vol,
+            "turnover_rate": turn,
+        }
+    ).set_index("trade_date")
+
+
+def test_compute_signals_breakout_boundaries(monkeypatch):
+    price_map = {
+        "A": _price_df(9.8),
+        "B": _price_df(10.0),
+        "C": _price_df(10.1),
+        "D": _price_df(10.5),
+    }
+    monkeypatch.setattr(trend_agent, "load_price_data", lambda ts: price_map[ts])
+
+    candidates = pd.DataFrame(
+        [{"ts_code": code, "name": code} for code in ["A", "B", "C", "D"]]
+    )
+    signals = trend_agent.compute_signals(candidates)
+
+    assert signals["A"]["ready_to_break"] is True
+    assert signals["B"]["ready_to_break"] is True
+    assert signals["C"]["already_breakout"] is True
+    assert signals["C"]["ready_to_break"] is False
+    assert signals["D"]["extended_breakout"] is True
+    assert signals["D"]["ready_to_break"] is False
+
+
+def test_hard_fail_requires_relevance_and_material_reduce():
+    unrelated = {
+        "title": "其他公司公告减持5%",
+        "snippet": "与目标股票无关",
+        "url": "https://example.com",
+        "date": "2026-01-10",
+    }
+    assert trend_agent.detect_hard_fail_reason(
+        unrelated,
+        name="目标公司",
+        symbol="000001",
+        require_recency=True,
+        max_age_days=365,
+        reduce_threshold=0.03,
+    ) is None
+
+    small_reduce = {
+        "title": "目标公司拟减持不超过1%",
+        "snippet": "000001.SZ 股东减持计划",
+        "url": "https://example.com/1",
+        "date": "2026-01-10",
+    }
+    assert trend_agent.detect_hard_fail_reason(
+        small_reduce,
+        name="目标公司",
+        symbol="000001",
+        require_recency=True,
+        max_age_days=365,
+        reduce_threshold=0.03,
+    ) is None
+
+    large_reduce = {
+        "title": "目标公司拟减持不超过5%",
+        "snippet": "000001.SZ 股东大比例减持计划",
+        "url": "https://example.com/2",
+        "date": "2026-01-10",
+    }
+    assert trend_agent.detect_hard_fail_reason(
+        large_reduce,
+        name="目标公司",
+        symbol="000001",
+        require_recency=True,
+        max_age_days=365,
+        reduce_threshold=0.03,
+    ) == "material_reduction"
+
+
+def test_phase2_off_theme_fallback_mixed_labels(monkeypatch):
+    class FakeDTL:
+        def load_recent_toplist(self, days=60):
+            return pd.DataFrame(columns=["ts_code"])
+
+    monkeypatch.setattr(trend_agent, "DragonTigerList", FakeDTL)
+    monkeypatch.setattr(
+        trend_agent,
+        "screen_all_stocks",
+        lambda: pd.DataFrame(
+            [
+                {
+                    "ts_code": "000001.SZ",
+                    "name": "A",
+                    "industry": "I1",
+                    "consolidation_score": 65,
+                    "ma_spread": 0.18,
+                    "ma_spread_std": 0.04,
+                    "volume_boost": 1.3,
+                    "composite_score": 70.0,
+                },
+                {
+                    "ts_code": "000002.SZ",
+                    "name": "B",
+                    "industry": "I2",
+                    "consolidation_score": 62,
+                    "ma_spread": 0.19,
+                    "ma_spread_std": 0.04,
+                    "volume_boost": 1.2,
+                    "composite_score": 68.0,
+                },
+            ]
+        ),
+    )
+
+    calls = {"n": 0}
+
+    def fake_match(themes, candidates, cache_path, cache_version="2"):
+        calls["n"] += 1
+        out = candidates.copy()
+        if calls["n"] < 4:
+            out["matched_themes"] = [[] for _ in range(len(out))]
+        else:
+            out["matched_themes"] = [["AI"], []]
+        return out
+
+    monkeypatch.setattr(trend_agent, "qwen_match_themes", fake_match)
+    cfg = StrategyConfig(toplist_exclusion_mode="penalty")
+    themes = [ThemeItem(name="AI", keywords=["算力"], summary="", sources=[], validation_status="confirmed")]
+    out = trend_agent.phase2_quant_filter(themes, config=cfg)
+
+    row_a = out[out["ts_code"] == "000001.SZ"].iloc[0]
+    row_b = out[out["ts_code"] == "000002.SZ"].iloc[0]
+    assert bool(row_a["off_theme"]) is False
+    assert bool(row_b["off_theme"]) is True
+    assert set(out["filter_tier"].tolist()) == {"OFF_THEME_FALLBACK"}
+
+
+def test_end_to_end_fixture_ranking_and_audit_distribution():
+    candidates = pd.DataFrame(
+        [
+            {
+                "ts_code": "000001.SZ",
+                "name": "A",
+                "industry": "I1",
+                "matched_themes": ["AI"],
+                "ma_spread": 0.10,
+                "theme_strength_score": 1.0,
+                "toplist_recency_score": 0.1,
+            },
+            {
+                "ts_code": "000002.SZ",
+                "name": "B",
+                "industry": "I2",
+                "matched_themes": ["AI"],
+                "ma_spread": 0.20,
+                "theme_strength_score": 0.7,
+                "toplist_recency_score": 0.5,
+            },
+            {
+                "ts_code": "000003.SZ",
+                "name": "C",
+                "industry": "I3",
+                "matched_themes": ["机器人"],
+                "ma_spread": 0.22,
+                "theme_strength_score": 0.8,
+                "toplist_recency_score": 0.3,
+            },
+        ]
+    )
+    audits = [
+        AuditResult(
+            ts_code="000001.SZ",
+            name="A",
+            theme="AI",
+            verdict="pass",
+            rationale="ok",
+            sources=["https://cninfo.com.cn/a"],
+            positive_findings=[PositiveFinding("contract", "中标订单", "e", 0.9, "https://cninfo.com.cn/a")],
+            growth_catalysts=[GrowthCatalyst("market_expansion", "扩产", "near_term", 0.8)],
+        ),
+        AuditResult(
+            ts_code="000002.SZ",
+            name="B",
+            theme="AI",
+            verdict="warn",
+            rationale="warn",
+            sources=["https://eastmoney.com/b"],
+        ),
+        AuditResult(
+            ts_code="000003.SZ",
+            name="C",
+            theme="机器人",
+            verdict="fail",
+            rationale="fail",
+            sources=["https://cninfo.com.cn/c"],
+        ),
+    ]
+    filtered, filtered_audits = trend_agent.apply_audit_filter(candidates, audits)
+    assert set(filtered["ts_code"].tolist()) == {"000001.SZ", "000002.SZ"}
+    assert set(a.verdict for a in filtered_audits) == {"pass", "warn"}
+
+    signals = {
+        "000001.SZ": {"breakout_window_ok": True, "already_breakout": False, "extended_breakout": False, "turnover_mult": 1.6},
+        "000002.SZ": {"breakout_window_ok": False, "already_breakout": True, "extended_breakout": False, "turnover_mult": 3.8},
+    }
+    ranked = trend_agent.rank_candidates_for_alpha(filtered, filtered_audits, signals, config=StrategyConfig())
+    ordered = ranked["ts_code"].tolist()
+    assert ordered[0] == "000001.SZ"
+    assert "audit_risk_score" in ranked.columns
+    assert "alpha_rank_score" in ranked.columns

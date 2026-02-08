@@ -17,13 +17,14 @@ from utils import EPSILON
 logger = logging.getLogger(__name__)
 
 # ============ 筛选参数配置 ============
-MARKET_CAP_MIN = 20e8   # 50亿市值
-MARKET_CAP_MAX = 300e8  # 300亿市值
-MIN_DATA_DAYS = 120     # 最少交易日数据
+# Relaxed parameters to allow more candidates through to research phase
+MARKET_CAP_MIN = 10e8   # 10亿市值 (relaxed from 20e8 to allow smaller growth stocks)
+MARKET_CAP_MAX = 500e8  # 500亿市值 (relaxed from 300e8 to include more mature growth)
+MIN_DATA_DAYS = 180     # 最少交易日数据 (relaxed from 250 to allow newer IPOs)
+MA_PERIODS = [60, 120, 250]  # 均线周期
+MA_RECENT_DAYS = 50     # 均线观察窗口
 CONSOLIDATION_DAYS = 120  # 横盘观察天数
-VOLATILITY_THRESHOLD = 0.35  # 横盘波动幅度阈值（35%）
-MIN_AVG_TURNOVER = 1.0  # 最低平均换手率
-RECENT_VOLUME_BOOST = 1.5  # 近期放量倍数
+VOLATILITY_THRESHOLD = 0.50  # 横盘波动幅度阈值（50%）(relaxed from 0.35 to allow more dynamic stocks)
 
 # 排除条件
 EXCLUDE_ST = False       # 排除ST股票
@@ -80,19 +81,20 @@ def analyze_stock_technical(df, current_date=None):
     recent_low = recent["low"].min()
     recent_volatility = (recent_high - recent_low) / (recent_low + EPSILON)
 
-    # 均线系统（MA20/60/120 纠缠度：最近20天的平均粘合程度）
-    df["ma20"] = df["close"].rolling(20).mean()
-    df["ma60"] = df["close"].rolling(60).mean()
-    df["ma120"] = df["close"].rolling(120).mean()
-    ma_recent = df[["ma20", "ma60", "ma120"]].tail(20).dropna()
+    # 均线系统（MA60/120/250 纠缠度：最近MA_RECENT_DAYS天的平均粘合程度）
+    for period in MA_PERIODS:
+        df[f"ma{period}"] = df["close"].rolling(period).mean()
+
+    ma_cols = [f"ma{p}" for p in MA_PERIODS]
+    ma_recent = df[ma_cols].tail(MA_RECENT_DAYS).dropna()
     if ma_recent.empty:
         return None
     daily_spread = (ma_recent.max(axis=1) - ma_recent.min(axis=1)) / (ma_recent.min(axis=1) + EPSILON)
     ma_spread = float(daily_spread.mean())
     ma_spread_std = float(daily_spread.std(ddof=0)) if len(daily_spread) > 1 else 0.0
-    ma20 = float(df["ma20"].iloc[-1])
     ma60 = float(df["ma60"].iloc[-1])
     ma120 = float(df["ma120"].iloc[-1])
+    ma250 = float(df["ma250"].iloc[-1])
 
     # 量能分析
     avg_turnover = recent['turnover_rate'].mean()
@@ -110,9 +112,9 @@ def analyze_stock_technical(df, current_date=None):
         'avg_turnover': avg_turnover,
         'volume_boost': volume_boost,
         'price_position': price_position,
-        'ma20': ma20,
         'ma60': ma60,
         'ma120': ma120,
+        'ma250': ma250,
         'current_price': latest['close'],
         'market_cap': market_cap_yuan,
         'pe': latest.get('pe_ttm', latest.get('pe', 0)),
@@ -133,13 +135,80 @@ def analyze_stock_technical(df, current_date=None):
 
     # 5. 趋势判断
     ma_trend = "neutral"
-    if ma20 > ma60 > ma120:
+    if ma60 > ma120 > ma250:
         ma_trend = "bullish"
-    elif ma20 < ma60 < ma120:
+    elif ma60 < ma120 < ma250:
         ma_trend = "bearish"
     scores['ma_trend'] = ma_trend
 
+    # 6. Momentum scoring (new)
+    momentum_score = compute_momentum_score(df, latest, ma60, ma120, ma250, recent_high, recent_low, volume_boost)
+    scores['momentum_score'] = momentum_score
+
     return scores
+
+
+def compute_momentum_score(
+    df: pd.DataFrame,
+    latest: pd.Series,
+    ma60: float,
+    ma120: float,
+    ma250: float,
+    box_top: float,
+    box_bottom: float,
+    volume_boost: float,
+) -> float:
+    """
+    Compute momentum score for a stock.
+
+    Scores:
+    - MA alignment (price above MA20/MA60): 0-40 points
+    - Box position (proximity to breakout): 0-30 points
+    - Volume confirmation (recent vs historical): 0-30 points
+
+    Returns:
+        Momentum score from 0-100
+    """
+    close = latest['close']
+    score = 0.0
+
+    # 1. MA Alignment Score (0-40 points)
+    # Price above short-term MAs is bullish
+    ma20 = df["close"].rolling(20).mean().iloc[-1] if len(df) >= 20 else close
+    ma_alignment = 0.0
+    if close > ma20:
+        ma_alignment += 15.0
+    if close > ma60:
+        ma_alignment += 15.0
+    if ma20 > ma60:
+        ma_alignment += 10.0  # Short above medium is bullish
+    score += ma_alignment
+
+    # 2. Box Position Score (0-30 points)
+    # Proximity to box top indicates potential breakout
+    box_range = box_top - box_bottom
+    if box_range > EPSILON:
+        position = (close - box_bottom) / box_range
+        # Higher position = closer to breakout (but not already broken out)
+        if 0.7 <= position <= 0.95:
+            score += 30.0  # Ideal breakout zone
+        elif 0.5 <= position < 0.7:
+            score += 20.0  # Good position
+        elif 0.3 <= position < 0.5:
+            score += 10.0  # Neutral
+        # Below 0.3 or above 0.95 = 0 points
+
+    # 3. Volume Confirmation Score (0-30 points)
+    # Volume boost between 1.2-3.0x is ideal (accumulation without distribution)
+    if 1.2 <= volume_boost <= 3.0:
+        score += 30.0  # Ideal volume
+    elif 1.0 <= volume_boost < 1.2:
+        score += 15.0  # Slight increase
+    elif 3.0 < volume_boost <= 5.0:
+        score += 10.0  # High volume (may indicate distribution)
+    # Below 1.0 or above 5.0 = 0 points
+
+    return min(100.0, score)
 
 
 def screen_all_stocks() -> pd.DataFrame:
@@ -233,11 +302,13 @@ def screen_all_stocks() -> pd.DataFrame:
         logger.warning("No stocks passed the initial filter!")
         return None
 
-    # 排序：按横盘得分 + 换手率综合排序
+    # 排序：按横盘得分 + 动量 + 换手率综合排序
+    # Rebalanced weights: consolidation 40%, momentum 20%, volume 25%, turnover 15%
     results_df['composite_score'] = (
-        results_df['consolidation_score'] * 0.6 +
-        results_df['volume_boost'] * 10 * 0.2 +
-        results_df['avg_turnover'] * 2 * 0.2
+        results_df['consolidation_score'] * 0.40 +
+        results_df['momentum_score'] * 0.20 +
+        results_df['volume_boost'] * 10 * 0.25 +
+        results_df['avg_turnover'] * 2 * 0.15
     )
     results_df = results_df.sort_values('composite_score', ascending=False)
 

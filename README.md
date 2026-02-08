@@ -610,6 +610,17 @@ DEBUG_SILICONFLOW=0
 
 # Strategy Parameters
 REGULATORY_MAX_AGE_DAYS=730
+HOLDING_HORIZON=swing_2_8w
+TOPLIST_EXCLUSION_MODE=penalty
+TOPLIST_PENALTY_WEIGHT=0.25
+TOPLIST_LOOKBACK_DAYS=60
+TOPLIST_CROWDED_MIN_HITS=4
+HARD_FAIL_REQUIRE_RECENCY=1
+HARD_FAIL_MAX_AGE_DAYS=730
+HARD_FAIL_REDUCE_MATERIALITY_THRESHOLD=0.03
+THEME_CACHE_VERSION=2
+MAX_NAMES_PER_THEME=4
+MAX_NAMES_PER_INDUSTRY=4
 ```
 
 ---
@@ -634,6 +645,9 @@ python check_setup.py
 
 # 测试DeepSeek思维模式
 python test_deepseek_thinking.py
+
+# 离线评估候选池（5/10/20日收益 + 消融）
+python strategy_evaluator.py --candidates reports/candidates_YYYYMMDD_HHMMSS.csv
 ```
 
 ### 调试模式

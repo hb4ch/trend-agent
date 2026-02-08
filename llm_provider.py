@@ -9,6 +9,7 @@ Supports multiple LLM backends through langchain:
 import os
 import logging
 from typing import Optional, List, Dict, Any
+from datetime import datetime
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
 from langchain_core.prompts import ChatPromptTemplate
@@ -25,6 +26,184 @@ if load_dotenv:
     load_dotenv()
 
 logger = logging.getLogger(__name__)
+
+# =============================================================================
+# LLM Logging Configuration
+# =============================================================================
+
+# Force LLM input/output to be printed to screen (parsed, not raw JSON)
+# Set via environment variable: FORCE_LLM_LOGGING=1
+FORCE_LLM_LOGGING = os.environ.get("FORCE_LLM_LOGGING", "").strip() in {"1", "true", "True", "YES", "yes"}
+
+# =============================================================================
+# LLM Message Formatting Helpers
+# =============================================================================
+
+def format_messages_for_screen(messages: List[Dict[str, str]], model: str, max_length: int = 2000) -> str:
+    """
+    Format messages for screen display in a readable format.
+
+    Args:
+        messages: List of message dicts with "role" and "content" keys
+        model: Model name being called
+        max_length: Maximum content length to display (truncate if longer)
+
+    Returns:
+        Formatted string for screen output
+    """
+    lines = [
+        "",
+        "=" * 80,
+        f"[{datetime.now().strftime('%H:%M:%S')}] LLM CALL: {model}",
+        "=" * 80,
+    ]
+
+    for i, msg in enumerate(messages):
+        role = msg.get("role", "unknown")
+        content = msg.get("content", "")
+        content_type = msg.get("type", "text")  # For tool results etc.
+
+        # Truncate long content for readability
+        if len(content) > max_length:
+            content_preview = content[:max_length] + f"... [truncated, total {len(content)} chars]"
+        else:
+            content_preview = content
+
+        lines.append(f"\n--- Message {i+1}: {role.upper()} ---")
+
+        # Handle different content types
+        if role == "tool":
+            tool_call_id = msg.get("tool_call_id", "unknown")
+            lines.append(f"Tool Call ID: {tool_call_id}")
+            if content_type:
+                lines.append(f"Content Type: {content_type}")
+            lines.append(f"Result: {content_preview}")
+        elif role == "assistant":
+            # Check for tool_calls
+            tool_calls = msg.get("tool_calls")
+            if tool_calls:
+                lines.append(f"Tool Calls: {len(tool_calls)} tool(s)")
+                for tc in tool_calls:
+                    if isinstance(tc, dict):
+                        tc_func = tc.get("function", {})
+                        lines.append(f"  - {tc_func.get('name', 'unknown')}(...)")
+                    else:
+                        lines.append(f"  - {tc}")
+            if content:
+                lines.append(f"Content: {content_preview}")
+            # Check for reasoning_content (DeepSeek thinking mode)
+            reasoning = msg.get("reasoning_content", "")
+            if reasoning:
+                reasoning_preview = reasoning[:max_length] + "..." if len(reasoning) > max_length else reasoning
+                lines.append(f"Reasoning: {reasoning_preview}")
+        else:
+            # system, user messages
+            lines.append(content_preview)
+
+    lines.append("\n" + "=" * 80)
+    return "\n".join(lines)
+
+
+def format_response_for_screen(response: str, model: str, max_length: int = 3000) -> str:
+    """
+    Format LLM response for screen display in a readable format.
+
+    Args:
+        response: The response content
+        model: Model name that was called
+        max_length: Maximum response length to display (truncate if longer)
+
+    Returns:
+        Formatted string for screen output
+    """
+    if len(response) > max_length:
+        response_preview = response[:max_length] + f"\n... [truncated, total {len(response)} chars]"
+    else:
+        response_preview = response
+
+    lines = [
+        "",
+        "=" * 80,
+        f"[{datetime.now().strftime('%H:%M:%S')}] LLM RESPONSE: {model}",
+        "=" * 80,
+        response_preview,
+        "=" * 80,
+    ]
+    return "\n".join(lines)
+
+
+def format_thinking_response_for_screen(result: Dict[str, Any], model: str) -> str:
+    """
+    Format DeepSeek thinking mode response for screen display.
+
+    Args:
+        result: Result dict from invoke_thinking
+        model: Model name that was called
+
+    Returns:
+        Formatted string for screen output
+    """
+    content = result.get("content", "")
+    reasoning = result.get("reasoning_content", "")
+    tool_calls = result.get("tool_calls")
+    usage = result.get("usage")
+
+    lines = [
+        "",
+        "=" * 80,
+        f"[{datetime.now().strftime('%H:%M:%S')}] LLM RESPONSE (Thinking Mode): {model}",
+        "=" * 80,
+    ]
+
+    # Add reasoning content if present
+    if reasoning:
+        reasoning_preview = reasoning[:2000] + "\n... [truncated]" if len(reasoning) > 2000 else reasoning
+        lines.extend([
+            "🧠 REASONING PROCESS:",
+            "-" * 40,
+            reasoning_preview,
+            "-" * 40,
+        ])
+
+    # Add tool calls if present
+    if tool_calls:
+        lines.extend([
+            "",
+            f"🔧 TOOL CALLS: {len(tool_calls)} tool(s)",
+        ])
+        for tc in tool_calls:
+            if hasattr(tc, 'function'):
+                lines.append(f"  - {tc.function.name}(...)")
+            elif isinstance(tc, dict):
+                tc_func = tc.get("function", {})
+                lines.append(f"  - {tc_func.get('name', 'unknown')}(...)")
+
+    # Add final content
+    content_preview = content[:2000] + "\n... [truncated]" if len(content) > 2000 else content
+    lines.extend([
+        "",
+        "📝 FINAL ANSWER:",
+        "-" * 40,
+        content_preview,
+    ])
+
+    # Add usage info if available
+    if usage:
+        lines.extend([
+            "-" * 40,
+            f"Tokens: prompt={getattr(usage, 'prompt_tokens', '?')} + "
+            f"completion={getattr(usage, 'completion_tokens', '?')} = "
+            f"total={getattr(usage, 'total_tokens', '?')}"
+        ])
+
+    lines.append("=" * 80)
+    return "\n".join(lines)
+
+
+def log_to_screen(message: str) -> None:
+    """Print message directly to screen (bypasses logging system)."""
+    print(message, flush=True)
+
 
 # Model configurations
 ZHIPU_MODEL = os.environ.get("ZHIPU_MODEL", "glm-4-flash")
@@ -143,6 +322,17 @@ class LLMProvider:
         Returns:
             Response text
         """
+        # Build message dict for logging
+        log_messages = []
+        if system_prompt:
+            log_messages.append({"role": "system", "content": system_prompt})
+        for msg in messages:
+            log_messages.append({"role": "user", "content": msg})
+
+        # Log input if forced logging is enabled
+        if FORCE_LLM_LOGGING:
+            log_to_screen(format_messages_for_screen(log_messages, model))
+
         llm = self.get_llm(model, temperature)
 
         # Convert messages to langchain format
@@ -154,7 +344,13 @@ class LLMProvider:
             langchain_messages.append(HumanMessage(content=msg))
 
         response = llm.invoke(langchain_messages, **kwargs)
-        return response.content
+        response_content = response.content
+
+        # Log output if forced logging is enabled
+        if FORCE_LLM_LOGGING:
+            log_to_screen(format_response_for_screen(response_content, model))
+
+        return response_content
 
     def invoke_messages(
         self,
@@ -176,6 +372,10 @@ class LLMProvider:
         Returns:
             Response text
         """
+        # Log input if forced logging is enabled
+        if FORCE_LLM_LOGGING:
+            log_to_screen(format_messages_for_screen(messages, model))
+
         llm = self.get_llm(model, temperature)
 
         # Convert message dicts to langchain format
@@ -195,7 +395,13 @@ class LLMProvider:
                 langchain_messages.append(HumanMessage(content=content))
 
         response = llm.invoke(langchain_messages, **kwargs)
-        return response.content
+        response_content = response.content
+
+        # Log output if forced logging is enabled
+        if FORCE_LLM_LOGGING:
+            log_to_screen(format_response_for_screen(response_content, model))
+
+        return response_content
 
     def invoke_with_prompt(
         self,
@@ -380,6 +586,10 @@ class DeepSeekThinkingClient:
         thinking_budget = thinking_budget or self.default_thinking_budget
         model = model or self.reasoning_model
 
+        # Log input if forced logging is enabled
+        if FORCE_LLM_LOGGING:
+            log_to_screen(format_messages_for_screen(messages, f"{model} (thinking)"))
+
         # Prepare request with thinking mode enabled
         kwargs = {
             "model": model,
@@ -446,6 +656,10 @@ class DeepSeekThinkingClient:
                         f"content_length={len(result['content'])}, "
                         f"reasoning_length={len(result['reasoning_content'])}")
 
+            # Log output if forced logging is enabled
+            if FORCE_LLM_LOGGING:
+                log_to_screen(format_thinking_response_for_screen(result, f"{model} (thinking, streaming)"))
+
             return result
 
         # Extract response components (non-streaming)
@@ -461,6 +675,10 @@ class DeepSeekThinkingClient:
         logger.debug(f"DeepSeek thinking response - reasoning_tokens={getattr(response.usage, 'completion_tokens', 0)}, "
                     f"content_length={len(result['content'])}, "
                     f"reasoning_length={len(result['reasoning_content'])}")
+
+        # Log output if forced logging is enabled
+        if FORCE_LLM_LOGGING:
+            log_to_screen(format_thinking_response_for_screen(result, f"{model} (thinking)"))
 
         return result
 
