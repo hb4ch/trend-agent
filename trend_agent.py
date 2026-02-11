@@ -72,7 +72,7 @@ CHART_FONT_FALLBACKS = [
 # Configuration from environment
 DEBUG_DEEPSEEK = os.environ.get("DEBUG_DEEPSEEK", "").strip() in {"1", "true", "True", "YES", "yes"}
 REGULATORY_MAX_AGE_DAYS = int(os.environ.get("REGULATORY_MAX_AGE_DAYS", "730"))
-THEME_CACHE_SCHEMA_VERSION = "2"
+THEME_CACHE_SCHEMA_VERSION = "3"
 
 
 @dataclass
@@ -271,19 +271,62 @@ def qwen_match_themes(
 
     def get_text(row: pd.Series) -> str:
         """Get text representation of stock for theme matching."""
+        main_business = str(row.get("main_business", "") or "")
+        introduction = str(row.get("introduction", "") or "")
+        business_scope = str(row.get("business_scope", "") or "")
+        # `business_scope` is often registration boilerplate with broad terms.
+        # Keep only a short snippet so it cannot dominate classification.
+        business_scope = re.sub(r"一般项目[:：]", "", business_scope)[:180]
         return " | ".join(
             [
                 f"name={row.get('name','')}",
                 f"code={row.get('ts_code','')}",
                 f"industry={row.get('industry','')}",
-                f"main_business={str(row.get('main_business',''))}",  # Full text for semantic matching
-                f"business_scope={str(row.get('business_scope',''))}",  # Full text for semantic matching
-                f"intro={str(row.get('introduction',''))}",  # Full text for semantic matching
+                f"main_business={main_business}",
+                f"business_scope={business_scope}",
+                f"intro={introduction[:500]}",
             ]
         )
 
+    def _theme_tokens(theme_name: str, keywords: List[str]) -> set[str]:
+        toks: set[str] = set()
+        for part in [theme_name, *(keywords or [])]:
+            cleaned = re.sub(r"[^\w\u4e00-\u9fff]+", " ", str(part))
+            for tok in cleaned.split():
+                if len(tok) >= 2 and tok not in {"题材", "板块", "产业", "行业", "应用", "前沿", "高端", "制造"}:
+                    toks.add(tok)
+        return toks
+
+    theme_token_map: Dict[str, set[str]] = {
+        t["name"]: _theme_tokens(t["name"], t.get("keywords", [])) for t in theme_list
+    }
+
     updated = candidates.copy()
     matched_map: Dict[str, List[str]] = {}
+    row_by_code: Dict[str, pd.Series] = {str(r["ts_code"]): r for _, r in updated.iterrows()}
+
+    def validate_match(ts_code: str, picked: List[str]) -> List[str]:
+        """
+        Deterministic sanity guard:
+        - require >=1 hit in main_business, OR
+        - require >=2 hits in (main_business + introduction)
+        This blocks matches that rely only on generic business_scope phrases.
+        """
+        row = row_by_code.get(str(ts_code))
+        if row is None:
+            return picked
+        main_business = str(row.get("main_business", "") or "")
+        combined = f"{main_business} {str(row.get('introduction','') or '')}"
+        kept: List[str] = []
+        for theme_name in picked:
+            toks = theme_token_map.get(theme_name, set())
+            if not toks:
+                continue
+            main_hits = sum(1 for tok in toks if tok in main_business)
+            combined_hits = sum(1 for tok in toks if tok in combined)
+            if main_hits >= 1 or combined_hits >= 2:
+                kept.append(theme_name)
+        return kept
 
     batch = []
     batch_keys = []
@@ -318,7 +361,9 @@ def qwen_match_themes(
                     "3. **概念延伸**：符合题材叙事逻辑或市场预期的标的\n\n"
                     "**要求：**\n"
                     "- 从白名单中选择0-2个最相关题材\n"
-                    "- 即使关联不直接，只要逻辑合理就可以选择\n"
+                    "- 仅当主营业务/产品/客户链条有实质关联时才可匹配\n"
+                    "- 不允许仅凭经营范围模板词（如通信设备制造、AI硬件销售等）直接匹配\n"
+                    "- 若证据主要来自经营范围而非主营业务，必须返回空数组\n"
                     "- 完全无关才返回空数组\n"
                     "- 输出严格JSON：{\"matches\":{\"ts_code\":[\"theme1\",\"theme2\"]},\"notes\":{\"ts_code\":\"reason\"}}\n"
                     "- notes中说明关联逻辑（直接/间接/概念延伸）"
@@ -344,6 +389,7 @@ def qwen_match_themes(
             if not isinstance(picked, list):
                 picked = []
             picked = [str(x) for x in picked if str(x) in [t["name"] for t in theme_list]]
+            picked = validate_match(str(ts_code), picked)
             matched_map[ts_code] = picked
             cache[fp] = {
                 "schema_version": cache_version,
@@ -375,6 +421,69 @@ def qwen_match_themes(
 
     updated["matched_themes"] = updated["ts_code"].map(lambda c: matched_map.get(c, []))
     return updated
+
+
+def heuristic_match_themes(
+    themes: List[ThemeItem],
+    candidates: pd.DataFrame,
+    existing_col: str = "matched_themes",
+) -> pd.DataFrame:
+    """
+    Heuristically assign themes based on keyword and theme-name token overlap.
+
+    Used as a fallback when LLM matching returns sparse or zero coverage.
+    """
+    if candidates.empty or not themes:
+        return candidates
+    out = candidates.copy()
+
+    def normalized_tokens(text: str) -> List[str]:
+        cleaned = re.sub(r"[^\w\u4e00-\u9fff]+", " ", str(text or ""))
+        return [tok for tok in cleaned.split() if len(tok) >= 2]
+
+    theme_features = []
+    for t in themes:
+        if not t.name:
+            continue
+        tokens = set(normalized_tokens(t.name))
+        for kw in (t.keywords or []):
+            tokens.update(normalized_tokens(kw))
+        tokens = {tok for tok in tokens if tok not in {"主题", "板块", "产业", "行业", "概念"}}
+        theme_features.append((t.name, tokens))
+
+    if not theme_features:
+        return out
+
+    def text_for_row(row: pd.Series) -> str:
+        return " ".join(
+            [
+                str(row.get("name", "")),
+                str(row.get("industry", "")),
+                str(row.get("main_business", "")),
+                str(row.get("business_scope", "")),
+                str(row.get("introduction", "")),
+            ]
+        )
+
+    matched_values = []
+    for _, row in out.iterrows():
+        base = row.get(existing_col, [])
+        base = base if isinstance(base, list) else []
+        if base:
+            matched_values.append(base)
+            continue
+        text = text_for_row(row)
+        picked = []
+        for theme_name, toks in theme_features:
+            if not toks:
+                continue
+            if any(tok and tok in text for tok in toks):
+                picked.append(theme_name)
+            if len(picked) >= 2:
+                break
+        matched_values.append(picked)
+    out[existing_col] = matched_values
+    return out
 
 
 # Constants for regulatory audit - Expanded source domains for opportunity discovery
@@ -908,6 +1017,8 @@ def phase2_quant_filter(themes: List[ThemeItem], config: Optional[StrategyConfig
     # Filter to only confirmed themes (web + capital both confirmed)
     confirmed_themes = [t for t in themes if t.validation_status == "confirmed"]
     web_only_themes = [t for t in themes if t.validation_status == "web_only"]
+    capital_only_themes = [t for t in themes if t.validation_status == "capital_only"]
+    weak_themes = [t for t in themes if t.validation_status == "weak"]
 
     # If no confirmed themes, fall back to web_only
     if not confirmed_themes and web_only_themes:
@@ -918,7 +1029,9 @@ def phase2_quant_filter(themes: List[ThemeItem], config: Optional[StrategyConfig
         logger.warning("No confirmed or web_only themes, using all themes")
         confirmed_themes = themes
 
-    logger.info(f"Phase 2 filtering with {len(confirmed_themes)} confirmed themes: {[t.name for t in confirmed_themes]}")
+    logger.info(f"Phase 2 filtering with {len(confirmed_themes)} primary themes: {[t.name for t in confirmed_themes]}")
+    expanded_themes = confirmed_themes + [t for t in (web_only_themes + capital_only_themes) if t.name not in {x.name for x in confirmed_themes}]
+    broad_themes = expanded_themes + [t for t in weak_themes if t.name not in {x.name for x in expanded_themes}]
 
     # Build toplist recency features for overcrowding control
     dtl = DragonTigerList()
@@ -1002,13 +1115,24 @@ def phase2_quant_filter(themes: List[ThemeItem], config: Optional[StrategyConfig
 
         logger.info(f"Tier '{tier['name']}': {len(filtered)} candidates passed technical filter")
 
-        # Use Qwen LLM for semantic theme matching
+        # Use staged theme matching: primary themes first, then broader pool if needed.
         filtered = qwen_match_themes(
             confirmed_themes,
             filtered,
             cache_path=Path(".cache/qwen_theme_match.json"),
             cache_version=config.theme_cache_version,
         )
+        has_match = filtered["matched_themes"].apply(bool).sum() if "matched_themes" in filtered.columns else 0
+        if has_match == 0 and expanded_themes:
+            filtered = qwen_match_themes(
+                expanded_themes,
+                filtered,
+                cache_path=Path(".cache/qwen_theme_match.json"),
+                cache_version=f"{config.theme_cache_version}_expanded",
+            )
+            has_match = filtered["matched_themes"].apply(bool).sum() if "matched_themes" in filtered.columns else 0
+        if has_match == 0 and broad_themes:
+            filtered = heuristic_match_themes(broad_themes, filtered, existing_col="matched_themes")
 
         has_match = filtered["matched_themes"].apply(bool).sum() if "matched_themes" in filtered.columns else 0
         logger.info(f"Tier '{tier['name']}': {has_match} candidates matched themes")
@@ -1045,6 +1169,17 @@ def phase2_quant_filter(themes: List[ThemeItem], config: Optional[StrategyConfig
         cache_path=Path(".cache/qwen_theme_match.json"),
         cache_version=config.theme_cache_version,
     )
+    has_fallback_match = filtered["matched_themes"].apply(bool).sum() if "matched_themes" in filtered.columns else 0
+    if has_fallback_match == 0 and expanded_themes:
+        filtered = qwen_match_themes(
+            expanded_themes,
+            filtered,
+            cache_path=Path(".cache/qwen_theme_match.json"),
+            cache_version=f"{config.theme_cache_version}_expanded",
+        )
+        has_fallback_match = filtered["matched_themes"].apply(bool).sum() if "matched_themes" in filtered.columns else 0
+    if has_fallback_match == 0 and broad_themes:
+        filtered = heuristic_match_themes(broad_themes, filtered, existing_col="matched_themes")
     filtered["theme_strength_score"] = filtered["matched_themes"].map(
         lambda arr: max([theme_strength_map.get(str(t), 0.5) for t in arr], default=0.0)
     )
@@ -2065,6 +2200,71 @@ def phase5_report(
     return md_path
 
 
+def build_deterministic_core_table(candidates: pd.DataFrame, audits: List[AuditResult], top_n: int = 8) -> str:
+    """Build deterministic core stock markdown table from ranked candidates."""
+    if candidates is None or candidates.empty:
+        return (
+            "## 【核心金股】\n\n"
+            "| 股票 | 所属主线 | 形态特征 | 置信度 | 推荐理由 |\n"
+            "| --- | --- | --- | --- | --- |\n"
+        )
+    audit_conf = {}
+    for a in audits or []:
+        audit_conf.setdefault(a.ts_code, []).append(float(a.confidence_score or 0.5))
+
+    lines = [
+        "## 【核心金股】",
+        "",
+        "| 股票 | 所属主线 | 形态特征 | 置信度 | 推荐理由 |",
+        "| --- | --- | --- | --- | --- |",
+    ]
+    for _, row in candidates.head(top_n).iterrows():
+        ts_code = str(row.get("ts_code", ""))
+        name = str(row.get("name", ts_code))
+        matched = row.get("matched_themes", [])
+        if not isinstance(matched, list):
+            matched = []
+        off_theme = bool(row.get("off_theme", not bool(matched)))
+        if off_theme:
+            theme_text = "**OFF-THEME（无题材匹配）**"
+        else:
+            theme_text = ", ".join(matched[:2]) if matched else "待确认"
+        shape_parts = []
+        if "consolidation_score" in row:
+            shape_parts.append(f"横盘分{float(row.get('consolidation_score', 0.0)):.0f}")
+        if "volume_boost" in row:
+            shape_parts.append(f"量能{float(row.get('volume_boost', 0.0)):.2f}")
+        if "filter_tier" in row:
+            shape_parts.append(f"层级{row.get('filter_tier')}")
+        shape = "，".join(shape_parts) if shape_parts else "技术形态待补充"
+        conf_list = audit_conf.get(ts_code, [])
+        confidence = float(np.mean(conf_list)) if conf_list else 0.5
+        reason_parts = []
+        if off_theme:
+            reason_parts.append("该股票未匹配当前热点题材，仅基于技术形态入选")
+        if "alpha_rank_score" in row:
+            reason_parts.append(f"alpha评分{float(row.get('alpha_rank_score', 0.0)):.1f}")
+        if "toplist_recency_score" in row:
+            reason_parts.append(f"拥挤度{float(row.get('toplist_recency_score', 0.0)):.2f}")
+        reason = "；".join(reason_parts) if reason_parts else "综合评分靠前"
+        lines.append(f"| {name}({ts_code}) | {theme_text} | {shape} | {confidence:.2f} | {reason} |")
+    return "\n".join(lines)
+
+
+def upsert_core_table_in_report(report_md: str, table_section_md: str) -> str:
+    """Replace existing core table section or insert one if missing."""
+    if not report_md:
+        return table_section_md
+    pattern = r"##\s*【核心金股】[\s\S]*?(?=\n##\s*【|\Z)"
+    if re.search(pattern, report_md):
+        return re.sub(pattern, table_section_md + "\n\n", report_md, count=1)
+    insert_after = re.search(r"##\s*【市场风向标】[\s\S]*?(?=\n##\s*【|\Z)", report_md)
+    if insert_after:
+        idx = insert_after.end()
+        return report_md[:idx] + "\n\n" + table_section_md + "\n\n" + report_md[idx:]
+    return table_section_md + "\n\n" + report_md
+
+
 def phase5_report_with_deepseek(
     themes: List[ThemeItem],
     candidates: pd.DataFrame,
@@ -2115,7 +2315,7 @@ def phase5_report_with_deepseek(
     audit_df = pd.DataFrame(audit_records)
 
     # Ensure off_theme and filter_tier columns exist in candidates
-    candidates_with_flag = candidates.head(12).copy()
+    candidates_with_flag = candidates.head(15).copy()
     if "off_theme" not in candidates_with_flag.columns:
         candidates_with_flag["off_theme"] = False
     if "filter_tier" not in candidates_with_flag.columns:
@@ -2309,6 +2509,8 @@ def phase5_report_with_deepseek(
         if real_urls:
             report_md = report_md.replace("url1", real_urls[0])
 
+    core_table_md = build_deterministic_core_table(candidates_with_flag, audits, top_n=min(10, len(candidates_with_flag)))
+    report_md = upsert_core_table_in_report(report_md, core_table_md)
     md_path.write_text(report_md, encoding="utf-8")
     return md_path
 
@@ -2333,6 +2535,12 @@ def postprocess_markdown(md_path: Path) -> Path:
     processed_lines = []
 
     for line in lines:
+        # Avoid pandoc YAML misparse for bare '---' separators in body text.
+        # Keep visual separator semantics using markdown horizontal rule '***'.
+        if line.strip() == "---":
+            processed_lines.append("***")
+            continue
+
         # Fix long comma-separated date lists - break them into multiple lines
         if "量能异动日：" in line and "," in line:
             match = re.search(r"(.*?)量能异动日：(.*?)(?:$|!)", line)

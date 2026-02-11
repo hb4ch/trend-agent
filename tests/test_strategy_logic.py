@@ -30,7 +30,7 @@ def test_theme_cache_invalidation_by_theme_set(monkeypatch, tmp_path):
                 "ts_code": "000001.SZ",
                 "name": "平安银行",
                 "industry": "银行",
-                "main_business": "金融服务",
+                "main_business": "主题A业务、主题B业务与金融服务",
                 "business_scope": "银行",
                 "introduction": "介绍",
             }
@@ -182,18 +182,24 @@ def test_phase2_off_theme_fallback_mixed_labels(monkeypatch):
         ),
     )
 
-    calls = {"n": 0}
-
     def fake_match(themes, candidates, cache_path, cache_version="2"):
-        calls["n"] += 1
         out = candidates.copy()
-        if calls["n"] < 4:
+        out["matched_themes"] = [[] for _ in range(len(out))]
+        return out
+
+    heuristic_calls = {"n": 0}
+
+    def fake_heuristic(themes, candidates, existing_col="matched_themes"):
+        heuristic_calls["n"] += 1
+        out = candidates.copy()
+        if heuristic_calls["n"] < 4:
             out["matched_themes"] = [[] for _ in range(len(out))]
         else:
             out["matched_themes"] = [["AI"], []]
         return out
 
     monkeypatch.setattr(trend_agent, "qwen_match_themes", fake_match)
+    monkeypatch.setattr(trend_agent, "heuristic_match_themes", fake_heuristic)
     cfg = StrategyConfig(toplist_exclusion_mode="penalty")
     themes = [ThemeItem(name="AI", keywords=["算力"], summary="", sources=[], validation_status="confirmed")]
     out = trend_agent.phase2_quant_filter(themes, config=cfg)
@@ -278,3 +284,80 @@ def test_end_to_end_fixture_ranking_and_audit_distribution():
     assert ordered[0] == "000001.SZ"
     assert "audit_risk_score" in ranked.columns
     assert "alpha_rank_score" in ranked.columns
+
+
+def test_heuristic_match_themes_recovers_non_empty_matches():
+    themes = [
+        ThemeItem(name="商业航天与卫星互联网", keywords=["卫星", "航天"], summary="", sources=[]),
+        ThemeItem(name="电网投资", keywords=["电网", "变压器"], summary="", sources=[]),
+    ]
+    candidates = pd.DataFrame(
+        [
+            {
+                "ts_code": "000001.SZ",
+                "name": "航天科技",
+                "industry": "军工",
+                "main_business": "卫星通信设备研发",
+                "business_scope": "航天电子产品",
+                "introduction": "",
+                "matched_themes": [],
+            }
+        ]
+    )
+    out = trend_agent.heuristic_match_themes(themes, candidates)
+    assert out.iloc[0]["matched_themes"]
+
+
+def test_upsert_core_table_replaces_sparse_llm_core_section():
+    report = (
+        "# 报告\n\n"
+        "## 【市场风向标】\n内容\n\n"
+        "## 【核心金股】\n\n"
+        "| 股票 | 所属主线 |\n| --- | --- |\n| A | OFF |\n\n"
+        "## 【深度图解】\n后续"
+    )
+    candidates = pd.DataFrame(
+        [
+            {"ts_code": "000001.SZ", "name": "A", "matched_themes": ["AI"], "off_theme": False, "consolidation_score": 70, "volume_boost": 1.5, "filter_tier": "Strict"},
+            {"ts_code": "000002.SZ", "name": "B", "matched_themes": [], "off_theme": True, "consolidation_score": 68, "volume_boost": 1.3, "filter_tier": "Fallback"},
+        ]
+    )
+    table = trend_agent.build_deterministic_core_table(candidates, audits=[], top_n=2)
+    merged = trend_agent.upsert_core_table_in_report(report, table)
+    assert merged.count("## 【核心金股】") == 1
+    assert "| A(000001.SZ) |" in merged
+    assert "| B(000002.SZ) |" in merged
+
+
+def test_qwen_match_guard_blocks_scope_only_false_positive(monkeypatch, tmp_path):
+    def fake_invoke(provider, messages, temperature=0.1):
+        payload = json.loads(messages[-1]["content"])
+        ts_code = payload["stocks"][0]["ts_code"]
+        return json.dumps(
+            {"matches": {ts_code: ["算力基建与通信（光模块/通信设备）"]}, "notes": {ts_code: "直接匹配"}},
+            ensure_ascii=False,
+        )
+
+    monkeypatch.setattr(trend_agent, "invoke_llm_messages", fake_invoke)
+    candidates = pd.DataFrame(
+        [
+            {
+                "ts_code": "300784.SZ",
+                "name": "利安科技",
+                "industry": "塑料",
+                "main_business": "主营业务为精密注塑模具和注塑产品",
+                "business_scope": "一般项目: 通信设备制造; 人工智能硬件销售; 电子产品销售",
+                "introduction": "模塑一体化生产企业。",
+            }
+        ]
+    )
+    themes = [
+        ThemeItem(
+            name="算力基建与通信（光模块/通信设备）",
+            keywords=["算力", "光模块", "通信设备"],
+            summary="",
+            sources=[],
+        )
+    ]
+    out = trend_agent.qwen_match_themes(themes, candidates, cache_path=tmp_path / "cache.json", cache_version="3")
+    assert out.iloc[0]["matched_themes"] == []
