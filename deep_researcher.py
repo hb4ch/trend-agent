@@ -299,33 +299,49 @@ def siliconflow_chat(
             "Authorization": f"Bearer {api_key}",
         },
     )
-    try:
-        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
-            body = json.loads(resp.read().decode("utf-8"))
-        content = body["choices"][0]["message"]["content"]
+    max_retries = 4
+    retry_backoff_s = 3
+    for attempt in range(max_retries + 1):
+        try:
+            with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+                body = json.loads(resp.read().decode("utf-8"))
+            content = body["choices"][0]["message"]["content"]
 
-        # Log output if forced logging is enabled
-        if FORCE_LLM_LOGGING and format_response_for_screen:
-            log_to_screen(format_response_for_screen(content, model))
+            # Log output if forced logging is enabled
+            if FORCE_LLM_LOGGING and format_response_for_screen:
+                log_to_screen(format_response_for_screen(content, model))
 
-        if debug or DEBUG_SILICONFLOW:
-            try:
-                print(f"[{debug_prefix}] response:\n" + _truncate(content, 4000))
-            except Exception:
-                pass
-        return content
-    except urllib.error.HTTPError as e:
-        if debug or DEBUG_SILICONFLOW:
-            print(f"[{debug_prefix}] HTTP error: {e.code} - {e.reason}")
-        return None
-    except urllib.error.URLError as e:
-        if debug or DEBUG_SILICONFLOW:
-            print(f"[{debug_prefix}] URL error: {e.reason}")
-        return None
-    except Exception as e:
-        if debug or DEBUG_SILICONFLOW:
-            print(f"[{debug_prefix}] error: {str(e)}")
-        return None
+            if debug or DEBUG_SILICONFLOW:
+                try:
+                    print(f"[{debug_prefix}] response:\n" + _truncate(content, 4000))
+                except Exception:
+                    pass
+            return content
+        except urllib.error.HTTPError as e:
+            if e.code == 429 and attempt < max_retries:
+                retry_after = e.headers.get("Retry-After") if getattr(e, "headers", None) else None
+                sleep_s = retry_backoff_s * (2 ** attempt)
+                if retry_after:
+                    try:
+                        sleep_s = max(sleep_s, float(retry_after))
+                    except Exception:
+                        pass
+                if debug or DEBUG_SILICONFLOW:
+                    print(f"[{debug_prefix}] HTTP 429 rate limited, retrying in {sleep_s:.1f}s (attempt {attempt + 1}/{max_retries})")
+                time.sleep(sleep_s)
+                continue
+            if debug or DEBUG_SILICONFLOW:
+                print(f"[{debug_prefix}] HTTP error: {e.code} - {e.reason}")
+            return None
+        except urllib.error.URLError as e:
+            if debug or DEBUG_SILICONFLOW:
+                print(f"[{debug_prefix}] URL error: {e.reason}")
+            return None
+        except Exception as e:
+            if debug or DEBUG_SILICONFLOW:
+                print(f"[{debug_prefix}] error: {str(e)}")
+            return None
+    return None
 
 
 def qwen_chat(messages: List[dict]) -> Optional[str]:

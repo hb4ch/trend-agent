@@ -582,9 +582,21 @@ HARD_FAIL_REQUIRE_RECENCY=1
 HARD_FAIL_MAX_AGE_DAYS=730
 HARD_FAIL_REDUCE_MATERIALITY_THRESHOLD=0.03
 THEME_CACHE_VERSION=2
+THEME_MATCH_POLICY=conservative
 MAX_NAMES_PER_THEME=4
 MAX_NAMES_PER_INDUSTRY=4
+
+# Qwen Theme Match Rate-Limit Controls (Phase 2)
+QWEN_BATCH_SIZE=4
+QWEN_RATE_LIMIT_MAX_RETRIES=6
+QWEN_RATE_LIMIT_BASE_DELAY_SEC=1.0
+QWEN_RATE_LIMIT_MAX_DELAY_SEC=20.0
+QWEN_REQUEST_INTERVAL_SEC=0.35
 ```
+
+说明:
+- 当Qwen在批次匹配中持续返回`429`并耗尽重试后，系统会对该批次降级为空匹配（`rate_limited_exhausted`），流水线继续执行并进入既有heuristic/off-theme fallback逻辑。
+- 默认采用“可靠性优先”策略：更小批次 + 请求节流 + 指数退避，降低TPM突发峰值导致的整体失败概率。
 
 ---
 

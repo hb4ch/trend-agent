@@ -15,8 +15,10 @@ import hashlib
 import json
 import logging
 import os
+import random
 import re
 import subprocess
+import time
 import contextlib
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -88,12 +90,22 @@ class StrategyConfig:
     hard_fail_max_age_days: int = REGULATORY_MAX_AGE_DAYS
     hard_fail_reduce_materiality_threshold: float = 0.03
     theme_cache_version: str = THEME_CACHE_SCHEMA_VERSION
+    theme_match_policy: str = "conservative"  # conservative|balanced|aggressive
     max_names_per_theme: int = 4
     max_names_per_industry: int = 4
+    qwen_batch_size: int = 4
+    qwen_rate_limit_max_retries: int = 6
+    qwen_rate_limit_base_delay_sec: float = 1.0
+    qwen_rate_limit_max_delay_sec: float = 20.0
+    qwen_request_interval_sec: float = 0.35
 
     @classmethod
     def from_env(cls) -> "StrategyConfig":
         """Build configuration from environment variables."""
+        theme_match_policy = os.environ.get("THEME_MATCH_POLICY", "conservative").strip().lower()
+        if theme_match_policy not in {"conservative", "balanced", "aggressive"}:
+            logger.warning(f"Invalid THEME_MATCH_POLICY='{theme_match_policy}', fallback to conservative")
+            theme_match_policy = "conservative"
         return cls(
             holding_horizon=os.environ.get("HOLDING_HORIZON", "swing_2_8w"),
             toplist_exclusion_mode=os.environ.get("TOPLIST_EXCLUSION_MODE", "penalty"),
@@ -104,8 +116,14 @@ class StrategyConfig:
             hard_fail_max_age_days=int(os.environ.get("HARD_FAIL_MAX_AGE_DAYS", str(REGULATORY_MAX_AGE_DAYS))),
             hard_fail_reduce_materiality_threshold=float(os.environ.get("HARD_FAIL_REDUCE_MATERIALITY_THRESHOLD", "0.03")),
             theme_cache_version=os.environ.get("THEME_CACHE_VERSION", THEME_CACHE_SCHEMA_VERSION),
+            theme_match_policy=theme_match_policy,
             max_names_per_theme=int(os.environ.get("MAX_NAMES_PER_THEME", "4")),
             max_names_per_industry=int(os.environ.get("MAX_NAMES_PER_INDUSTRY", "4")),
+            qwen_batch_size=max(1, int(os.environ.get("QWEN_BATCH_SIZE", "4"))),
+            qwen_rate_limit_max_retries=max(0, int(os.environ.get("QWEN_RATE_LIMIT_MAX_RETRIES", "6"))),
+            qwen_rate_limit_base_delay_sec=max(0.0, float(os.environ.get("QWEN_RATE_LIMIT_BASE_DELAY_SEC", "1.0"))),
+            qwen_rate_limit_max_delay_sec=max(0.0, float(os.environ.get("QWEN_RATE_LIMIT_MAX_DELAY_SEC", "20.0"))),
+            qwen_request_interval_sec=max(0.0, float(os.environ.get("QWEN_REQUEST_INTERVAL_SEC", "0.35"))),
         )
 
 
@@ -220,7 +238,11 @@ def parse_search_payload(raw: Any) -> Dict[str, Any]:
 
 
 def qwen_match_themes(
-    themes: List[ThemeItem], candidates: pd.DataFrame, cache_path: Path, cache_version: str = THEME_CACHE_SCHEMA_VERSION
+    themes: List[ThemeItem],
+    candidates: pd.DataFrame,
+    cache_path: Path,
+    cache_version: str = THEME_CACHE_SCHEMA_VERSION,
+    config: Optional[StrategyConfig] = None,
 ) -> pd.DataFrame:
     """
     Match stocks to themes using Qwen LLM for semantic understanding.
@@ -235,6 +257,7 @@ def qwen_match_themes(
     """
     if not themes or candidates.empty:
         return candidates
+    config = config or StrategyConfig.from_env()
 
     cache: Dict[str, Any] = {}
     try:
@@ -304,6 +327,38 @@ def qwen_match_themes(
     updated = candidates.copy()
     matched_map: Dict[str, List[str]] = {}
     row_by_code: Dict[str, pd.Series] = {str(r["ts_code"]): r for _, r in updated.iterrows()}
+    total_batches = 0
+    rate_limited_batches = 0
+    exhausted_batches = 0
+    effective_retries_used = 0
+
+    def is_rate_limit_error(err: Exception) -> bool:
+        status_code = getattr(err, "status_code", None)
+        response = getattr(err, "response", None)
+        if status_code is None and response is not None:
+            status_code = getattr(response, "status_code", None)
+        if status_code == 429:
+            return True
+        name = type(err).__name__.lower()
+        if "ratelimit" in name or "rate_limit" in name:
+            return True
+        message = str(err).lower()
+        return "429" in message and "rate" in message and "limit" in message
+
+    def retry_after_seconds(err: Exception) -> Optional[float]:
+        response = getattr(err, "response", None)
+        if response is None:
+            return None
+        headers = getattr(response, "headers", None)
+        if not headers:
+            return None
+        retry_after = headers.get("Retry-After") or headers.get("retry-after")
+        if retry_after is None:
+            return None
+        try:
+            return max(0.0, float(retry_after))
+        except (TypeError, ValueError):
+            return None
 
     def validate_match(ts_code: str, picked: List[str]) -> List[str]:
         """
@@ -344,8 +399,10 @@ def qwen_match_themes(
 
     def flush(batch_items: List[dict], batch_fp: List[str]) -> None:
         """Flush batch of stocks to LLM for theme matching."""
+        nonlocal total_batches, rate_limited_batches, exhausted_batches, effective_retries_used
         if not batch_items:
             return
+        total_batches += 1
 
         messages = [
             {
@@ -378,7 +435,57 @@ def qwen_match_themes(
             },
         ]
 
-        content = invoke_llm_messages("qwen", messages, temperature=0.1)
+        content = None
+        max_attempts = config.qwen_rate_limit_max_retries + 1
+        for attempt in range(1, max_attempts + 1):
+            try:
+                content = invoke_llm_messages("qwen", messages, temperature=0.1)
+                break
+            except Exception as err:
+                if not is_rate_limit_error(err):
+                    raise
+                rate_limited_batches += 1
+                retries_used = attempt - 1
+                effective_retries_used += 1
+                if attempt >= max_attempts:
+                    exhausted_batches += 1
+                    logger.warning(
+                        "Qwen theme matching exhausted after rate limits: batch_size=%s retries=%s",
+                        len(batch_items),
+                        retries_used,
+                    )
+                    for fp, item in zip(batch_fp, batch_items):
+                        ts_code = item.get("ts_code")
+                        matched_map[ts_code] = []
+                        cache[fp] = {
+                            "schema_version": cache_version,
+                            "theme_set_hash": theme_set_hash,
+                            "matched": [],
+                            "note": "rate_limited_exhausted",
+                        }
+                    return
+                backoff_cap = min(
+                    config.qwen_rate_limit_max_delay_sec,
+                    config.qwen_rate_limit_base_delay_sec * (2 ** retries_used),
+                )
+                jitter = random.uniform(0.0, max(0.1, 0.2 * backoff_cap))
+                computed_wait = min(config.qwen_rate_limit_max_delay_sec, backoff_cap + jitter)
+                wait_seconds = retry_after_seconds(err) or computed_wait
+                logger.warning(
+                    "Qwen theme matching rate-limited (attempt=%s/%s, batch_size=%s); sleeping %.2fs",
+                    attempt,
+                    max_attempts,
+                    len(batch_items),
+                    wait_seconds,
+                )
+                if wait_seconds > 0:
+                    time.sleep(wait_seconds)
+            finally:
+                if config.qwen_request_interval_sec > 0:
+                    time.sleep(config.qwen_request_interval_sec)
+
+        if content is None:
+            return
         parsed = safe_json_loads(content or "")
         matches = parsed.get("matches", {}) if isinstance(parsed, dict) else {}
         notes = parsed.get("notes", {}) if isinstance(parsed, dict) else {}
@@ -404,11 +511,19 @@ def qwen_match_themes(
     for item, fp in zip(batch, batch_keys):
         chunk.append(item)
         chunk_keys.append(fp)
-        if len(chunk) >= 8:
+        if len(chunk) >= config.qwen_batch_size:
             flush(chunk, chunk_keys)
             chunk = []
             chunk_keys = []
     flush(chunk, chunk_keys)
+    if total_batches > 0:
+        logger.info(
+            "Qwen match stats: total_batches=%s rate_limited_batches=%s exhausted_batches=%s effective_retries_used=%s",
+            total_batches,
+            rate_limited_batches,
+            exhausted_batches,
+            effective_retries_used,
+        )
 
     # Save cache
     try:
@@ -1013,6 +1128,30 @@ def phase2_quant_filter(themes: List[ThemeItem], config: Optional[StrategyConfig
     """
     logger.info("Starting Phase 2: Quantitative Filtering with Progressive Relaxation")
     config = config or StrategyConfig.from_env()
+    use_heuristic_fallback = config.theme_match_policy in {"balanced", "aggressive"}
+    logger.info(
+        f"Theme match policy: {config.theme_match_policy} "
+        f"(heuristic_fallback={'on' if use_heuristic_fallback else 'off'})"
+    )
+
+    def normalize_match_columns(df: pd.DataFrame) -> pd.DataFrame:
+        out = df.copy()
+        if "matched_themes" not in out.columns:
+            out["matched_themes"] = [[] for _ in range(len(out))]
+        out["matched_themes"] = out["matched_themes"].map(lambda x: x if isinstance(x, list) else [])
+        out["off_theme"] = out["matched_themes"].map(lambda arr: len(arr) == 0)
+        return out
+
+    def match_source_counts(qwen_before: pd.Series, matched_after: pd.Series) -> Dict[str, int]:
+        qwen_count = int(qwen_before.apply(bool).sum())
+        final_count = int(matched_after.apply(bool).sum())
+        heuristic_count = max(0, final_count - qwen_count)
+        off_theme_count = int((~matched_after.apply(bool)).sum())
+        return {
+            "qwen_validated": qwen_count,
+            "heuristic": heuristic_count,
+            "off_theme": off_theme_count,
+        }
 
     # Filter to only confirmed themes (web + capital both confirmed)
     confirmed_themes = [t for t in themes if t.validation_status == "confirmed"]
@@ -1121,6 +1260,7 @@ def phase2_quant_filter(themes: List[ThemeItem], config: Optional[StrategyConfig
             filtered,
             cache_path=Path(".cache/qwen_theme_match.json"),
             cache_version=config.theme_cache_version,
+            config=config,
         )
         has_match = filtered["matched_themes"].apply(bool).sum() if "matched_themes" in filtered.columns else 0
         if has_match == 0 and expanded_themes:
@@ -1129,10 +1269,20 @@ def phase2_quant_filter(themes: List[ThemeItem], config: Optional[StrategyConfig
                 filtered,
                 cache_path=Path(".cache/qwen_theme_match.json"),
                 cache_version=f"{config.theme_cache_version}_expanded",
+                config=config,
             )
             has_match = filtered["matched_themes"].apply(bool).sum() if "matched_themes" in filtered.columns else 0
-        if has_match == 0 and broad_themes:
+        qwen_only_matches = filtered["matched_themes"].map(lambda x: x if isinstance(x, list) else []) if "matched_themes" in filtered.columns else pd.Series([[]] * len(filtered))
+        if has_match == 0 and broad_themes and use_heuristic_fallback:
             filtered = heuristic_match_themes(broad_themes, filtered, existing_col="matched_themes")
+        filtered = normalize_match_columns(filtered)
+        tier_counts = match_source_counts(qwen_only_matches, filtered["matched_themes"])
+        logger.info(
+            f"Tier '{tier['name']}' match sources: "
+            f"qwen_validated={tier_counts['qwen_validated']} "
+            f"heuristic={tier_counts['heuristic']} "
+            f"off_theme={tier_counts['off_theme']}"
+        )
 
         has_match = filtered["matched_themes"].apply(bool).sum() if "matched_themes" in filtered.columns else 0
         logger.info(f"Tier '{tier['name']}': {has_match} candidates matched themes")
@@ -1148,7 +1298,7 @@ def phase2_quant_filter(themes: List[ThemeItem], config: Optional[StrategyConfig
                 + filtered["theme_strength_score"] * 15.0
                 - filtered["toplist_recency_score"] * (config.toplist_penalty_weight * 10.0)
             )
-            filtered["off_theme"] = False
+            filtered = normalize_match_columns(filtered)
             filtered["filter_tier"] = tier['name']
             filtered = filtered.sort_values("alpha_rank_score", ascending=False)
             logger.info(f"Phase 2 complete: Using tier '{tier['name']}', {len(filtered.head(15))} candidates with theme matches")
@@ -1168,6 +1318,7 @@ def phase2_quant_filter(themes: List[ThemeItem], config: Optional[StrategyConfig
         filtered,
         cache_path=Path(".cache/qwen_theme_match.json"),
         cache_version=config.theme_cache_version,
+        config=config,
     )
     has_fallback_match = filtered["matched_themes"].apply(bool).sum() if "matched_themes" in filtered.columns else 0
     if has_fallback_match == 0 and expanded_themes:
@@ -1176,10 +1327,20 @@ def phase2_quant_filter(themes: List[ThemeItem], config: Optional[StrategyConfig
             filtered,
             cache_path=Path(".cache/qwen_theme_match.json"),
             cache_version=f"{config.theme_cache_version}_expanded",
+            config=config,
         )
         has_fallback_match = filtered["matched_themes"].apply(bool).sum() if "matched_themes" in filtered.columns else 0
-    if has_fallback_match == 0 and broad_themes:
+    qwen_only_fallback = filtered["matched_themes"].map(lambda x: x if isinstance(x, list) else []) if "matched_themes" in filtered.columns else pd.Series([[]] * len(filtered))
+    if has_fallback_match == 0 and broad_themes and use_heuristic_fallback:
         filtered = heuristic_match_themes(broad_themes, filtered, existing_col="matched_themes")
+    filtered = normalize_match_columns(filtered)
+    fallback_counts = match_source_counts(qwen_only_fallback, filtered["matched_themes"])
+    logger.info(
+        "OFF_THEME_FALLBACK match sources: "
+        f"qwen_validated={fallback_counts['qwen_validated']} "
+        f"heuristic={fallback_counts['heuristic']} "
+        f"off_theme={fallback_counts['off_theme']}"
+    )
     filtered["theme_strength_score"] = filtered["matched_themes"].map(
         lambda arr: max([theme_strength_map.get(str(t), 0.5) for t in arr], default=0.0)
     )
@@ -1188,7 +1349,7 @@ def phase2_quant_filter(themes: List[ThemeItem], config: Optional[StrategyConfig
         + filtered["theme_strength_score"] * 15.0
         - filtered["toplist_recency_score"] * (config.toplist_penalty_weight * 10.0)
     )
-    filtered["off_theme"] = filtered["matched_themes"].map(lambda arr: len(arr) == 0)
+    filtered = normalize_match_columns(filtered)
     filtered["filter_tier"] = "OFF_THEME_FALLBACK"
     filtered = filtered.sort_values("alpha_rank_score", ascending=False)
     logger.info(f"Phase 2 complete: OFF_THEME_FALLBACK mode, returning top 15 technical candidates")
@@ -2531,69 +2692,96 @@ def postprocess_markdown(md_path: Path) -> Path:
     content = md_path.read_text(encoding="utf-8")
     processed_path = md_path.parent / f"{md_path.stem}_processed.md"
 
+    def split_inline_items(line: str) -> List[str]:
+        """
+        Split list items that were collapsed into a single line.
+        Example:
+          【技术分析】 - A。- B。- C
+        ->
+          【技术分析】
+          - A。
+          - B。
+          - C
+        """
+        normalized = re.sub(r"([。；])\s*-\s", r"\1\n- ", line)
+        normalized = re.sub(
+            r"^(\s*(?:\*\*)?【[^】]+】(?:\*\*)?)\s+-\s",
+            r"\1\n- ",
+            normalized
+        )
+
+        if "\n" in normalized:
+            return [seg for seg in normalized.split("\n") if seg.strip()]
+        return [line]
+
     lines = content.split("\n")
     processed_lines = []
 
     for line in lines:
-        # Avoid pandoc YAML misparse for bare '---' separators in body text.
-        # Keep visual separator semantics using markdown horizontal rule '***'.
-        if line.strip() == "---":
-            processed_lines.append("***")
-            continue
-
-        # Fix long comma-separated date lists - break them into multiple lines
-        if "量能异动日：" in line and "," in line:
-            match = re.search(r"(.*?)量能异动日：(.*?)(?:$|!)", line)
-            if match:
-                prefix = match.group(1)
-                dates_str = match.group(2).strip()
-                dates = [d.strip() for d in dates_str.split(",")]
-                processed_lines.append(f"{prefix}量能异动日：")
-                # Group dates into lines of 8
-                for i in range(0, len(dates), 8):
-                    processed_lines.append(", ".join(dates[i:i+8]))
+        candidate_lines = split_inline_items(line)
+        for line in candidate_lines:
+            # Avoid pandoc YAML misparse for bare '---' separators in body text.
+            # Keep visual separator semantics using markdown horizontal rule '***'.
+            if line.strip() == "---":
+                processed_lines.append("***")
                 continue
 
-        # Fix long source lines - break into multiple lines BEFORE URL processing
-        if "- 来源：" in line:
-            match = re.search(r"(.*?- 来源：)(.*?)(?:$)", line)
-            if match:
-                prefix = match.group(1)
-                sources_str = match.group(2).strip()
-
-                # Extract URLs from the sources
-                url_pattern = r"https?://[^\s,]+"
-                urls = re.findall(url_pattern, sources_str)
-
-                if urls:
-                    processed_lines.append(prefix)
-                    # Create clickable links, 2 per line
-                    for i in range(0, len(urls), 2):
-                        link_parts = []
-                        for url in urls[i:i+2]:
-                            parsed = urlparse(url)
-                            domain = parsed.netloc or parsed.path[:30]
-                            link_parts.append(f"[{domain}]({url})")
-                        processed_lines.append("  " + "  ".join(link_parts))
+            # Fix long comma-separated date lists - break them into multiple lines
+            if "量能异动日：" in line and "," in line:
+                match = re.search(r"(.*?)量能异动日：(.*?)(?:$|!)", line)
+                if match:
+                    prefix = match.group(1)
+                    dates_str = match.group(2).strip()
+                    dates = [d.strip() for d in dates_str.split(",")]
+                    processed_lines.append(f"{prefix}量能异动日：")
+                    # Group dates into lines of 8
+                    for i in range(0, len(dates), 8):
+                        processed_lines.append(", ".join(dates[i:i+8]))
                     continue
 
-        # Fix bare URLs in other lines - make them clickable
-        url_pattern = r"(https?://[^\s\]\),]+)"
-        def replace_url(match):
-            url = match.group(1)
-            # Skip if already in markdown link format
-            if f"]({url})" in line or f"](<{url}>)" in line:
-                return url
-            # Extract domain for link text
-            parsed = urlparse(url)
-            domain = parsed.netloc or parsed.path[:30]
-            return f"[{domain}]({url})"
+            # Fix long source lines - break into multiple lines BEFORE URL processing
+            if "- 来源：" in line:
+                match = re.search(r"(.*?- 来源：)(.*?)(?:$)", line)
+                if match:
+                    prefix = match.group(1)
+                    sources_str = match.group(2).strip()
 
-        line = re.sub(url_pattern, replace_url, line)
+                    # Extract URLs from the sources
+                    url_pattern = r"https?://[^\s,]+"
+                    urls = re.findall(url_pattern, sources_str)
 
-        processed_lines.append(line)
+                    if urls:
+                        processed_lines.append(prefix)
+                        # Create clickable links, 2 per line
+                        for i in range(0, len(urls), 2):
+                            link_parts = []
+                            for url in urls[i:i+2]:
+                                parsed = urlparse(url)
+                                domain = parsed.netloc or parsed.path[:30]
+                                link_parts.append(f"[{domain}]({url})")
+                            processed_lines.append("  " + "  ".join(link_parts))
+                        continue
+
+            # Fix bare URLs in other lines - make them clickable
+            url_pattern = r"(https?://[^\s\]\),]+)"
+            def replace_url(match):
+                url = match.group(1)
+                # Skip if already in markdown link format
+                if f"]({url})" in line or f"](<{url}>)" in line:
+                    return url
+                # Extract domain for link text
+                parsed = urlparse(url)
+                domain = parsed.netloc or parsed.path[:30]
+                return f"[{domain}]({url})"
+
+            line = re.sub(url_pattern, replace_url, line)
+
+            processed_lines.append(line)
 
     processed_content = "\n".join(processed_lines)
+    # Normalize malformed bold markers so stars do not leak into PDF text.
+    # Example: "** 估值水平 **" -> "**估值水平**"
+    processed_content = re.sub(r"\*\*\s+([^*\n][^*\n]*?)\s+\*\*", r"**\1**", processed_content)
 
     # Convert HTML font color tags to pandoc raw LaTeX for PDF rendering
     # Pattern: <font color='red'>text</font> or <font color="red">text</font>
@@ -2627,7 +2815,19 @@ def postprocess_markdown(md_path: Path) -> Path:
             for orig, repl in replacements:
                 s = s.replace(orig, repl)
             return s
-        text = escape_latex_text(text)
+        # Preserve markdown bold semantics as LaTeX bold within colored text.
+        # We escape plain/bold fragments separately so LaTeX braces are not escaped.
+        segments: List[str] = []
+        cursor = 0
+        for bold_match in re.finditer(r"\*\*\s*(.*?)\s*\*\*", text, flags=re.DOTALL):
+            if bold_match.start() > cursor:
+                segments.append(escape_latex_text(text[cursor:bold_match.start()]))
+            bold_text = escape_latex_text(bold_match.group(1))
+            segments.append(f"\\textbf{{{bold_text}}}")
+            cursor = bold_match.end()
+        if cursor < len(text):
+            segments.append(escape_latex_text(text[cursor:]))
+        text = "".join(segments)
         # For multiline content, use fenced code block raw LaTeX
         # For single-line, use inline raw attribute syntax
         if '\n' in text:
