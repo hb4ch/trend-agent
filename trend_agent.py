@@ -35,7 +35,15 @@ from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
 
 from deep_researcher import deepseek_chat, deepseek_plan_queries, zhipu_search
-from screen_growth_stocks import screen_all_stocks
+from screen_growth_stocks import (
+    screen_all_stocks,
+    compute_atr,
+    compute_adx,
+    compute_bollinger_width,
+    compute_obv,
+    compute_rsi,
+    compute_ema,
+)
 from utils import (
     DragonTigerList,
     EPSILON,
@@ -1220,6 +1228,7 @@ def phase2_quant_filter(themes: List[ThemeItem], config: Optional[StrategyConfig
             "ma_spread_std": 0.03,
             "volume_min": 1.2,
             "volume_max": 3.0,
+            "squeeze_readiness_min": 40,
         },
         {
             "name": "Relaxed",
@@ -1228,6 +1237,7 @@ def phase2_quant_filter(themes: List[ThemeItem], config: Optional[StrategyConfig
             "ma_spread_std": 0.05,
             "volume_min": 1.0,
             "volume_max": 4.0,
+            "squeeze_readiness_min": 20,
         },
         {
             "name": "Loose",
@@ -1236,11 +1246,15 @@ def phase2_quant_filter(themes: List[ThemeItem], config: Optional[StrategyConfig
             "ma_spread_std": 0.08,
             "volume_min": 0.8,
             "volume_max": 5.0,
+            "squeeze_readiness_min": 0,
         },
     ]
 
     # Try each tier until we find theme matches
     for tier in filter_tiers:
+        squeeze_clause = ""
+        if tier.get("squeeze_readiness_min", 0) > 0 and "squeeze_readiness" in screen_df.columns:
+            squeeze_clause = f"AND squeeze_readiness >= {tier['squeeze_readiness_min']}"
         filtered = con.execute(f"""
             SELECT *
             FROM screen
@@ -1249,6 +1263,7 @@ def phase2_quant_filter(themes: List[ThemeItem], config: Optional[StrategyConfig
               AND ma_spread_std <= {tier['ma_spread_std']}
               AND volume_boost >= {tier['volume_min']}
               AND volume_boost <= {tier['volume_max']}
+              {squeeze_clause}
             ORDER BY composite_score DESC
         """).df()
 
@@ -2131,6 +2146,34 @@ def phase4_plot_charts(candidates: pd.DataFrame) -> Dict[str, List[str]]:
                     row=1, col=1,
                 )
 
+        # Bollinger Bands (20-day, 2 std) for squeeze visualization
+        if len(df) >= 20:
+            bb_mid = df["close"].rolling(20).mean()
+            bb_std = df["close"].rolling(20).std(ddof=0)
+            bb_upper = bb_mid + 2 * bb_std
+            bb_lower = bb_mid - 2 * bb_std
+            if bb_upper.notna().any():
+                fig.add_trace(
+                    go.Scatter(
+                        x=df.index, y=bb_upper,
+                        mode="lines", name="BB Upper",
+                        line=dict(color="rgba(150,150,150,0.4)", width=1, dash="dot"),
+                        showlegend=False,
+                    ),
+                    row=1, col=1,
+                )
+                fig.add_trace(
+                    go.Scatter(
+                        x=df.index, y=bb_lower,
+                        mode="lines", name="BB Lower",
+                        line=dict(color="rgba(150,150,150,0.4)", width=1, dash="dot"),
+                        fill="tonexty",
+                        fillcolor="rgba(200,200,200,0.1)",
+                        showlegend=False,
+                    ),
+                    row=1, col=1,
+                )
+
         # Turnover spike markers
         spikes = detect_turnover_spikes(df)
         spike_dates = df.index[spikes].strftime("%Y-%m-%d").tolist()
@@ -2253,6 +2296,35 @@ def compute_signals(candidates: pd.DataFrame) -> Dict[str, Dict[str, object]]:
         breakout_window_ok = (not already_breakout) and (0.0 <= dist_to_top <= 0.03)
         ready = ignition and breakout_window_ok and close >= float(df["close"].rolling(20).mean().iloc[-1])
 
+        # New indicator signals
+        atr_series = compute_atr(df)
+        atr_now = float(atr_series.iloc[-1]) if atr_series.notna().any() else None
+        atr_60d_ago = float(atr_series.iloc[-60]) if len(atr_series) >= 60 and atr_series.iloc[-60] == atr_series.iloc[-60] else None
+        atr_squeeze = (atr_now / (atr_60d_ago + EPSILON)) < 0.7 if (atr_now is not None and atr_60d_ago is not None) else False
+
+        bbw_series = compute_bollinger_width(df)
+        bbw_now = float(bbw_series.iloc[-1]) if bbw_series.notna().any() else None
+        bbw_120 = bbw_series.tail(120).dropna()
+        bbw_squeeze = False
+        if len(bbw_120) > 1 and bbw_now is not None:
+            bbw_pct = (bbw_now - float(bbw_120.min())) / (float(bbw_120.max()) - float(bbw_120.min()) + EPSILON)
+            bbw_squeeze = bbw_pct < 0.2
+
+        adx_series, _, _ = compute_adx(df)
+        adx_value = float(adx_series.iloc[-1]) if adx_series.notna().any() else 20.0
+        adx_5d_ago = float(adx_series.iloc[-5]) if len(adx_series) >= 5 and adx_series.iloc[-5] == adx_series.iloc[-5] else adx_value
+        adx_inflecting = adx_value < 25 and (adx_value - adx_5d_ago) > 0
+
+        obv_series = compute_obv(df)
+        obv_recent = obv_series.tail(20)
+        obv_accumulating = False
+        if len(obv_recent) >= 2:
+            obv_slope = float(np.polyfit(range(len(obv_recent)), obv_recent.values, 1)[0])
+            obv_accumulating = obv_slope > 0
+
+        rsi_series = compute_rsi(df)
+        rsi_val = float(rsi_series.iloc[-1]) if rsi_series.notna().any() else 50.0
+
         signals[ts_code] = {
             "name": name,
             "box_top": box_top,
@@ -2270,6 +2342,12 @@ def compute_signals(candidates: pd.DataFrame) -> Dict[str, Dict[str, object]]:
             "already_breakout": already_breakout,
             "extended_breakout": extended_breakout,
             "ready_to_break": ready,
+            "atr_squeeze": atr_squeeze,
+            "bbw_squeeze": bbw_squeeze,
+            "adx_value": adx_value,
+            "adx_inflecting": adx_inflecting,
+            "obv_accumulating": obv_accumulating,
+            "rsi": rsi_val,
         }
     return signals
 

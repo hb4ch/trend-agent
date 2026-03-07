@@ -11,6 +11,8 @@ from pathlib import Path
 from datetime import datetime, timedelta
 import json
 
+from math import exp
+
 from utils import EPSILON
 
 # Setup logging
@@ -47,6 +49,123 @@ def load_stock_company() -> pd.DataFrame:
     except (OSError, IOError) as e:
         logger.warning(f"Could not load company info: {e}")
         return pd.DataFrame()
+
+
+# ============ Technical Indicator Functions ============
+
+def compute_ema(series: pd.Series, period: int) -> pd.Series:
+    """Exponential Moving Average."""
+    return series.ewm(span=period, adjust=False).mean()
+
+
+def compute_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    """Average True Range."""
+    high = df["high"]
+    low = df["low"]
+    prev_close = df["close"].shift(1)
+    tr = pd.concat([
+        high - low,
+        (high - prev_close).abs(),
+        (low - prev_close).abs(),
+    ], axis=1).max(axis=1)
+    return tr.rolling(period).mean()
+
+
+def compute_adx(df: pd.DataFrame, period: int = 14):
+    """
+    Average Directional Index.
+
+    Returns:
+        (adx, plus_di, minus_di) as pd.Series
+    """
+    high = df["high"]
+    low = df["low"]
+    prev_close = df["close"].shift(1)
+
+    tr = pd.concat([
+        high - low,
+        (high - prev_close).abs(),
+        (low - prev_close).abs(),
+    ], axis=1).max(axis=1)
+
+    up_move = high - high.shift(1)
+    down_move = low.shift(1) - low
+
+    plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
+    minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
+
+    plus_dm = pd.Series(plus_dm, index=df.index)
+    minus_dm = pd.Series(minus_dm, index=df.index)
+
+    atr = tr.ewm(span=period, adjust=False).mean()
+    plus_di = 100 * (plus_dm.ewm(span=period, adjust=False).mean() / (atr + EPSILON))
+    minus_di = 100 * (minus_dm.ewm(span=period, adjust=False).mean() / (atr + EPSILON))
+
+    dx = 100 * ((plus_di - minus_di).abs() / (plus_di + minus_di + EPSILON))
+    adx = dx.ewm(span=period, adjust=False).mean()
+
+    return adx, plus_di, minus_di
+
+
+def compute_bollinger_width(df: pd.DataFrame, period: int = 20, std_mult: float = 2.0) -> pd.Series:
+    """Bollinger Band Width = (upper - lower) / middle."""
+    middle = df["close"].rolling(period).mean()
+    std = df["close"].rolling(period).std(ddof=0)
+    upper = middle + std_mult * std
+    lower = middle - std_mult * std
+    return (upper - lower) / (middle + EPSILON)
+
+
+def compute_obv(df: pd.DataFrame) -> pd.Series:
+    """On-Balance Volume."""
+    direction = np.sign(df["close"].diff())
+    vol_col = "volume" if "volume" in df.columns else "vol"
+    return (direction * df[vol_col]).cumsum()
+
+
+def compute_rsi(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    """Relative Strength Index."""
+    delta = df["close"].diff()
+    gain = delta.clip(lower=0)
+    loss = (-delta).clip(lower=0)
+    avg_gain = gain.ewm(span=period, adjust=False).mean()
+    avg_loss = loss.ewm(span=period, adjust=False).mean()
+    rs = avg_gain / (avg_loss + EPSILON)
+    return 100 - (100 / (1 + rs))
+
+
+def compute_vwap(df: pd.DataFrame, period: int = 20) -> pd.Series:
+    """Rolling VWAP over `period` days."""
+    vol_col = "volume" if "volume" in df.columns else "vol"
+    typical_price = (df["high"] + df["low"] + df["close"]) / 3
+    tp_vol = typical_price * df[vol_col]
+    return tp_vol.rolling(period).sum() / (df[vol_col].rolling(period).sum() + EPSILON)
+
+
+# ============ Continuous Scoring Utilities ============
+
+def gaussian_score(value: float, optimal: float, width: float, max_points: float) -> float:
+    """Bell-curve scoring centered on optimal value."""
+    return max_points * exp(-0.5 * ((value - optimal) / (width + EPSILON)) ** 2)
+
+
+def linear_score(value: float, min_val: float, max_val: float, max_points: float, invert: bool = False) -> float:
+    """Linear ramp between min and max, optionally inverted."""
+    if max_val <= min_val:
+        return 0.0
+    t = max(0.0, min(1.0, (value - min_val) / (max_val - min_val)))
+    if invert:
+        t = 1.0 - t
+    return max_points * t
+
+
+def range_score(value: float, lo: float, hi: float, max_points: float) -> float:
+    """Full points inside [lo, hi], linear taper outside."""
+    if lo <= value <= hi:
+        return max_points
+    if value < lo:
+        return max(0.0, max_points * (1.0 - (lo - value) / (hi - lo + EPSILON)))
+    return max(0.0, max_points * (1.0 - (value - hi) / (hi - lo + EPSILON)))
 
 
 def analyze_stock_technical(df, current_date=None):
@@ -104,7 +223,44 @@ def analyze_stock_technical(df, current_date=None):
     # 价格位置
     price_position = (latest['close'] - recent_low) / (recent_high - recent_low + EPSILON)
 
-    # 3. 计算综合得分
+    # 3. Compute new technical indicators
+    ema20 = float(compute_ema(df["close"], 20).iloc[-1]) if len(df) >= 20 else float(latest['close'])
+
+    atr_series = compute_atr(df)
+    atr_now = float(atr_series.iloc[-1]) if atr_series.notna().any() else None
+    atr_60d_ago = float(atr_series.iloc[-60]) if len(atr_series) >= 60 and atr_series.iloc[-60] == atr_series.iloc[-60] else None
+    atr_ratio = (atr_now / (atr_60d_ago + EPSILON)) if (atr_now is not None and atr_60d_ago is not None and atr_60d_ago > EPSILON) else 1.0
+
+    adx_series, _, _ = compute_adx(df)
+    adx_now = float(adx_series.iloc[-1]) if adx_series.notna().any() else 20.0
+    adx_5d_ago = float(adx_series.iloc[-5]) if len(adx_series) >= 5 and adx_series.iloc[-5] == adx_series.iloc[-5] else adx_now
+    adx_slope = adx_now - adx_5d_ago
+
+    bbw_series = compute_bollinger_width(df)
+    bbw_now = float(bbw_series.iloc[-1]) if bbw_series.notna().any() else None
+    bbw_120 = bbw_series.tail(120).dropna()
+    if len(bbw_120) > 1 and bbw_now is not None:
+        bbw_min = float(bbw_120.min())
+        bbw_max = float(bbw_120.max())
+        bbw_percentile = (bbw_now - bbw_min) / (bbw_max - bbw_min + EPSILON)
+    else:
+        bbw_percentile = 0.5
+
+    obv_series = compute_obv(df)
+    obv_recent = obv_series.tail(20)
+    if len(obv_recent) >= 2:
+        obv_slope = float(np.polyfit(range(len(obv_recent)), obv_recent.values, 1)[0])
+    else:
+        obv_slope = 0.0
+
+    rsi_series = compute_rsi(df)
+    rsi_now = float(rsi_series.iloc[-1]) if rsi_series.notna().any() else 50.0
+
+    vwap_series = compute_vwap(df, period=20)
+    vwap_now = float(vwap_series.iloc[-1]) if vwap_series.notna().any() else float(latest['close'])
+    vwap_ratio = float(latest['close']) / (vwap_now + EPSILON)
+
+    # 3b. Build scores dict
     scores = {
         'volatility': recent_volatility,
         'ma_spread': ma_spread,
@@ -115,15 +271,23 @@ def analyze_stock_technical(df, current_date=None):
         'ma60': ma60,
         'ma120': ma120,
         'ma250': ma250,
+        'ema20': ema20,
         'current_price': latest['close'],
         'market_cap': market_cap_yuan,
         'pe': latest.get('pe_ttm', latest.get('pe', 0)),
         'pb': latest.get('pb', 0),
         'turnover_rate': latest['turnover_rate'],
         'data_days': len(df),
+        'atr_ratio': atr_ratio,
+        'adx': adx_now,
+        'adx_slope': adx_slope,
+        'bbw_percentile': bbw_percentile,
+        'obv_slope': obv_slope,
+        'rsi': rsi_now,
+        'vwap_ratio': vwap_ratio,
     }
 
-    # 4. 横盘得分（连续评分，避免满分扎堆）
+    # 4. 横盘得分 (ORIGINAL - preserved for backward-compatible tier filtering)
     vol_score = max(0.0, 1.0 - (recent_volatility / VOLATILITY_THRESHOLD)) * 40
     ma_score = max(0.0, 1.0 - (ma_spread / 0.15)) * 25
     ma_std_score = max(0.0, 1.0 - (ma_spread_std / 0.03)) * 5
@@ -133,6 +297,20 @@ def analyze_stock_technical(df, current_date=None):
 
     scores['consolidation_score'] = consolidation_score
 
+    # 4b. Squeeze Readiness Score (0-100) - NEW
+    sq_atr = linear_score(atr_ratio, 0.5, 1.0, 40.0, invert=True)  # lower ratio = more squeeze
+    sq_bbw = linear_score(bbw_percentile, 0.0, 0.5, 30.0, invert=True)  # lower percentile = tighter
+    sq_adx = gaussian_score(adx_now, 15.0, 10.0, 30.0)  # ADX near 15 = quiescent, max squeeze
+    squeeze_readiness = min(100.0, sq_atr + sq_bbw + sq_adx)
+    scores['squeeze_readiness'] = squeeze_readiness
+
+    # 4c. Volume Quality Score (0-100) - NEW
+    vq_obv = linear_score(obv_slope, 0.0, abs(obv_slope) * 2 + EPSILON, 40.0) if obv_slope > 0 else 0.0
+    vq_boost = range_score(volume_boost, 1.2, 3.0, 35.0)
+    vq_turnover = range_score(avg_turnover, 1.0, 5.0, 25.0)
+    volume_quality_score = min(100.0, vq_obv + vq_boost + vq_turnover)
+    scores['volume_quality_score'] = volume_quality_score
+
     # 5. 趋势判断
     ma_trend = "neutral"
     if ma60 > ma120 > ma250:
@@ -141,8 +319,12 @@ def analyze_stock_technical(df, current_date=None):
         ma_trend = "bearish"
     scores['ma_trend'] = ma_trend
 
-    # 6. Momentum scoring (new)
-    momentum_score = compute_momentum_score(df, latest, ma60, ma120, ma250, recent_high, recent_low, volume_boost)
+    # 6. Momentum scoring (enhanced with new indicators)
+    momentum_score = compute_momentum_score(
+        df, latest, ema20, ma60, ma120, ma250,
+        recent_high, recent_low, volume_boost,
+        adx_now, adx_slope, obv_slope, vwap_ratio,
+    )
     scores['momentum_score'] = momentum_score
 
     return scores
@@ -151,62 +333,68 @@ def analyze_stock_technical(df, current_date=None):
 def compute_momentum_score(
     df: pd.DataFrame,
     latest: pd.Series,
+    ema20: float,
     ma60: float,
     ma120: float,
     ma250: float,
     box_top: float,
     box_bottom: float,
     volume_boost: float,
+    adx: float = 20.0,
+    adx_slope: float = 0.0,
+    obv_slope: float = 0.0,
+    vwap_ratio: float = 1.0,
 ) -> float:
     """
-    Compute momentum score for a stock.
+    Compute momentum score for a stock (enhanced with continuous scoring).
 
-    Scores:
-    - MA alignment (price above MA20/MA60): 0-40 points
-    - Box position (proximity to breakout): 0-30 points
-    - Volume confirmation (recent vs historical): 0-30 points
+    Components:
+    - MA Alignment (EMA20 > MA60 > MA120): 0-25 points
+    - ADX Inflection (rising from < 25):    0-20 points
+    - Box Position (0.6-0.95 ideal):        0-15 points
+    - OBV Divergence (positive slope):      0-20 points
+    - Volume Confirmation (1.2-3.0x):       0-10 points
+    - VWAP Confirmation (close near/above): 0-10 points
 
     Returns:
         Momentum score from 0-100
     """
-    close = latest['close']
+    close = float(latest['close'])
     score = 0.0
 
-    # 1. MA Alignment Score (0-40 points)
-    # Price above short-term MAs is bullish
-    ma20 = df["close"].rolling(20).mean().iloc[-1] if len(df) >= 20 else close
-    ma_alignment = 0.0
-    if close > ma20:
-        ma_alignment += 15.0
-    if close > ma60:
-        ma_alignment += 15.0
-    if ma20 > ma60:
-        ma_alignment += 10.0  # Short above medium is bullish
-    score += ma_alignment
+    # 1. MA Alignment Score (0-25 points) - continuous
+    alignment = 0.0
+    if close > ema20:
+        alignment += 8.0
+    if ema20 > ma60:
+        alignment += 8.0
+    if ma60 > ma120:
+        alignment += 5.0
+    if ma120 > ma250:
+        alignment += 4.0
+    score += alignment
 
-    # 2. Box Position Score (0-30 points)
-    # Proximity to box top indicates potential breakout
+    # 2. ADX Inflection Score (0-20 points) - ADX rising from below 25
+    if adx < 25 and adx_slope > 0:
+        score += linear_score(adx_slope, 0.0, 3.0, 20.0)
+    elif adx < 20:
+        score += 5.0  # Low ADX about to inflect
+
+    # 3. Box Position Score (0-15 points) - continuous taper
     box_range = box_top - box_bottom
     if box_range > EPSILON:
         position = (close - box_bottom) / box_range
-        # Higher position = closer to breakout (but not already broken out)
-        if 0.7 <= position <= 0.95:
-            score += 30.0  # Ideal breakout zone
-        elif 0.5 <= position < 0.7:
-            score += 20.0  # Good position
-        elif 0.3 <= position < 0.5:
-            score += 10.0  # Neutral
-        # Below 0.3 or above 0.95 = 0 points
+        score += range_score(position, 0.6, 0.95, 15.0)
 
-    # 3. Volume Confirmation Score (0-30 points)
-    # Volume boost between 1.2-3.0x is ideal (accumulation without distribution)
-    if 1.2 <= volume_boost <= 3.0:
-        score += 30.0  # Ideal volume
-    elif 1.0 <= volume_boost < 1.2:
-        score += 15.0  # Slight increase
-    elif 3.0 < volume_boost <= 5.0:
-        score += 10.0  # High volume (may indicate distribution)
-    # Below 1.0 or above 5.0 = 0 points
+    # 4. OBV Divergence Score (0-20 points) - positive OBV slope = accumulation
+    if obv_slope > 0:
+        score += min(20.0, linear_score(obv_slope, 0.0, abs(obv_slope) * 2 + EPSILON, 20.0))
+
+    # 5. Volume Confirmation Score (0-10 points) - continuous
+    score += range_score(volume_boost, 1.2, 3.0, 10.0)
+
+    # 6. VWAP Confirmation Score (0-10 points) - close near/above VWAP
+    score += gaussian_score(vwap_ratio, 1.02, 0.05, 10.0)
 
     return min(100.0, score)
 
@@ -302,15 +490,21 @@ def screen_all_stocks() -> pd.DataFrame:
         logger.warning("No stocks passed the initial filter!")
         return None
 
-    # 排序：按横盘得分 + 动量 + 换手率综合排序
-    # Rebalanced weights: consolidation 40%, momentum 20%, volume 25%, turnover 15%
+    # Composite ranking: consolidation 35%, momentum 25%, volume quality 20%, squeeze readiness 20%
     results_df['composite_score'] = (
-        results_df['consolidation_score'] * 0.40 +
-        results_df['momentum_score'] * 0.20 +
-        results_df['volume_boost'] * 10 * 0.25 +
-        results_df['avg_turnover'] * 2 * 0.15
+        results_df['consolidation_score'] * 0.35 +
+        results_df['momentum_score'] * 0.25 +
+        results_df['volume_quality_score'] * 0.20 +
+        results_df['squeeze_readiness'] * 0.20
     )
     results_df = results_df.sort_values('composite_score', ascending=False)
+
+    # Distribution logging for calibration
+    for col in ['composite_score', 'consolidation_score', 'momentum_score', 'squeeze_readiness', 'volume_quality_score']:
+        if col in results_df.columns:
+            vals = results_df[col].dropna()
+            if len(vals) > 0:
+                logger.info(f"  {col}: p25={vals.quantile(0.25):.1f} p50={vals.quantile(0.50):.1f} p75={vals.quantile(0.75):.1f}")
 
     # 添加公司信息
     if not stock_company.empty:
