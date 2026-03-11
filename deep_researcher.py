@@ -380,13 +380,12 @@ def deepseek_plan_queries(name: str, theme: str, evidence: str, pass_id: int) ->
     content = deepseek_chat(messages)
     if not content:
         return None
-    try:
-        parsed = json.loads(content.strip().strip("```"))
+    parsed = _safe_json_from_text(content)
+    if parsed is not None:
         _debug_print("plan_queries_output", parsed)
         return parsed
-    except json.JSONDecodeError:
-        _debug_print("plan_queries_parse_error", {"raw": _truncate(content, 2000)})
-        return None
+    _debug_print("plan_queries_parse_error", {"raw": _truncate(content, 2000)})
+    return None
 
 # 确保你的 .env 文件里是 ZHIPUAI_API_KEY
 # 格式通常是: vector_... 或其他 (取决于你的 key 类型)

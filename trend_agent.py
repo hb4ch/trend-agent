@@ -715,7 +715,11 @@ def detect_hard_fail_reason(
     if re.search(r"(被|遭|因|涉嫌).{0,12}(立案|立案调查)", text):
         return "recent_investigation"
     if re.search(r"(重大诉讼|未决诉讼|仲裁|诉讼事项)", text):
-        return "major_litigation"
+        # Skip if resolved or favorable outcome
+        if not re.search(r"(胜诉|判决获支持|已结案|已和解|已撤诉|已了结|调解结案)", text):
+            # Require directional context — company is defendant/subject
+            if re.search(r"(被诉|被告|被仲裁|遭.{0,6}诉讼|因.{0,6}诉讼|涉诉|涉及.{0,6}诉讼|面临.{0,6}诉讼)", text):
+                return "major_litigation"
     if re.search(r"(终止上市|退市风险警示|暂停上市|强制退市)", text):
         return "delisting_risk"
     if re.search(r"(拟|计划).{0,12}减持|减持计划", text) and is_material_reduce_event(text, reduce_threshold):
@@ -1597,6 +1601,8 @@ def phase3_deep_audit(
         generate_opportunity_queries,
         extract_positive_findings,
         get_source_tier_weight,
+        deepseek_plan_opportunity_queries,
+        OPPORTUNITY_QUERY_TEMPLATES,
     )
 
     config = config or StrategyConfig.from_env()
@@ -1736,6 +1742,58 @@ def phase3_deep_audit(
                             timeframe=timeframe,
                             confidence=avg_confidence,
                         ))
+
+            # Adaptive follow-up: if findings are sparse, use AI to plan targeted queries
+            if len(positive_findings) < 2:
+                logger.debug(f"Sparse findings ({len(positive_findings)}) for {name}, attempting adaptive follow-up")
+                found_categories = {f.category for f in positive_findings}
+                all_categories = list(OPPORTUNITY_QUERY_TEMPLATES.keys())
+                evidence_gaps = [c for c in all_categories if c not in found_categories]
+
+                current_findings_summary = "; ".join(
+                    f.description[:100] for f in positive_findings
+                ) if positive_findings else "暂无发现"
+
+                followup_plan = deepseek_plan_opportunity_queries(
+                    name=name,
+                    theme=theme,
+                    current_findings=current_findings_summary,
+                    evidence_gaps=evidence_gaps[:3],
+                )
+
+                if followup_plan and followup_plan.get("queries"):
+                    followup_queries = followup_plan["queries"][:5]
+                    logger.debug(f"Adaptive follow-up: {len(followup_queries)} queries for {name}")
+                    trace_append(trace_path, "opportunity_followup", {
+                        "ts_code": row["ts_code"], "name": name,
+                        "queries": followup_queries,
+                        "focus_areas": followup_plan.get("focus_areas", []),
+                    })
+
+                    for fq in followup_queries:
+                        raw = run_search(fq)
+                        parsed = parse_search_payload(raw)
+                        search_results = parsed.get("results", [])
+
+                        for cat in evidence_gaps:
+                            findings = extract_positive_findings(search_results, name, cat)
+                            for f in findings:
+                                positive_findings.append(PositiveFinding(
+                                    category=f["category"],
+                                    description=f["description"],
+                                    evidence=f["evidence"],
+                                    confidence=f["confidence"],
+                                    source_url=f["source_url"],
+                                    date=f.get("date"),
+                                ))
+                                if f["source_url"] not in opportunity_urls:
+                                    opportunity_urls.append(f["source_url"])
+
+                        for result in search_results[:3]:
+                            if isinstance(result, dict):
+                                snippet = result.get("snippet", "")
+                                if snippet and name in snippet:
+                                    opportunity_evidence.append(f"[followup] {snippet[:200]}")
 
             logger.info(f"Opportunity discovery: {len(positive_findings)} findings, {len(growth_catalysts)} catalysts for {name}")
             trace_append(trace_path, "opportunity_pass_done", {
@@ -2504,6 +2562,189 @@ def upsert_core_table_in_report(report_md: str, table_section_md: str) -> str:
     return table_section_md + "\n\n" + report_md
 
 
+_MARKET_OVERVIEW_SYSTEM_PROMPT = (
+    "你是资深A股投研团队负责人，遵循\"重势、通过滤、待时机\"理念。\n"
+    "请仅生成【市场风向标】部分。\n\n"
+    "## 【市场风向标】\n"
+    "每个主题分析：\n"
+    "- 主题名称和验证状态（confirmed/web_only/capital_only/weak）\n"
+    "- 主题逻辑（从web search获取的新闻情绪、政策催化）\n"
+    "- **资金验证**<font color='purple'>（从龙虎榜获取的资金信号：上榜次数、净买入额、资金结构、趋势）</font>\n"
+    "- 持续观察指标\n\n"
+    "## 要求：\n"
+    "- 输出JSON：{\"market_overview\": \"## 【市场风向标】\\n...\"}\n"
+    "- 对于confirmed主题，必须展示龙虎榜资金信号\n"
+    "- 引用真实URL，不使用占位符\n"
+)
+
+_STOCK_SECTION_SYSTEM_PROMPT = (
+    "你是资深A股投研分析师，遵循\"重势、通过滤、待时机\"理念。\n"
+    "请为给定的单只股票生成深度分析，作为研报【深度图解】的一个子章节。\n\n"
+    "## 分析内容（必须包含）：\n\n"
+    "**【投资逻辑】**<font color='blue'>\n"
+    "- 观察现象：量能异动、技术形态、题材契合\n"
+    "- 分析意义：资金态度、趋势方向、突破可能\n"
+    "- 验证方式：龙虎榜、财报、公告\n"
+    "- 结论：交易机会评级（强烈推荐/推荐/谨慎）\n"
+    "</font>\n\n"
+    "**【正面催化发现】**<font color='green'>（从positive_findings提取）\n"
+    "- 列出发现的正面信息（订单、客户、政策、技术突破、产能扩张等）\n"
+    "- 每个发现标注类别和置信度\n"
+    "- 引用来源URL\n"
+    "</font>\n\n"
+    "**【增长催化剂】**<font color='red'>（从growth_catalysts提取）\n"
+    "- 催化剂类型：policy/tech_breakthrough/market_expansion/competitive_moat\n"
+    "- 时间框架：near_term/medium_term/long_term\n"
+    "- 置信度评估\n"
+    "</font>\n\n"
+    "**【技术分析】**横盘时长/波动率、量能信号、均线排列、箱体位置\n"
+    "- ignition信号：是否处于温和放量阶段(1.2-3.0x)\n"
+    "- ready_to_break信号：是否接近箱体突破\n\n"
+    "**【资金验证】**<font color='purple'>（从capital_signal_summary提取）\n"
+    "- 龙虎榜资金信号\n"
+    "- 机构游资动向\n"
+    "- 估值水平、市值适合度\n"
+    "</font>\n\n"
+    "**【交易建议】**<font color='green'>买入时机/仓位/止盈止损/持仓周期</font>\n\n"
+    "**【风险提示】**<font color='orange'>核心风险及应对</font>\n\n"
+    "- 量能异动日：[列表]\n"
+    "![股票名称 代码](../charts/代码.png)\n"
+    "- 尽调结论：pass/warn/fail（说明+来源）\n"
+    "- 研究深度：standard/deep\n\n"
+    "## 要求：\n"
+    "- 输出JSON：{\"stock_section\": \"### 股票名称 代码\\n...\"}\n"
+    "- 引用真实URL，不使用占位符\n"
+    "- 突出\"待时机\"：箱体上沿+温和放量(1.2-3.0x)+均线粘合\n"
+    "- 先展示发现的机会（正面催化），再展示风险（审计结果）\n"
+    "- 如果需要额外信息，可调用工具：\n"
+    "  - {\"tool\": \"web_search\", \"input\": \"查询内容\"}\n"
+    "  - {\"tool\": \"duckdb\", \"input\": \"SQL语句\"}\n"
+    "  - {\"tool\": \"python\", \"input\": \"代码\"}\n"
+)
+
+
+def _build_stock_context(
+    row: dict,
+    stock_audits: List[AuditResult],
+    chart_notes: Dict[str, List[str]],
+    signals: Dict[str, Dict[str, object]],
+    theme_context: str,
+) -> dict:
+    """Build per-stock context dict for DeepSeek report generation."""
+    ts_code = row["ts_code"]
+    return {
+        "ts_code": ts_code,
+        "name": row.get("name", ts_code),
+        "theme_context": theme_context,
+        "stock_data": {k: v for k, v in row.items()},
+        "audits": [
+            {
+                "theme": a.theme,
+                "verdict": a.verdict,
+                "rationale": a.rationale,
+                "sources": a.sources,
+                "confidence_score": a.confidence_score,
+                "capital_signal_summary": a.capital_signal_summary,
+                "positive_findings": [
+                    {"category": f.category, "description": f.description,
+                     "evidence": f.evidence[:200], "confidence": f.confidence,
+                     "source_url": f.source_url, "date": f.date}
+                    for f in (a.positive_findings or [])
+                ],
+                "growth_catalysts": [
+                    {"catalyst_type": c.catalyst_type, "description": c.description,
+                     "timeframe": c.timeframe, "confidence": c.confidence}
+                    for c in (a.growth_catalysts or [])
+                ],
+            }
+            for a in stock_audits
+        ],
+        "chart_notes": chart_notes.get(ts_code, []),
+        "signals": signals.get(ts_code, {}),
+    }
+
+
+def _generate_market_overview(theme_summary: list, trace_path: Path) -> Optional[str]:
+    """Generate market overview section via DeepSeek."""
+    messages = [
+        {"role": "system", "content": _MARKET_OVERVIEW_SYSTEM_PROMPT},
+        {"role": "user", "content": "请生成【市场风向标】部分。\n" + json.dumps({"themes": theme_summary}, ensure_ascii=False)},
+    ]
+    trace_append(trace_path, "overview_request", {})
+    content = deepseek_chat(messages) if deepseek_chat else None
+    if not content:
+        return None
+    parsed = safe_json_loads(content)
+    result = parsed.get("market_overview")
+    if result:
+        return result
+    if content.lstrip().startswith("#"):
+        return content
+    return None
+
+
+def _generate_stock_section(ctx: dict, trace_path: Path, candidates_df: pd.DataFrame) -> Optional[str]:
+    """Generate one stock's deep analysis section via DeepSeek with tool loop."""
+    ts_code = ctx["ts_code"]
+    name = ctx["name"]
+    messages = [
+        {"role": "system", "content": _STOCK_SECTION_SYSTEM_PROMPT},
+        {"role": "user", "content": f"请为 {name}({ts_code}) 生成深度分析。\n" + json.dumps(ctx, ensure_ascii=False, default=str)},
+    ]
+    trace_append(trace_path, "stock_section_request", {"ts_code": ts_code, "name": name})
+
+    tool_context = {
+        "candidates_df": candidates_df,
+        "signals": ctx.get("signals", {}),
+    }
+
+    for _ in range(5):
+        content = deepseek_chat(messages) if deepseek_chat else None
+        if not content:
+            break
+        trace_append(trace_path, "stock_section_response", {"ts_code": ts_code, "content": truncate(content, 8000)})
+        parsed = safe_json_loads(content)
+        tool = parsed.get("tool")
+        if tool:
+            if tool == "web_search":
+                result = run_search(parsed.get("input", ""))
+            elif tool == "duckdb":
+                result = run_duckdb_sql(parsed.get("input", ""), tool_context)
+            elif tool == "python":
+                result = run_python(parsed.get("input", ""), tool_context)
+            else:
+                result = "unknown_tool"
+            trace_append(trace_path, "stock_tool_result", {"ts_code": ts_code, "tool": tool})
+            messages.append({"role": "user", "content": f"TOOL_RESULT:\n{result}"})
+            continue
+        section = parsed.get("stock_section")
+        if section:
+            return section
+        if content.lstrip().startswith("#"):
+            return content
+        messages.append({"role": "user", "content": "请按JSON格式返回 {\"stock_section\": \"### markdown...\"}"})
+    return None
+
+
+def _fallback_stock_section(row, stock_audits, chart_notes):
+    """Minimal deterministic fallback when DeepSeek fails for a stock."""
+    ts_code = row["ts_code"]
+    name = row.get("name", ts_code)
+    spikes = chart_notes.get(ts_code, [])
+    spike_note = ", ".join(spikes) if spikes else "未检测到明显量能异动"
+    lines = [
+        f"### {name} {ts_code}\n",
+        f"- 量能异动日：{spike_note}",
+        f"![{name} {ts_code}](../charts/{ts_code}.png)\n",
+    ]
+    for a in stock_audits:
+        lines.append(f"- 尽调结论({a.theme})：{a.verdict}")
+        lines.append(f"  - 说明：{a.rationale}")
+        lines.append(f"  - 来源：{', '.join(a.sources)}")
+    lines.append("")
+    return "\n".join(lines)
+
+
 def phase5_report_with_deepseek(
     themes: List[ThemeItem],
     candidates: pd.DataFrame,
@@ -2516,229 +2757,69 @@ def phase5_report_with_deepseek(
     md_path = REPORT_DIR / f"report_{timestamp}.md"
     trace_path = REPORT_DIR / f"deepseek_trace_{timestamp}.jsonl"
 
-    # Convert audits to dict, handling dataclass fields properly
-    audit_records = []
-    for audit in audits:
-        record = {
-            "ts_code": audit.ts_code,
-            "name": audit.name,
-            "theme": audit.theme,
-            "verdict": audit.verdict,
-            "rationale": audit.rationale,
-            "sources": audit.sources,
-            "confidence_score": audit.confidence_score,
-            "research_depth": audit.research_depth,
-            "capital_signal_summary": audit.capital_signal_summary,
-            "positive_findings": [
-                {
-                    "category": f.category,
-                    "description": f.description,
-                    "evidence": f.evidence[:200],
-                    "confidence": f.confidence,
-                    "source_url": f.source_url,
-                    "date": f.date,
-                }
-                for f in (audit.positive_findings or [])
-            ],
-            "growth_catalysts": [
-                {
-                    "catalyst_type": c.catalyst_type,
-                    "description": c.description,
-                    "timeframe": c.timeframe,
-                    "confidence": c.confidence,
-                }
-                for c in (audit.growth_catalysts or [])
-            ],
-        }
-        audit_records.append(record)
-    audit_df = pd.DataFrame(audit_records)
+    # Build audit lookup
+    audit_map = {}
+    for a in audits:
+        audit_map.setdefault(a.ts_code, []).append(a)
 
-    # Ensure off_theme and filter_tier columns exist in candidates
     candidates_with_flag = candidates.head(15).copy()
     if "off_theme" not in candidates_with_flag.columns:
         candidates_with_flag["off_theme"] = False
     if "filter_tier" not in candidates_with_flag.columns:
         candidates_with_flag["filter_tier"] = "Unknown"
 
-    summary = {
-        "themes": [
-            {
-                "name": t.name,
-                "keywords": t.keywords,
-                "summary": t.summary,
-                "sources": t.sources,
-                "validation_status": t.validation_status,
-                "capital_signal": t.capital_signal,
-                "evidence": t.evidence,
-            }
-            for t in themes
-        ],
-        "candidates": candidates_with_flag.to_dict("records"),
-        "audits": audit_records,  # Use the enhanced audit records with findings
-        "chart_notes": chart_notes,
-        "signals": signals,
-    }
+    # --- Part A: Market overview (themes only) ---
+    theme_summary = [
+        {
+            "name": t.name, "keywords": t.keywords, "summary": t.summary,
+            "sources": t.sources, "validation_status": t.validation_status,
+            "capital_signal": t.capital_signal, "evidence": t.evidence,
+        }
+        for t in themes
+    ]
+    logger.info("Phase 5: generating market overview...")
+    overview_md = _generate_market_overview(theme_summary, trace_path)
 
-    system_prompt = (
-        "你是资深A股投研团队负责人，遵循\"重势、通过滤、待时机\"理念。"
-        ""
-        "## 报告结构："
-        ""
-        "### 【市场风向标】"
-        "每个主题分析："
-        "- 主题名称和验证状态（confirmed/web_only/capital_only/weak）"
-        "- 主题逻辑（从web search获取的新闻情绪、政策催化）"
-        "- **资金验证**<font color='purple'>（从龙虎榜获取的资金信号：上榜次数、净买入额、资金结构、趋势）</font>"
-        "- 持续观察指标"
-        ""
-        "### 【核心金股】表格"
-        "列：股票、所属主线、形态特征、置信度、推荐理由"
-        ""
-        "**置信度说明（confidence_score）：**\n"
-        "- 0.8-1.0: 高置信度，多源验证充分\n"
-        "- 0.6-0.8: 中等置信度，部分验证\n"
-        "- 0.4-0.6: 低置信度，需要更多验证\n\n"
-        ""
-        "**重要：如果股票的off_theme字段为True，必须：**\n"
-        "- 在\"所属主线\"列开头标注 **⚠️ OFF-THEME（无题材匹配）**\n"
-        "- 在推荐理由中说明：\"该股票未匹配当前热点题材，仅基于技术形态入选\"\n"
-        "- 在报告末尾添加【风险提示】说明OFF-THEME股票风险\n\n"
-        ""
-        "### 【深度图解】（每个标的必须包含）："
-        ""
-        "**【投资逻辑】**<font color='blue'>"
-        "- 观察现象：量能异动、技术形态、题材契合"
-        "- 分析意义：资金态度、趋势方向、突破可能"
-        "- 验证方式：龙虎榜、财报、公告"
-        "- 结论：交易机会评级（强烈推荐/推荐/谨慎）"
-        "</font>"
-        ""
-        "**【正面催化发现】**<font color='green'>（从positive_findings提取）\n"
-        "- 列出发现的正面信息（订单、客户、政策、技术突破、产能扩张等）\n"
-        "- 每个发现标注类别和置信度\n"
-        "- 引用来源URL\n"
-        "</font>"
-        ""
-        "**【增长催化剂】**<font color='red'>（从growth_catalysts提取）\n"
-        "- 催化剂类型：policy/tech_breakthrough/market_expansion/competitive_moat\n"
-        "- 时间框架：near_term/medium_term/long_term\n"
-        "- 置信度评估\n"
-        "</font>"
-        ""
-        "**【技术分析】**横盘时长/波动率、量能信号、均线排列、箱体位置"
-        "- ignition信号：是否处于温和放量阶段(1.2-3.0x)"
-        "- ready_to_break信号：是否接近箱体突破"
-        ""
-        "**【资金验证】**<font color='purple'>（从capital_signal_summary提取）\n"
-        "- 龙虎榜资金信号\n"
-        "- 机构游资动向\n"
-        "- 估值水平、市值适合度\n"
-        "</font>"
-        ""
-        "**【交易建议】**<font color='green'>买入时机/仓位/止盈止损/持仓周期</font>"
-        ""
-        "**【风险提示】**<font color='orange'>核心风险及应对</font>"
-        ""
-        "- 量能异动日：[列表]\\n"
-        "![股票名称 代码](../charts/代码.png)\\n"
-        "- 尽调结论：pass/warn/fail（说明+来源）"
-        "- 研究深度：standard/deep"
-        ""
-        "### 【风险提示】"
-        "用<font color='orange'>橙色</font>标注核心风险"
-        ""
-        "**如果有OFF-THEME股票，必须额外添加风险说明：**\n"
-        "<font color='orange'>\n"
-        "**OFF-THEME股票风险提示：**\n"
-        "- 该股票未匹配当前市场热点题材，仅基于技术形态入选\n"
-        "- 缺乏题材催化，上涨动力可能不足\n"
-        "- 建议谨慎对待，优先关注有题材匹配的标的\n"
-        "</font>\n\n"
-        ""
-        "## 要求："
-        "- 输出JSON：{\"final_report\":\"# Markdown...\"}"
-        "- 引用真实URL，不使用占位符"
-        "- 突出\"待时机\"：箱体上沿+温和放量(1.2-3.0x)+均线粘合"
-        "- **在【市场风向标】中展示资金验证信息**：对于confirmed主题，必须展示龙虎榜资金信号"
-        "- **在【深度图解】中展示正面催化发现**：从positive_findings和growth_catalysts中提取关键信息"
-        "- **展示置信度分数**：在核心金股表格中显示confidence_score"
-        ""
-        "记住：先展示发现的机会（正面催化），再展示风险（审计结果）。"
+    # --- Part B: Deterministic core table ---
+    core_table_md = build_deterministic_core_table(
+        candidates_with_flag, audits, top_n=min(10, len(candidates_with_flag))
     )
 
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {
-            "role": "user",
-            "content": (
-                "请生成完整研报，包含市场风向标、核心金股、深度图解、风险提示。"
-                "注意引用来源URL。上下文如下：\n"
-                + json.dumps(summary, ensure_ascii=False)
-            ),
-        },
+    # --- Part C: Per-stock deep sections ---
+    stock_sections = []
+    theme_context = "; ".join(f"{t.name}({t.validation_status})" for t in themes)
+
+    for idx, (_, row) in enumerate(candidates_with_flag.head(10).iterrows()):
+        ts_code = row["ts_code"]
+        name = row.get("name", ts_code)
+        stock_audits = audit_map.get(ts_code, [])
+        ctx = _build_stock_context(row.to_dict(), stock_audits, chart_notes, signals, theme_context)
+
+        logger.info(f"Phase 5: generating stock section {idx+1}/10 for {name}({ts_code})...")
+        section_md = _generate_stock_section(ctx, trace_path, candidates_with_flag)
+        if section_md:
+            stock_sections.append(section_md)
+        else:
+            stock_sections.append(_fallback_stock_section(row, stock_audits, chart_notes))
+
+    # --- Assemble ---
+    report_parts = [
+        "# A股趋势跟踪研报\n",
+        overview_md or "## 【市场风向标】\n\n（生成失败，请参考审计数据）\n",
+        "\n",
+        core_table_md,
+        "\n\n## 【深度图解】\n",
     ]
-    logger.debug(f"Report trace: {trace_path}")
-    trace_append(trace_path, "report_init", {"system": truncate(system_prompt, 2000)})
-    trace_append(trace_path, "report_context", {"summary_keys": list(summary.keys())})
+    report_parts.extend(stock_sections)
+    report_parts.append(
+        "\n## 【风险提示】\n"
+        "- 题材轮动快，注意情绪退潮风险。\n"
+        "- 量能异动需配合市场主线验证。\n"
+    )
 
-    report_md = None
-    tool_context = {
-        "candidates_df": candidates,
-        "audits_df": audit_df,
-        "signals": signals,
-        "candidates_records": candidates.head(15).to_dict("records"),
-    }
+    report_md = "\n".join(report_parts)
 
-    for _ in range(5):
-        logger.debug(f"Report round: {len(messages)} messages")
-        trace_append(trace_path, "report_request", {"messages": [{"role": m.get("role"), "content": truncate(str(m.get("content","")), 1200)} for m in messages[-3:]]})
-        content = deepseek_chat(messages) if deepseek_chat else None
-        if not content:
-            logger.debug("Report: no response from DeepSeek")
-            trace_append(trace_path, "report_no_response", {})
-            break
-        logger.debug(f"Report raw response: {truncate(content, 1200)}")
-        trace_append(trace_path, "report_raw_response", {"content": truncate(content, 12000)})
-        parsed = safe_json_loads(content)
-        tool = parsed.get("tool")
-        if tool:
-            if tool == "web_search":
-                tool_input = parsed.get("input", "")
-                logger.debug(f"Report tool: web_search input={truncate(str(tool_input), 400)}")
-                trace_append(trace_path, "report_tool_call", {"tool": "web_search", "input": tool_input})
-                result = run_search(tool_input)
-            elif tool == "duckdb":
-                tool_input = parsed.get("input", "")
-                logger.debug(f"Report tool: duckdb input={truncate(str(tool_input), 400)}")
-                trace_append(trace_path, "report_tool_call", {"tool": "duckdb", "input": tool_input})
-                result = run_duckdb_sql(tool_input, tool_context)
-            elif tool == "python":
-                tool_input = parsed.get("input", "")
-                logger.debug(f"Report tool: python input={truncate(str(tool_input), 400)}")
-                trace_append(trace_path, "report_tool_call", {"tool": "python", "input": tool_input})
-                result = run_python(tool_input, tool_context)
-            else:
-                result = "unknown_tool"
-            logger.debug(f"Report tool result: {truncate(result, 800)}")
-            trace_append(trace_path, "report_tool_result", {"tool": tool, "result": truncate(result, 20000)})
-            messages.append({"role": "user", "content": f"TOOL_RESULT:\n{result}"})
-            continue
-        report_md = parsed.get("final_report")
-        if report_md:
-            logger.debug("Report: final received")
-            trace_append(trace_path, "report_final_received", {"length": len(report_md)})
-            break
-        if content.lstrip().startswith("#"):
-            report_md = content
-            logger.debug("Report: markdown fallback")
-            trace_append(trace_path, "report_markdown_fallback", {"length": len(report_md)})
-            break
-        messages.append({"role": "user", "content": "请按JSON格式返回。"})
-        trace_append(trace_path, "report_retry", {})
-
-    if not report_md:
-        return phase5_report(themes, candidates, audits, chart_notes)
-
+    # Fix placeholder URLs
     if "url1" in report_md:
         real_urls = []
         for theme in themes:
@@ -2748,7 +2829,6 @@ def phase5_report_with_deepseek(
         if real_urls:
             report_md = report_md.replace("url1", real_urls[0])
 
-    core_table_md = build_deterministic_core_table(candidates_with_flag, audits, top_n=min(10, len(candidates_with_flag)))
     report_md = upsert_core_table_in_report(report_md, core_table_md)
     md_path.write_text(report_md, encoding="utf-8")
     return md_path
