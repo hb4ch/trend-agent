@@ -1285,6 +1285,17 @@ def phase2_quant_filter(themes: List[ThemeItem], config: Optional[StrategyConfig
             LIMIT 100
         """).df()
         con_a.close()
+
+        # Ensure named stocks are in the pool even if they didn't make top-100 momentum
+        if named_codes:
+            named_in_pool = set(theme_pool["ts_code"].astype(str)) if not theme_pool.empty else set()
+            missing_named = named_codes - named_in_pool
+            if missing_named:
+                extra = screen_df[screen_df["ts_code"].astype(str).isin(missing_named)]
+                if not extra.empty:
+                    theme_pool = pd.concat([theme_pool, extra], ignore_index=True)
+                    logger.info(f"Added {len(extra)} named stocks missing from top-100 momentum pool")
+
         logger.info(f"Theme pool: {len(theme_pool)} candidates after minimal filter")
 
         if not theme_pool.empty:
@@ -1310,19 +1321,21 @@ def phase2_quant_filter(themes: List[ThemeItem], config: Optional[StrategyConfig
                     named_stock_codes=named_codes,
                 )
 
-            theme_pool = normalize_match_columns(theme_pool)
+            # A4: Merge named stocks (assign their themes from evidence) BEFORE normalize
+            if "matched_themes" not in theme_pool.columns:
+                theme_pool["matched_themes"] = [[] for _ in range(len(theme_pool))]
+            for ts_code, theme_names in named_stocks.items():
+                mask = theme_pool["ts_code"].astype(str) == str(ts_code)
+                if mask.any():
+                    existing = theme_pool.loc[mask, "matched_themes"].iloc[0]
+                    if not isinstance(existing, list):
+                        existing = []
+                    merged_themes = list(dict.fromkeys(existing + theme_names))
+                    theme_pool.loc[mask, "matched_themes"] = [merged_themes] * mask.sum()
 
-            # A4: Merge named stocks (assign their themes from evidence) with Qwen-matched
-            if "matched_themes" in theme_pool.columns:
-                for ts_code, theme_names in named_stocks.items():
-                    mask = theme_pool["ts_code"] == ts_code
-                    if mask.any():
-                        existing = theme_pool.loc[mask, "matched_themes"].iloc[0]
-                        if not isinstance(existing, list):
-                            existing = []
-                        merged_themes = list(dict.fromkeys(existing + theme_names))
-                        theme_pool.loc[mask, "matched_themes"] = [merged_themes] * mask.sum()
-                        theme_pool.loc[mask, "off_theme"] = False
+            theme_pool = normalize_match_columns(theme_pool)
+            qwen_matches = theme_pool["matched_themes"].apply(bool).sum()
+            logger.info(f"Theme pool after Qwen + named stock merge: {qwen_matches} stocks with theme matches")
 
             # A5: Filter to only matched stocks
             matched_mask = theme_pool["matched_themes"].apply(lambda x: isinstance(x, list) and len(x) > 0)
