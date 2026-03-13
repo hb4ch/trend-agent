@@ -251,6 +251,8 @@ def qwen_match_themes(
     cache_path: Path,
     cache_version: str = THEME_CACHE_SCHEMA_VERSION,
     config: Optional[StrategyConfig] = None,
+    relaxed_validation: bool = False,
+    named_stock_codes: Optional[set] = None,
 ) -> pd.DataFrame:
     """
     Match stocks to themes using Qwen LLM for semantic understanding.
@@ -374,12 +376,20 @@ def qwen_match_themes(
         - require >=1 hit in main_business, OR
         - require >=2 hits in (main_business + introduction)
         This blocks matches that rely only on generic business_scope phrases.
+
+        When relaxed_validation is True (outer scope):
+        - Accept >=1 hit in (main_business + introduction + business_scope)
+        - OR: stock was explicitly named in theme evidence (bypass keyword check)
         """
         row = row_by_code.get(str(ts_code))
         if row is None:
             return picked
+        # If stock was explicitly named in theme evidence, bypass keyword check
+        if relaxed_validation and named_stock_codes and str(ts_code) in named_stock_codes:
+            return picked
         main_business = str(row.get("main_business", "") or "")
-        combined = f"{main_business} {str(row.get('introduction','') or '')}"
+        introduction = str(row.get("introduction", "") or "")
+        combined = f"{main_business} {introduction}"
         kept: List[str] = []
         for theme_name in picked:
             toks = theme_token_map.get(theme_name, set())
@@ -387,8 +397,16 @@ def qwen_match_themes(
                 continue
             main_hits = sum(1 for tok in toks if tok in main_business)
             combined_hits = sum(1 for tok in toks if tok in combined)
-            if main_hits >= 1 or combined_hits >= 2:
-                kept.append(theme_name)
+            if relaxed_validation:
+                # Relaxed: accept >=1 hit in combined (including business_scope)
+                business_scope = str(row.get("business_scope", "") or "")
+                full_text = f"{combined} {business_scope}"
+                full_hits = sum(1 for tok in toks if tok in full_text)
+                if full_hits >= 1:
+                    kept.append(theme_name)
+            else:
+                if main_hits >= 1 or combined_hits >= 2:
+                    kept.append(theme_name)
         return kept
 
     batch = []
@@ -1122,29 +1140,66 @@ def phase1_market_intel(llm: BaseChatModel) -> List[ThemeItem]:
     return merged_themes
 
 
+def extract_theme_named_stocks(
+    themes: List[ThemeItem],
+    screen_df: pd.DataFrame,
+) -> Dict[str, List[str]]:
+    """
+    Extract stock names explicitly mentioned in theme capital_signal and evidence fields.
+
+    Returns:
+        Dict mapping ts_code -> list of matched theme names
+    """
+    # Load stock_basic for name -> ts_code lookup
+    basic_path = DATA_ROOT / "stock_basic"
+    basic_files = list(basic_path.glob("*.parquet")) if basic_path.exists() else []
+    if not basic_files:
+        return {}
+    basic_df = pd.concat([pd.read_parquet(f) for f in basic_files], ignore_index=True)
+    if basic_df.empty or "name" not in basic_df.columns or "ts_code" not in basic_df.columns:
+        return {}
+
+    # Build name -> ts_code map (only for stocks in screen_df)
+    screen_codes = set(screen_df["ts_code"].astype(str)) if "ts_code" in screen_df.columns else set()
+    name_to_code: Dict[str, str] = {}
+    for _, row in basic_df.iterrows():
+        name = str(row.get("name", "")).strip()
+        code = str(row.get("ts_code", "")).strip()
+        if name and code and len(name) >= 3 and code in screen_codes:
+            name_to_code[name] = code
+
+    result: Dict[str, List[str]] = {}
+    for theme in themes:
+        text = f"{theme.capital_signal or ''} {theme.evidence or ''}"
+        if not text.strip():
+            continue
+        for stock_name, ts_code in name_to_code.items():
+            if stock_name in text:
+                result.setdefault(ts_code, [])
+                if theme.name not in result[ts_code]:
+                    result[ts_code].append(theme.name)
+
+    return result
+
+
 def phase2_quant_filter(themes: List[ThemeItem], config: Optional[StrategyConfig] = None) -> pd.DataFrame:
     """
-    Phase 2: Screen stocks using quantitative technical criteria with progressive relaxation.
+    Phase 2: Dual-list stock selection.
 
-    Implements progressive relaxation when no theme matches are found:
-    1. Strict tier - highest quality criteria
-    2. Relaxed tier - moderate criteria
-    3. Loose tier - most lenient criteria
-    4. OFF_THEME_FALLBACK - best technical stocks (clearly marked)
+    Always produces two complementary lists:
+    1. Theme-Driven List (max 5): Stocks matching identified themes with relaxed filters
+    2. Technical Alpha List (fills to 10 total): Best consolidation/squeeze candidates
 
     Args:
         themes: List of market themes for matching (should have validation_status)
 
     Returns:
-        DataFrame of filtered candidate stocks
+        DataFrame of filtered candidate stocks with 'list_type' column
     """
-    logger.info("Starting Phase 2: Quantitative Filtering with Progressive Relaxation")
+    logger.info("Starting Phase 2: Dual-List Stock Selection")
     config = config or StrategyConfig.from_env()
-    use_heuristic_fallback = config.theme_match_policy in {"balanced", "aggressive"}
-    logger.info(
-        f"Theme match policy: {config.theme_match_policy} "
-        f"(heuristic_fallback={'on' if use_heuristic_fallback else 'off'})"
-    )
+    TOTAL_CAP = 10
+    THEME_CAP = 5
 
     def normalize_match_columns(df: pd.DataFrame) -> pd.DataFrame:
         out = df.copy()
@@ -1153,17 +1208,6 @@ def phase2_quant_filter(themes: List[ThemeItem], config: Optional[StrategyConfig
         out["matched_themes"] = out["matched_themes"].map(lambda x: x if isinstance(x, list) else [])
         out["off_theme"] = out["matched_themes"].map(lambda arr: len(arr) == 0)
         return out
-
-    def match_source_counts(qwen_before: pd.Series, matched_after: pd.Series) -> Dict[str, int]:
-        qwen_count = int(qwen_before.apply(bool).sum())
-        final_count = int(matched_after.apply(bool).sum())
-        heuristic_count = max(0, final_count - qwen_count)
-        off_theme_count = int((~matched_after.apply(bool)).sum())
-        return {
-            "qwen_validated": qwen_count,
-            "heuristic": heuristic_count,
-            "off_theme": off_theme_count,
-        }
 
     # Filter to only confirmed themes (web + capital both confirmed)
     confirmed_themes = [t for t in themes if t.validation_status == "confirmed"]
@@ -1182,7 +1226,6 @@ def phase2_quant_filter(themes: List[ThemeItem], config: Optional[StrategyConfig
 
     logger.info(f"Phase 2 filtering with {len(confirmed_themes)} primary themes: {[t.name for t in confirmed_themes]}")
     expanded_themes = confirmed_themes + [t for t in (web_only_themes + capital_only_themes) if t.name not in {x.name for x in confirmed_themes}]
-    broad_themes = expanded_themes + [t for t in weak_themes if t.name not in {x.name for x in expanded_themes}]
 
     # Build toplist recency features for overcrowding control
     dtl = DragonTigerList()
@@ -1206,8 +1249,6 @@ def phase2_quant_filter(themes: List[ThemeItem], config: Optional[StrategyConfig
         elif config.toplist_exclusion_mode == "none":
             screen_df["toplist_recency_score"] = 0.0
 
-    con = duckdb.connect()
-    con.register("screen", screen_df)
     theme_strength_map = {}
     for theme in themes:
         base = 0.35
@@ -1223,156 +1264,157 @@ def phase2_quant_filter(themes: List[ThemeItem], config: Optional[StrategyConfig
             base = min(1.1, base + 0.05)
         theme_strength_map[theme.name] = base
 
-    # Define progressive relaxation tiers
-    filter_tiers = [
-        {
-            "name": "Strict",
-            "consolidation": 70,
-            "ma_spread": 0.15,
-            "ma_spread_std": 0.03,
-            "volume_min": 1.2,
-            "volume_max": 3.0,
-            "squeeze_readiness_min": 40,
-        },
-        {
-            "name": "Relaxed",
-            "consolidation": 60,
-            "ma_spread": 0.20,
-            "ma_spread_std": 0.05,
-            "volume_min": 1.0,
-            "volume_max": 4.0,
-            "squeeze_readiness_min": 20,
-        },
-        {
-            "name": "Loose",
-            "consolidation": 50,
-            "ma_spread": 0.30,
-            "ma_spread_std": 0.08,
-            "volume_min": 0.8,
-            "volume_max": 5.0,
-            "squeeze_readiness_min": 0,
-        },
-    ]
+    # ============ Step A: Build Theme-Driven List (max 5) ============
+    theme_list: pd.DataFrame = pd.DataFrame()
+    if themes:
+        logger.info("Step A: Building theme-driven list...")
 
-    # Try each tier until we find theme matches
-    for tier in filter_tiers:
-        squeeze_clause = ""
-        if tier.get("squeeze_readiness_min", 0) > 0 and "squeeze_readiness" in screen_df.columns:
-            squeeze_clause = f"AND squeeze_readiness >= {tier['squeeze_readiness_min']}"
-        filtered = con.execute(f"""
+        # A1: Extract stocks explicitly named in theme evidence
+        named_stocks = extract_theme_named_stocks(themes, screen_df)
+        named_codes = set(named_stocks.keys())
+        logger.info(f"Found {len(named_codes)} stocks named in theme evidence")
+
+        # A2: Minimal filter from screen_df — only volume_boost >= 0.5
+        con_a = duckdb.connect()
+        con_a.register("screen", screen_df)
+        theme_pool = con_a.execute("""
             SELECT *
             FROM screen
-            WHERE consolidation_score >= {tier['consolidation']}
-              AND ma_spread <= {tier['ma_spread']}
-              AND ma_spread_std <= {tier['ma_spread_std']}
-              AND volume_boost >= {tier['volume_min']}
-              AND volume_boost <= {tier['volume_max']}
-              {squeeze_clause}
-            ORDER BY composite_score DESC
+            WHERE volume_boost >= 0.5
+            ORDER BY momentum_score DESC
+            LIMIT 100
         """).df()
+        con_a.close()
+        logger.info(f"Theme pool: {len(theme_pool)} candidates after minimal filter")
 
-        logger.info(f"Tier '{tier['name']}': {len(filtered)} candidates passed technical filter")
-
-        # Use staged theme matching: primary themes first, then broader pool if needed.
-        filtered = qwen_match_themes(
-            confirmed_themes,
-            filtered,
-            cache_path=Path(".cache/qwen_theme_match.json"),
-            cache_version=config.theme_cache_version,
-            config=config,
-        )
-        has_match = filtered["matched_themes"].apply(bool).sum() if "matched_themes" in filtered.columns else 0
-        if has_match == 0 and expanded_themes:
-            filtered = qwen_match_themes(
-                expanded_themes,
-                filtered,
-                cache_path=Path(".cache/qwen_theme_match.json"),
-                cache_version=f"{config.theme_cache_version}_expanded",
+        if not theme_pool.empty:
+            # A3: Run qwen_match_themes with relaxed validation on broader pool
+            theme_pool = qwen_match_themes(
+                confirmed_themes,
+                theme_pool,
+                cache_path=Path(".cache/qwen_theme_match_relaxed.json"),
+                cache_version=f"{config.theme_cache_version}_theme_driven",
                 config=config,
+                relaxed_validation=True,
+                named_stock_codes=named_codes,
             )
-            has_match = filtered["matched_themes"].apply(bool).sum() if "matched_themes" in filtered.columns else 0
-        qwen_only_matches = filtered["matched_themes"].map(lambda x: x if isinstance(x, list) else []) if "matched_themes" in filtered.columns else pd.Series([[]] * len(filtered))
-        if has_match == 0 and broad_themes and use_heuristic_fallback:
-            filtered = heuristic_match_themes(broad_themes, filtered, existing_col="matched_themes")
-        filtered = normalize_match_columns(filtered)
-        tier_counts = match_source_counts(qwen_only_matches, filtered["matched_themes"])
-        logger.info(
-            f"Tier '{tier['name']}' match sources: "
-            f"qwen_validated={tier_counts['qwen_validated']} "
-            f"heuristic={tier_counts['heuristic']} "
-            f"off_theme={tier_counts['off_theme']}"
-        )
+            has_match = theme_pool["matched_themes"].apply(bool).sum() if "matched_themes" in theme_pool.columns else 0
+            if has_match == 0 and expanded_themes:
+                theme_pool = qwen_match_themes(
+                    expanded_themes,
+                    theme_pool,
+                    cache_path=Path(".cache/qwen_theme_match_relaxed.json"),
+                    cache_version=f"{config.theme_cache_version}_theme_driven_expanded",
+                    config=config,
+                    relaxed_validation=True,
+                    named_stock_codes=named_codes,
+                )
 
-        has_match = filtered["matched_themes"].apply(bool).sum() if "matched_themes" in filtered.columns else 0
-        logger.info(f"Tier '{tier['name']}': {has_match} candidates matched themes")
+            theme_pool = normalize_match_columns(theme_pool)
 
-        if has_match > 0:
-            # Found theme matches at this tier
-            filtered = filtered[filtered["matched_themes"].apply(bool)]
-            filtered["theme_strength_score"] = filtered["matched_themes"].map(
-                lambda arr: max([theme_strength_map.get(str(t), 0.5) for t in arr], default=0.0)
-            )
-            filtered["alpha_rank_score"] = (
-                filtered["composite_score"]
-                + filtered["theme_strength_score"] * 15.0
-                - filtered["toplist_recency_score"] * (config.toplist_penalty_weight * 10.0)
-            )
-            filtered = normalize_match_columns(filtered)
-            filtered["filter_tier"] = tier['name']
-            filtered = filtered.sort_values("alpha_rank_score", ascending=False)
-            logger.info(f"Phase 2 complete: Using tier '{tier['name']}', {len(filtered.head(15))} candidates with theme matches")
-            return filtered.head(15)
+            # A4: Merge named stocks (assign their themes from evidence) with Qwen-matched
+            if "matched_themes" in theme_pool.columns:
+                for ts_code, theme_names in named_stocks.items():
+                    mask = theme_pool["ts_code"] == ts_code
+                    if mask.any():
+                        existing = theme_pool.loc[mask, "matched_themes"].iloc[0]
+                        if not isinstance(existing, list):
+                            existing = []
+                        merged_themes = list(dict.fromkeys(existing + theme_names))
+                        theme_pool.loc[mask, "matched_themes"] = [merged_themes] * mask.sum()
+                        theme_pool.loc[mask, "off_theme"] = False
 
-    # Final fallback - clearly mark as off-theme
-    logger.warning("No theme matches after all tiers, returning best technical stocks (OFF-THEME FALLBACK)")
-    # Get the best candidates from the loosest tier
-    filtered = con.execute(f"""
+            # A5: Filter to only matched stocks
+            matched_mask = theme_pool["matched_themes"].apply(lambda x: isinstance(x, list) and len(x) > 0)
+            theme_matched = theme_pool[matched_mask].copy()
+
+            if not theme_matched.empty:
+                # A6: Score with momentum-weighted formula
+                theme_matched["theme_strength_score"] = theme_matched["matched_themes"].map(
+                    lambda arr: max([theme_strength_map.get(str(t), 0.5) for t in arr], default=0.0)
+                )
+                momentum_col = "momentum_score" if "momentum_score" in theme_matched.columns else "composite_score"
+                volume_col = "volume_quality_score" if "volume_quality_score" in theme_matched.columns else "volume_boost"
+                toplist_penalty = theme_matched.get("toplist_recency_score", pd.Series(0.0, index=theme_matched.index))
+                theme_matched["alpha_rank_score"] = (
+                    theme_matched[momentum_col] * 0.30
+                    + theme_matched["theme_strength_score"] * 20.0
+                    + theme_matched[volume_col] * 0.15
+                    + theme_matched["composite_score"] * 0.10
+                    - toplist_penalty * (config.toplist_penalty_weight * 10.0)
+                )
+                theme_matched = theme_matched.sort_values("alpha_rank_score", ascending=False)
+
+                # A7: Take top 5, tag as theme_driven
+                theme_list = theme_matched.head(THEME_CAP).copy()
+                theme_list["list_type"] = "theme_driven"
+                theme_list["filter_tier"] = "theme_driven"
+                logger.info(f"Theme-driven list: {len(theme_list)} stocks selected")
+            else:
+                logger.info("No theme matches found in broader pool")
+    else:
+        logger.info("No themes available, skipping theme-driven list")
+
+    # ============ Step B: Build Technical Alpha List (fills to 10) ============
+    tech_budget = TOTAL_CAP - len(theme_list)
+    logger.info(f"Step B: Building technical alpha list (budget={tech_budget})...")
+
+    con_b = duckdb.connect()
+    con_b.register("screen", screen_df)
+    tech_pool = con_b.execute("""
         SELECT *
         FROM screen
         WHERE consolidation_score >= 50
         ORDER BY composite_score DESC
     """).df()
-    filtered = qwen_match_themes(
-        confirmed_themes,
-        filtered,
-        cache_path=Path(".cache/qwen_theme_match.json"),
-        cache_version=config.theme_cache_version,
-        config=config,
-    )
-    has_fallback_match = filtered["matched_themes"].apply(bool).sum() if "matched_themes" in filtered.columns else 0
-    if has_fallback_match == 0 and expanded_themes:
-        filtered = qwen_match_themes(
-            expanded_themes,
-            filtered,
-            cache_path=Path(".cache/qwen_theme_match.json"),
-            cache_version=f"{config.theme_cache_version}_expanded",
-            config=config,
-        )
-        has_fallback_match = filtered["matched_themes"].apply(bool).sum() if "matched_themes" in filtered.columns else 0
-    qwen_only_fallback = filtered["matched_themes"].map(lambda x: x if isinstance(x, list) else []) if "matched_themes" in filtered.columns else pd.Series([[]] * len(filtered))
-    if has_fallback_match == 0 and broad_themes and use_heuristic_fallback:
-        filtered = heuristic_match_themes(broad_themes, filtered, existing_col="matched_themes")
-    filtered = normalize_match_columns(filtered)
-    fallback_counts = match_source_counts(qwen_only_fallback, filtered["matched_themes"])
+    con_b.close()
+    logger.info(f"Technical pool: {len(tech_pool)} candidates after consolidation filter")
+
+    if not tech_pool.empty:
+        # Exclude stocks already in theme list
+        if not theme_list.empty and "ts_code" in theme_list.columns:
+            theme_codes = set(theme_list["ts_code"].astype(str))
+            tech_pool = tech_pool[~tech_pool["ts_code"].astype(str).isin(theme_codes)]
+
+        tech_pool = normalize_match_columns(tech_pool)
+        tech_pool["theme_strength_score"] = 0.0
+        tech_pool["alpha_rank_score"] = tech_pool["composite_score"]
+
+        tech_list = tech_pool.head(tech_budget).copy()
+        tech_list["list_type"] = "technical"
+        tech_list["filter_tier"] = "technical"
+    else:
+        tech_list = pd.DataFrame()
+
+    # ============ Step C: Combine ============
+    parts = []
+    if not theme_list.empty:
+        parts.append(theme_list)
+    if not tech_list.empty:
+        parts.append(tech_list)
+
+    if not parts:
+        logger.warning("No candidates from either list")
+        return pd.DataFrame()
+
+    combined = pd.concat(parts, ignore_index=True)
+
+    # Mark stocks appearing in both lists
+    if not theme_list.empty and not tech_list.empty:
+        theme_codes = set(theme_list["ts_code"].astype(str)) if not theme_list.empty else set()
+        tech_codes = set(tech_list["ts_code"].astype(str)) if not tech_list.empty else set()
+        both_codes = theme_codes & tech_codes
+        if both_codes:
+            combined.loc[combined["ts_code"].astype(str).isin(both_codes), "list_type"] = "both"
+
+    combined = normalize_match_columns(combined)
+    theme_count = len(combined[combined["list_type"].isin(["theme_driven", "both"])])
+    tech_count = len(combined[combined["list_type"].isin(["technical", "both"])])
     logger.info(
-        "OFF_THEME_FALLBACK match sources: "
-        f"qwen_validated={fallback_counts['qwen_validated']} "
-        f"heuristic={fallback_counts['heuristic']} "
-        f"off_theme={fallback_counts['off_theme']}"
+        f"Phase 2 complete: {len(combined)} total candidates "
+        f"(theme_driven={theme_count}, technical={tech_count})"
     )
-    filtered["theme_strength_score"] = filtered["matched_themes"].map(
-        lambda arr: max([theme_strength_map.get(str(t), 0.5) for t in arr], default=0.0)
-    )
-    filtered["alpha_rank_score"] = (
-        filtered["composite_score"]
-        + filtered["theme_strength_score"] * 15.0
-        - filtered["toplist_recency_score"] * (config.toplist_penalty_weight * 10.0)
-    )
-    filtered = normalize_match_columns(filtered)
-    filtered["filter_tier"] = "OFF_THEME_FALLBACK"
-    filtered = filtered.sort_values("alpha_rank_score", ascending=False)
-    logger.info(f"Phase 2 complete: OFF_THEME_FALLBACK mode, returning top 15 technical candidates")
-    return filtered.head(15)
+    return combined
 
 
 def apply_audit_filter(
@@ -1564,12 +1606,22 @@ def rank_candidates_for_alpha(
         ranked["alpha_rank_score"] = ranked["alpha_rank_score_new"]
         ranked = ranked.drop(columns=["alpha_rank_score_new"])
 
-    ranked = ranked.sort_values("alpha_rank_score", ascending=False)
+    # Sort within each list_type group, then concatenate (theme first, then technical)
+    has_list_type = "list_type" in ranked.columns
+    if has_list_type:
+        theme_part = ranked[ranked["list_type"].isin(["theme_driven", "both"])].sort_values("alpha_rank_score", ascending=False)
+        tech_part = ranked[ranked["list_type"] == "technical"].sort_values("alpha_rank_score", ascending=False)
+        ranked = pd.concat([theme_part, tech_part], ignore_index=True)
+        # Drop duplicates (stocks in both lists already have list_type="both")
+        ranked = ranked.drop_duplicates(subset="ts_code", keep="first")
+    else:
+        ranked = ranked.sort_values("alpha_rank_score", ascending=False)
+
     ranked = apply_diversification_constraints(
         ranked,
         max_per_theme=config.max_names_per_theme,
         max_per_industry=config.max_names_per_industry,
-        target_n=15,
+        target_n=10,
     )
     return ranked.reset_index(drop=True)
 
@@ -1606,7 +1658,7 @@ def phase3_deep_audit(
     )
 
     config = config or StrategyConfig.from_env()
-    top = candidates.head(15)
+    top = candidates
     audit_results: List[AuditResult] = []
 
     # Build theme capital signal map
@@ -2312,7 +2364,7 @@ def phase4_plot_charts(candidates: pd.DataFrame) -> Dict[str, List[str]]:
 
 def compute_signals(candidates: pd.DataFrame) -> Dict[str, Dict[str, object]]:
     signals: Dict[str, Dict[str, object]] = {}
-    for _, row in candidates.head(15).iterrows():
+    for _, row in candidates.iterrows():
         ts_code = row["ts_code"]
         name = row.get("name", "")
         df = load_price_data(ts_code)
@@ -2497,11 +2549,50 @@ def phase5_report(
     return md_path
 
 
-def build_deterministic_core_table(candidates: pd.DataFrame, audits: List[AuditResult], top_n: int = 8) -> str:
-    """Build deterministic core stock markdown table from ranked candidates."""
+def build_deterministic_theme_table(candidates: pd.DataFrame, audits: List[AuditResult], top_n: int = 5) -> str:
+    """Build deterministic theme-driven stock markdown table."""
     if candidates is None or candidates.empty:
+        return ""
+    # Filter to theme-driven stocks
+    theme_stocks = candidates[candidates["list_type"].isin(["theme_driven", "both"])] if "list_type" in candidates.columns else pd.DataFrame()
+    if theme_stocks.empty:
+        return ""
+
+    audit_conf = {}
+    for a in audits or []:
+        audit_conf.setdefault(a.ts_code, []).append(float(a.confidence_score or 0.5))
+
+    lines = [
+        "## 【核心金股 - 题材驱动精选】",
+        "",
+        "| 股票 | 匹配题材 | 题材强度 | 动量评分 | Alpha评分 |",
+        "| --- | --- | --- | --- | --- |",
+    ]
+    for _, row in theme_stocks.head(top_n).iterrows():
+        ts_code = str(row.get("ts_code", ""))
+        name = str(row.get("name", ts_code))
+        matched = row.get("matched_themes", [])
+        if not isinstance(matched, list):
+            matched = []
+        theme_text = ", ".join(matched[:2]) if matched else "待确认"
+        theme_strength = float(row.get("theme_strength_score", 0.0))
+        momentum = float(row.get("momentum_score", row.get("composite_score", 0.0)))
+        alpha = float(row.get("alpha_rank_score", 0.0))
+        lines.append(f"| {name}({ts_code}) | {theme_text} | {theme_strength:.2f} | {momentum:.1f} | {alpha:.1f} |")
+    return "\n".join(lines)
+
+
+def build_deterministic_core_table(candidates: pd.DataFrame, audits: List[AuditResult], top_n: int = 8) -> str:
+    """Build deterministic core stock markdown table from ranked candidates (technical alpha)."""
+    # Filter to technical stocks when list_type is available
+    if "list_type" in candidates.columns if candidates is not None else False:
+        tech_stocks = candidates[candidates["list_type"].isin(["technical", "both"])]
+    else:
+        tech_stocks = candidates
+
+    if tech_stocks is None or tech_stocks.empty:
         return (
-            "## 【核心金股】\n\n"
+            "## 【核心金股 - 技术形态精选】\n\n"
             "| 股票 | 所属主线 | 形态特征 | 置信度 | 推荐理由 |\n"
             "| --- | --- | --- | --- | --- |\n"
         )
@@ -2510,12 +2601,12 @@ def build_deterministic_core_table(candidates: pd.DataFrame, audits: List[AuditR
         audit_conf.setdefault(a.ts_code, []).append(float(a.confidence_score or 0.5))
 
     lines = [
-        "## 【核心金股】",
+        "## 【核心金股 - 技术形态精选】",
         "",
         "| 股票 | 所属主线 | 形态特征 | 置信度 | 推荐理由 |",
         "| --- | --- | --- | --- | --- |",
     ]
-    for _, row in candidates.head(top_n).iterrows():
+    for _, row in tech_stocks.head(top_n).iterrows():
         ts_code = str(row.get("ts_code", ""))
         name = str(row.get("name", ts_code))
         matched = row.get("matched_themes", [])
@@ -2523,7 +2614,7 @@ def build_deterministic_core_table(candidates: pd.DataFrame, audits: List[AuditR
             matched = []
         off_theme = bool(row.get("off_theme", not bool(matched)))
         if off_theme:
-            theme_text = "**OFF-THEME（无题材匹配）**"
+            theme_text = "技术形态入选"
         else:
             theme_text = ", ".join(matched[:2]) if matched else "待确认"
         shape_parts = []
@@ -2531,14 +2622,10 @@ def build_deterministic_core_table(candidates: pd.DataFrame, audits: List[AuditR
             shape_parts.append(f"横盘分{float(row.get('consolidation_score', 0.0)):.0f}")
         if "volume_boost" in row:
             shape_parts.append(f"量能{float(row.get('volume_boost', 0.0)):.2f}")
-        if "filter_tier" in row:
-            shape_parts.append(f"层级{row.get('filter_tier')}")
         shape = "，".join(shape_parts) if shape_parts else "技术形态待补充"
         conf_list = audit_conf.get(ts_code, [])
         confidence = float(np.mean(conf_list)) if conf_list else 0.5
         reason_parts = []
-        if off_theme:
-            reason_parts.append("该股票未匹配当前热点题材，仅基于技术形态入选")
         if "alpha_rank_score" in row:
             reason_parts.append(f"alpha评分{float(row.get('alpha_rank_score', 0.0)):.1f}")
         if "toplist_recency_score" in row:
@@ -2548,18 +2635,22 @@ def build_deterministic_core_table(candidates: pd.DataFrame, audits: List[AuditR
     return "\n".join(lines)
 
 
-def upsert_core_table_in_report(report_md: str, table_section_md: str) -> str:
-    """Replace existing core table section or insert one if missing."""
+def upsert_core_table_in_report(report_md: str, table_sections_md: str) -> str:
+    """Replace existing core table sections or insert them if missing."""
     if not report_md:
-        return table_section_md
-    pattern = r"##\s*【核心金股】[\s\S]*?(?=\n##\s*【|\Z)"
-    if re.search(pattern, report_md):
-        return re.sub(pattern, table_section_md + "\n\n", report_md, count=1)
+        return table_sections_md
+    # Remove any existing core table sections (both old and new format)
+    for pattern in [
+        r"##\s*【核心金股 - 技术形态精选】[\s\S]*?(?=\n##\s*【|\Z)",
+        r"##\s*【核心金股 - 题材驱动精选】[\s\S]*?(?=\n##\s*【|\Z)",
+        r"##\s*【核心金股】[\s\S]*?(?=\n##\s*【|\Z)",
+    ]:
+        report_md = re.sub(pattern, "", report_md)
     insert_after = re.search(r"##\s*【市场风向标】[\s\S]*?(?=\n##\s*【|\Z)", report_md)
     if insert_after:
         idx = insert_after.end()
-        return report_md[:idx] + "\n\n" + table_section_md + "\n\n" + report_md[idx:]
-    return table_section_md + "\n\n" + report_md
+        return report_md[:idx] + "\n\n" + table_sections_md + "\n\n" + report_md[idx:]
+    return table_sections_md + "\n\n" + report_md
 
 
 _MARKET_OVERVIEW_SYSTEM_PROMPT = (
@@ -2762,11 +2853,13 @@ def phase5_report_with_deepseek(
     for a in audits:
         audit_map.setdefault(a.ts_code, []).append(a)
 
-    candidates_with_flag = candidates.head(15).copy()
+    candidates_with_flag = candidates.copy()
     if "off_theme" not in candidates_with_flag.columns:
         candidates_with_flag["off_theme"] = False
     if "filter_tier" not in candidates_with_flag.columns:
         candidates_with_flag["filter_tier"] = "Unknown"
+    if "list_type" not in candidates_with_flag.columns:
+        candidates_with_flag["list_type"] = "technical"
 
     # --- Part A: Market overview (themes only) ---
     theme_summary = [
@@ -2780,22 +2873,32 @@ def phase5_report_with_deepseek(
     logger.info("Phase 5: generating market overview...")
     overview_md = _generate_market_overview(theme_summary, trace_path)
 
-    # --- Part B: Deterministic core table ---
+    # --- Part B: Deterministic core tables (dual-list) ---
+    theme_table_md = build_deterministic_theme_table(
+        candidates_with_flag, audits, top_n=5
+    )
     core_table_md = build_deterministic_core_table(
         candidates_with_flag, audits, top_n=min(10, len(candidates_with_flag))
     )
+    # Combined table sections
+    table_sections = []
+    table_sections.append(core_table_md)
+    if theme_table_md:
+        table_sections.append(theme_table_md)
+    combined_tables_md = "\n\n".join(table_sections)
 
     # --- Part C: Per-stock deep sections ---
     stock_sections = []
     theme_context = "; ".join(f"{t.name}({t.validation_status})" for t in themes)
 
-    for idx, (_, row) in enumerate(candidates_with_flag.head(10).iterrows()):
+    stock_limit = min(10, len(candidates_with_flag))
+    for idx, (_, row) in enumerate(candidates_with_flag.head(stock_limit).iterrows()):
         ts_code = row["ts_code"]
         name = row.get("name", ts_code)
         stock_audits = audit_map.get(ts_code, [])
         ctx = _build_stock_context(row.to_dict(), stock_audits, chart_notes, signals, theme_context)
 
-        logger.info(f"Phase 5: generating stock section {idx+1}/10 for {name}({ts_code})...")
+        logger.info(f"Phase 5: generating stock section {idx+1}/{stock_limit} for {name}({ts_code})...")
         section_md = _generate_stock_section(ctx, trace_path, candidates_with_flag)
         if section_md:
             stock_sections.append(section_md)
@@ -2807,7 +2910,7 @@ def phase5_report_with_deepseek(
         "# A股趋势跟踪研报\n",
         overview_md or "## 【市场风向标】\n\n（生成失败，请参考审计数据）\n",
         "\n",
-        core_table_md,
+        combined_tables_md,
         "\n\n## 【深度图解】\n",
     ]
     report_parts.extend(stock_sections)
@@ -2829,7 +2932,7 @@ def phase5_report_with_deepseek(
         if real_urls:
             report_md = report_md.replace("url1", real_urls[0])
 
-    report_md = upsert_core_table_in_report(report_md, core_table_md)
+    report_md = upsert_core_table_in_report(report_md, combined_tables_md)
     md_path.write_text(report_md, encoding="utf-8")
     return md_path
 
