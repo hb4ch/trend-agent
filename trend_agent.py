@@ -466,13 +466,26 @@ def qwen_match_themes(
         parsed = safe_json_loads(content or "")
         matches = parsed.get("matches", {}) if isinstance(parsed, dict) else {}
 
+        # Build normalized name lookup: collapse whitespace so "AI 算力" matches "AI算力"
+        _norm = lambda s: re.sub(r"\s+", "", s)
+        norm_to_original = {_norm(t["name"]): t["name"] for t in theme_list}
+
         for item in batch_items:
             ts_code = item.get("ts_code")
             picked = matches.get(ts_code, []) if isinstance(matches, dict) else []
             if not isinstance(picked, list):
                 picked = []
-            picked = [str(x) for x in picked if str(x) in [t["name"] for t in theme_list]]
-            picked = validate_match(str(ts_code), picked)
+            # Fuzzy-match theme names: normalize whitespace before comparing to whitelist
+            resolved = []
+            for x in picked:
+                x_str = str(x)
+                if x_str in norm_to_original.values():
+                    resolved.append(x_str)
+                else:
+                    canonical = norm_to_original.get(_norm(x_str))
+                    if canonical:
+                        resolved.append(canonical)
+            picked = validate_match(str(ts_code), resolved)
             matched_map[ts_code] = picked
 
     # Process in batches
