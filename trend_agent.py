@@ -11,7 +11,6 @@ Implements a 5-phase pipeline:
 """
 
 import io
-import hashlib
 import json
 import logging
 import os
@@ -82,7 +81,6 @@ CHART_FONT_FALLBACKS = [
 # Configuration from environment
 DEBUG_DEEPSEEK = os.environ.get("DEBUG_DEEPSEEK", "").strip() in {"1", "true", "True", "YES", "yes"}
 REGULATORY_MAX_AGE_DAYS = int(os.environ.get("REGULATORY_MAX_AGE_DAYS", "730"))
-THEME_CACHE_SCHEMA_VERSION = "3"
 
 
 @dataclass
@@ -97,7 +95,6 @@ class StrategyConfig:
     hard_fail_require_recency: bool = True
     hard_fail_max_age_days: int = REGULATORY_MAX_AGE_DAYS
     hard_fail_reduce_materiality_threshold: float = 0.03
-    theme_cache_version: str = THEME_CACHE_SCHEMA_VERSION
     theme_match_policy: str = "conservative"  # conservative|balanced|aggressive
     max_names_per_theme: int = 4
     max_names_per_industry: int = 4
@@ -123,7 +120,6 @@ class StrategyConfig:
             hard_fail_require_recency=os.environ.get("HARD_FAIL_REQUIRE_RECENCY", "1").strip() in {"1", "true", "True", "YES", "yes"},
             hard_fail_max_age_days=int(os.environ.get("HARD_FAIL_MAX_AGE_DAYS", str(REGULATORY_MAX_AGE_DAYS))),
             hard_fail_reduce_materiality_threshold=float(os.environ.get("HARD_FAIL_REDUCE_MATERIALITY_THRESHOLD", "0.03")),
-            theme_cache_version=os.environ.get("THEME_CACHE_VERSION", THEME_CACHE_SCHEMA_VERSION),
             theme_match_policy=theme_match_policy,
             max_names_per_theme=int(os.environ.get("MAX_NAMES_PER_THEME", "4")),
             max_names_per_industry=int(os.environ.get("MAX_NAMES_PER_INDUSTRY", "4")),
@@ -248,8 +244,6 @@ def parse_search_payload(raw: Any) -> Dict[str, Any]:
 def qwen_match_themes(
     themes: List[ThemeItem],
     candidates: pd.DataFrame,
-    cache_path: Path,
-    cache_version: str = THEME_CACHE_SCHEMA_VERSION,
     config: Optional[StrategyConfig] = None,
     relaxed_validation: bool = False,
     named_stock_codes: Optional[set] = None,
@@ -260,7 +254,8 @@ def qwen_match_themes(
     Args:
         themes: List of market themes to match against
         candidates: DataFrame of candidate stocks
-        cache_path: Path to cache file for results
+        relaxed_validation: Use relaxed keyword validation rules
+        named_stock_codes: Stock codes explicitly named in theme evidence (bypass validation)
 
     Returns:
         DataFrame with additional 'matched_themes' column
@@ -269,14 +264,6 @@ def qwen_match_themes(
         return candidates
     config = config or StrategyConfig.from_env()
 
-    cache: Dict[str, Any] = {}
-    try:
-        if cache_path.exists():
-            cache = json.loads(cache_path.read_text(encoding="utf-8"))
-    except (OSError, ValueError, json.JSONDecodeError) as e:
-        logger.warning(f"Failed to load theme match cache: {e}")
-        cache = {}
-
     theme_list = [
         {"name": t.name, "keywords": t.keywords, "summary": t.summary}
         for t in themes
@@ -284,31 +271,12 @@ def qwen_match_themes(
     ]
     if not theme_list:
         return candidates
-    theme_fingerprint_text = json.dumps(
-        sorted(
-            [{"name": t["name"], "keywords": sorted(t.get("keywords", [])), "summary": t.get("summary", "")} for t in theme_list],
-            key=lambda x: x["name"],
-        ),
-        ensure_ascii=False,
-    )
-    theme_set_hash = hashlib.sha256(theme_fingerprint_text.encode("utf-8", errors="ignore")).hexdigest()[:16]
-
-    def row_fingerprint(row: pd.Series) -> str:
-        """Create fingerprint for caching theme matches."""
-        from utils import create_row_fingerprint
-
-        return create_row_fingerprint(
-            row.to_dict(),
-            ["name", "industry", "main_business", "business_scope", "introduction"],
-        )
 
     def get_text(row: pd.Series) -> str:
         """Get text representation of stock for theme matching."""
         main_business = str(row.get("main_business", "") or "")
         introduction = str(row.get("introduction", "") or "")
         business_scope = str(row.get("business_scope", "") or "")
-        # `business_scope` is often registration boilerplate with broad terms.
-        # Keep only a short snippet so it cannot dominate classification.
         business_scope = re.sub(r"一般项目[:：]", "", business_scope)[:180]
         return " | ".join(
             [
@@ -384,7 +352,6 @@ def qwen_match_themes(
         row = row_by_code.get(str(ts_code))
         if row is None:
             return picked
-        # If stock was explicitly named in theme evidence, bypass keyword check
         if relaxed_validation and named_stock_codes and str(ts_code) in named_stock_codes:
             return picked
         main_business = str(row.get("main_business", "") or "")
@@ -398,7 +365,6 @@ def qwen_match_themes(
             main_hits = sum(1 for tok in toks if tok in main_business)
             combined_hits = sum(1 for tok in toks if tok in combined)
             if relaxed_validation:
-                # Relaxed: accept >=1 hit in combined (including business_scope)
                 business_scope = str(row.get("business_scope", "") or "")
                 full_text = f"{combined} {business_scope}"
                 full_hits = sum(1 for tok in toks if tok in full_text)
@@ -409,21 +375,13 @@ def qwen_match_themes(
                     kept.append(theme_name)
         return kept
 
-    batch = []
-    batch_keys = []
-    for _, row in updated.iterrows():
-        key = f"{cache_version}:{theme_set_hash}:{row_fingerprint(row)}"
-        if key in cache:
-            val = cache.get(key)
-            if isinstance(val, dict) and isinstance(val.get("matched"), list):
-                matched_map[row["ts_code"]] = [
-                    str(x) for x in val["matched"] if str(x) in [t["name"] for t in theme_list]
-                ]
-            continue
-        batch.append({"ts_code": row["ts_code"], "text": get_text(row)})
-        batch_keys.append(key)
+    # Build all batch items (no cache — always send everything to LLM)
+    batch = [
+        {"ts_code": row["ts_code"], "text": get_text(row)}
+        for _, row in updated.iterrows()
+    ]
 
-    def flush(batch_items: List[dict], batch_fp: List[str]) -> None:
+    def flush(batch_items: List[dict]) -> None:
         """Flush batch of stocks to LLM for theme matching."""
         nonlocal total_batches, rate_limited_batches, exhausted_batches, effective_retries_used
         if not batch_items:
@@ -480,15 +438,8 @@ def qwen_match_themes(
                         len(batch_items),
                         retries_used,
                     )
-                    for fp, item in zip(batch_fp, batch_items):
-                        ts_code = item.get("ts_code")
-                        matched_map[ts_code] = []
-                        cache[fp] = {
-                            "schema_version": cache_version,
-                            "theme_set_hash": theme_set_hash,
-                            "matched": [],
-                            "note": "rate_limited_exhausted",
-                        }
+                    for item in batch_items:
+                        matched_map[item["ts_code"]] = []
                     return
                 backoff_cap = min(
                     config.qwen_rate_limit_max_delay_sec,
@@ -514,9 +465,8 @@ def qwen_match_themes(
             return
         parsed = safe_json_loads(content or "")
         matches = parsed.get("matches", {}) if isinstance(parsed, dict) else {}
-        notes = parsed.get("notes", {}) if isinstance(parsed, dict) else {}
 
-        for fp, item in zip(batch_fp, batch_items):
+        for item in batch_items:
             ts_code = item.get("ts_code")
             picked = matches.get(ts_code, []) if isinstance(matches, dict) else []
             if not isinstance(picked, list):
@@ -524,24 +474,10 @@ def qwen_match_themes(
             picked = [str(x) for x in picked if str(x) in [t["name"] for t in theme_list]]
             picked = validate_match(str(ts_code), picked)
             matched_map[ts_code] = picked
-            cache[fp] = {
-                "schema_version": cache_version,
-                "theme_set_hash": theme_set_hash,
-                "matched": picked,
-                "note": notes.get(ts_code) if isinstance(notes, dict) else ""
-            }
 
     # Process in batches
-    chunk = []
-    chunk_keys = []
-    for item, fp in zip(batch, batch_keys):
-        chunk.append(item)
-        chunk_keys.append(fp)
-        if len(chunk) >= config.qwen_batch_size:
-            flush(chunk, chunk_keys)
-            chunk = []
-            chunk_keys = []
-    flush(chunk, chunk_keys)
+    for i in range(0, len(batch), config.qwen_batch_size):
+        flush(batch[i:i + config.qwen_batch_size])
     if total_batches > 0:
         logger.info(
             "Qwen match stats: total_batches=%s rate_limited_batches=%s exhausted_batches=%s effective_retries_used=%s",
@@ -550,15 +486,6 @@ def qwen_match_themes(
             exhausted_batches,
             effective_retries_used,
         )
-
-    # Save cache
-    try:
-        cache_path.parent.mkdir(parents=True, exist_ok=True)
-        cache_path.write_text(
-            json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
-    except (OSError, IOError) as e:
-        logger.warning(f"Failed to save theme match cache: {e}")
 
     updated["matched_themes"] = updated["ts_code"].map(lambda c: matched_map.get(c, []))
     return updated
@@ -1303,8 +1230,6 @@ def phase2_quant_filter(themes: List[ThemeItem], config: Optional[StrategyConfig
             theme_pool = qwen_match_themes(
                 confirmed_themes,
                 theme_pool,
-                cache_path=Path(".cache/qwen_theme_match_relaxed.json"),
-                cache_version=f"{config.theme_cache_version}_theme_driven",
                 config=config,
                 relaxed_validation=True,
                 named_stock_codes=named_codes,
@@ -1314,8 +1239,6 @@ def phase2_quant_filter(themes: List[ThemeItem], config: Optional[StrategyConfig
                 theme_pool = qwen_match_themes(
                     expanded_themes,
                     theme_pool,
-                    cache_path=Path(".cache/qwen_theme_match_relaxed.json"),
-                    cache_version=f"{config.theme_cache_version}_theme_driven_expanded",
                     config=config,
                     relaxed_validation=True,
                     named_stock_codes=named_codes,
