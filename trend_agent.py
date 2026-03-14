@@ -464,11 +464,49 @@ def qwen_match_themes(
         if content is None:
             return
         parsed = safe_json_loads(content or "")
-        matches = parsed.get("matches", {}) if isinstance(parsed, dict) else {}
+        raw_matches = parsed.get("matches", {}) if isinstance(parsed, dict) else {}
+        raw_notes = parsed.get("notes", {}) if isinstance(parsed, dict) else {}
 
         # Build normalized name lookup: collapse whitespace so "AI 算力" matches "AI算力"
         _norm = lambda s: re.sub(r"\s+", "", s)
         norm_to_original = {_norm(t["name"]): t["name"] for t in theme_list}
+        theme_name_set = {t["name"] for t in theme_list}
+        batch_codes = {item["ts_code"] for item in batch_items}
+
+        # Detect malformed response: Qwen3-8B sometimes returns
+        # {"matches": {"ts_code": ["600584.SH", ...]}} instead of
+        # {"matches": {"600584.SH": ["theme1"], ...}}
+        matches = {}
+        if isinstance(raw_matches, dict):
+            # Check if keys are stock codes or something else
+            keys_are_codes = any(k in batch_codes for k in raw_matches.keys())
+            if keys_are_codes:
+                matches = raw_matches
+            else:
+                # Malformed: try to reconstruct from notes (which usually has correct format)
+                # Also check if values are stock codes (inverted format)
+                for key, val in raw_matches.items():
+                    if isinstance(val, list) and val and all(str(v) in batch_codes for v in val):
+                        # Inverted format: key is theme name, values are stock codes
+                        theme_canonical = norm_to_original.get(_norm(str(key)), str(key))
+                        if theme_canonical in theme_name_set:
+                            for code in val:
+                                matches.setdefault(str(code), []).append(theme_canonical)
+                    elif isinstance(val, list) and val and any(str(v) in theme_name_set or _norm(str(v)) in norm_to_original for v in val):
+                        # Normal format but key might be a stock code
+                        matches[key] = val
+
+                # Fallback: extract from notes if matches still empty
+                if not matches and isinstance(raw_notes, dict):
+                    for code in batch_codes:
+                        note = raw_notes.get(code, "")
+                        if isinstance(note, str):
+                            for t_name in theme_name_set:
+                                if t_name in note or _norm(t_name) in _norm(note):
+                                    matches.setdefault(code, []).append(t_name)
+
+                if matches:
+                    logger.info(f"Recovered {len(matches)} matches from malformed Qwen response")
 
         for item in batch_items:
             ts_code = item.get("ts_code")
@@ -479,7 +517,7 @@ def qwen_match_themes(
             resolved = []
             for x in picked:
                 x_str = str(x)
-                if x_str in norm_to_original.values():
+                if x_str in theme_name_set:
                     resolved.append(x_str)
                 else:
                     canonical = norm_to_original.get(_norm(x_str))
@@ -1260,14 +1298,20 @@ def phase2_quant_filter(themes: List[ThemeItem], config: Optional[StrategyConfig
             # A4: Merge named stocks (assign their themes from evidence) BEFORE normalize
             if "matched_themes" not in theme_pool.columns:
                 theme_pool["matched_themes"] = [[] for _ in range(len(theme_pool))]
+            pool_codes = set(theme_pool["ts_code"].astype(str))
             for ts_code, theme_names in named_stocks.items():
+                if str(ts_code) not in pool_codes:
+                    logger.warning(f"Named stock {ts_code} not found in theme pool ({len(pool_codes)} stocks)")
+                    continue
                 mask = theme_pool["ts_code"].astype(str) == str(ts_code)
-                if mask.any():
-                    existing = theme_pool.loc[mask, "matched_themes"].iloc[0]
-                    if not isinstance(existing, list):
-                        existing = []
-                    merged_themes = list(dict.fromkeys(existing + theme_names))
-                    theme_pool.loc[mask, "matched_themes"] = [merged_themes] * mask.sum()
+                idx = theme_pool.index[mask]
+                existing = theme_pool.at[idx[0], "matched_themes"]
+                if not isinstance(existing, list):
+                    existing = []
+                merged_themes = list(dict.fromkeys(existing + theme_names))
+                for i in idx:
+                    theme_pool.at[i, "matched_themes"] = merged_themes
+                logger.info(f"Named stock merge: {ts_code} -> {merged_themes}")
 
             theme_pool = normalize_match_columns(theme_pool)
             qwen_matches = theme_pool["matched_themes"].apply(bool).sum()
