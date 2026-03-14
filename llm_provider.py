@@ -213,7 +213,17 @@ SILICONFLOW_BASE_URL = os.environ.get("SILICONFLOW_BASE_URL", os.environ.get("DE
 SILICONFLOW_API_KEY = os.environ.get("SILICONFLOW_API_KEY", os.environ.get("DEEPSEEK_API_KEY"))
 DEEPSEEK_MODEL = os.environ.get("DEEPSEEK_MODEL", "Pro/deepseek-ai/DeepSeek-V3.2")
 
-QWEN_MODEL = os.environ.get("QWEN_MODEL", "Qwen/Qwen3-8B")
+QWEN_MODEL = os.environ.get("QWEN_MODEL", "qwen3.5-35B-A3B")
+QWEN_BASE_URL = os.environ.get("QWEN_BASE_URL", "http://192.168.3.46:8000/v1")
+QWEN_API_KEY = os.environ.get("QWEN_API_KEY", "dummy")
+
+# Bypass proxy for local vLLM endpoint
+if "192.168." in QWEN_BASE_URL:
+    _no_proxy = os.environ.get("no_proxy", "")
+    _host = QWEN_BASE_URL.split("//")[-1].split(":")[0].split("/")[0]
+    if _host not in _no_proxy:
+        os.environ["no_proxy"] = f"{_no_proxy},{_host}" if _no_proxy else _host
+        os.environ["NO_PROXY"] = os.environ["no_proxy"]
 
 
 class LLMProvider:
@@ -289,12 +299,10 @@ class LLMProvider:
             )
 
         elif model == "qwen":
-            if not SILICONFLOW_API_KEY:
-                raise ValueError("SILICONFLOW_API_KEY not set")
             return ChatOpenAI(
                 model=QWEN_MODEL,
-                base_url=SILICONFLOW_BASE_URL,
-                api_key=SILICONFLOW_API_KEY,
+                base_url=QWEN_BASE_URL,
+                api_key=QWEN_API_KEY,
                 temperature=temperature,
             )
 

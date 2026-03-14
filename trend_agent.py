@@ -381,12 +381,15 @@ def qwen_match_themes(
         for _, row in updated.iterrows()
     ]
 
+    _flush_lock = __import__("threading").Lock()
+
     def flush(batch_items: List[dict]) -> None:
         """Flush batch of stocks to LLM for theme matching."""
         nonlocal total_batches, rate_limited_batches, exhausted_batches, effective_retries_used
         if not batch_items:
             return
-        total_batches += 1
+        with _flush_lock:
+            total_batches += 1
 
         messages = [
             {
@@ -428,18 +431,21 @@ def qwen_match_themes(
             except Exception as err:
                 if not is_rate_limit_error(err):
                     raise
-                rate_limited_batches += 1
+                with _flush_lock:
+                    rate_limited_batches += 1
+                    effective_retries_used += 1
                 retries_used = attempt - 1
-                effective_retries_used += 1
                 if attempt >= max_attempts:
-                    exhausted_batches += 1
+                    with _flush_lock:
+                        exhausted_batches += 1
                     logger.warning(
                         "Qwen theme matching exhausted after rate limits: batch_size=%s retries=%s",
                         len(batch_items),
                         retries_used,
                     )
-                    for item in batch_items:
-                        matched_map[item["ts_code"]] = []
+                    with _flush_lock:
+                        for item in batch_items:
+                            matched_map[item["ts_code"]] = []
                     return
                 backoff_cap = min(
                     config.qwen_rate_limit_max_delay_sec,
@@ -524,11 +530,15 @@ def qwen_match_themes(
                     if canonical:
                         resolved.append(canonical)
             picked = validate_match(str(ts_code), resolved)
-            matched_map[ts_code] = picked
+            with _flush_lock:
+                matched_map[ts_code] = picked
 
-    # Process in batches
-    for i in range(0, len(batch), config.qwen_batch_size):
-        flush(batch[i:i + config.qwen_batch_size])
+    # Process in batches — up to 4 concurrent requests to local vLLM
+    import concurrent.futures
+    chunks = [batch[i:i + config.qwen_batch_size] for i in range(0, len(batch), config.qwen_batch_size)]
+    max_workers = min(4, len(chunks)) if chunks else 1
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        list(executor.map(flush, chunks))
     if total_batches > 0:
         logger.info(
             "Qwen match stats: total_batches=%s rate_limited_batches=%s exhausted_batches=%s effective_retries_used=%s",
