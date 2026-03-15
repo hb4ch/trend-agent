@@ -1287,23 +1287,15 @@ def phase2_quant_filter(themes: List[ThemeItem], config: Optional[StrategyConfig
         logger.info(f"Theme pool: {len(theme_pool)} candidates after minimal filter")
 
         if not theme_pool.empty:
-            # A3: Run qwen_match_themes with relaxed validation on broader pool
+            # A3: Run qwen_match_themes with ALL themes (confirmed + web_only + capital_only)
+            # Theme strength scoring already accounts for validation_status differences
             theme_pool = qwen_match_themes(
-                confirmed_themes,
+                expanded_themes,
                 theme_pool,
                 config=config,
                 relaxed_validation=True,
                 named_stock_codes=named_codes,
             )
-            has_match = theme_pool["matched_themes"].apply(bool).sum() if "matched_themes" in theme_pool.columns else 0
-            if has_match == 0 and expanded_themes:
-                theme_pool = qwen_match_themes(
-                    expanded_themes,
-                    theme_pool,
-                    config=config,
-                    relaxed_validation=True,
-                    named_stock_codes=named_codes,
-                )
 
             # A4: Merge named stocks (assign their themes from evidence) BEFORE normalize
             if "matched_themes" not in theme_pool.columns:
