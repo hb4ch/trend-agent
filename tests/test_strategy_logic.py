@@ -438,9 +438,111 @@ def test_upsert_core_table_replaces_sparse_llm_core_section():
     )
     table = trend_agent.build_deterministic_core_table(candidates, audits=[], top_n=2)
     merged = trend_agent.upsert_core_table_in_report(report, table)
-    assert merged.count("## 【核心金股】") == 1
+    assert merged.count("## 【核心金股 - 技术形态精选】") == 1
     assert "| A(000001.SZ) |" in merged
     assert "| B(000002.SZ) |" in merged
+
+
+def test_normalize_stock_section_payload_strips_placeholder_urls():
+    row = {"ts_code": "000001.SZ", "name": "测试股", "matched_themes": ["AI应用"]}
+    payload = {
+        "summary": "公司逻辑 url1",
+        "investment_logic": ["- 箱体突破 url2"],
+        "source_urls": ["https://example.com/report"],
+    }
+    section = trend_agent._normalize_stock_section_payload(payload, row, [], None, {})
+    assert "url1" not in section.summary.lower()
+    assert all("url" not in item.lower() for item in section.investment_logic)
+    assert section.source_urls == ["https://example.com/report"]
+
+
+def test_generate_market_overview_falls_back_from_markdown(monkeypatch, tmp_path):
+    monkeypatch.setattr(trend_agent, "deepseek_chat", lambda messages: "## 【市场风向标】\n- markdown response")
+    themes = [ThemeItem(name="AI应用", keywords=["AI"], summary="主题逻辑", sources=["https://example.com/theme"], validation_status="confirmed")]
+    items = trend_agent._generate_market_overview(
+        [{"name": "AI应用", "summary": "主题逻辑"}],
+        tmp_path / "trace.jsonl",
+        themes,
+    )
+    assert len(items) == 1
+    assert items[0].name == "AI应用"
+    assert items[0].validation_status == "confirmed"
+    assert items[0].logic
+
+
+def test_render_report_html_is_self_contained():
+    report = trend_agent.ReportModel(
+        title="测试研报",
+        generated_at="2026-03-22 12:00:00",
+        theme_overviews=[
+            trend_agent.ReportThemeOverview(
+                name="AI应用",
+                validation_status="confirmed",
+                logic=["逻辑A"],
+                capital_validation=["资金A"],
+                watch_items=["观察A"],
+                source_urls=["https://example.com/theme"],
+            )
+        ],
+        core_table_rows=[
+            {"股票": "测试股(000001.SZ)", "所属主线": "AI应用", "形态特征": "横盘分70", "置信度": "0.80", "推荐理由": "alpha评分高"}
+        ],
+        theme_table_rows=[],
+        stock_sections=[
+            trend_agent.ReportStockSection(
+                ts_code="000001.SZ",
+                name="测试股",
+                matched_themes=["AI应用"],
+                recommendation="buy",
+                recommendation_label="推荐",
+                research_depth="standard",
+                summary="摘要",
+                investment_logic=["逻辑"],
+                positive_findings=[],
+                growth_catalysts=[],
+                technical_analysis=["技术"],
+                capital_validation=["资金"],
+                trade_plan=["计划"],
+                risks=["风险"],
+                source_urls=["https://example.com/stock"],
+                chart=trend_agent.ChartArtifact(
+                    ts_code="000001.SZ",
+                    spike_dates=["2026-03-20"],
+                    plotly_html="<div id='chart-a'></div><script>Plotly.newPlot('chart-a',[])</script>",
+                ),
+            )
+        ],
+        risks=["总风险"],
+    )
+    html = trend_agent.render_report_html(report)
+    assert html.startswith("<!DOCTYPE html>")
+    assert "<script src=" not in html
+    assert "<link " not in html
+    assert "../charts/" not in html
+    assert "Plotly.newPlot" in html
+    assert 'id="stock-search"' in html
+    assert 'id="theme-filter"' in html
+
+
+def test_phase5_report_with_deepseek_writes_html_and_md(monkeypatch, tmp_path):
+    monkeypatch.setattr(trend_agent, "REPORT_DIR", tmp_path / "reports")
+    report = trend_agent.ReportModel(
+        title="测试研报",
+        generated_at="2026-03-22 12:00:00",
+        theme_overviews=[],
+        core_table_rows=[],
+        theme_table_rows=[],
+        stock_sections=[],
+        risks=["风险"],
+    )
+    monkeypatch.setattr(trend_agent, "_build_report_model", lambda *args, **kwargs: report)
+    artifacts = trend_agent.phase5_report_with_deepseek([], pd.DataFrame(), [], {}, {})
+    assert artifacts.html_path.exists()
+    assert artifacts.markdown_debug_path.exists()
+    assert artifacts.html_path.suffix == ".html"
+    assert artifacts.markdown_debug_path.suffix == ".md"
+    assert "<!DOCTYPE html>" in artifacts.html_path.read_text(encoding="utf-8")
+    assert "# 测试研报" in artifacts.markdown_debug_path.read_text(encoding="utf-8")
 
 
 def test_qwen_match_guard_blocks_scope_only_false_positive(monkeypatch, tmp_path):

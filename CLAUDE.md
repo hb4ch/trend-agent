@@ -40,7 +40,7 @@ export FORCE_LLM_LOGGING=1  # Print all LLM I/O to screen
 2. **Phase 2 - Quantitative Mining**: DuckDB + technical criteria → candidate stocks (relaxed filters)
 3. **Phase 3 - Deep Research**: Opportunity Discovery (first) + Adversarial Veto Audit (second)
 4. **Phase 4 - Visualization**: Generate K-line charts with Plotly
-5. **Phase 5 - Report Generation**: DeepSeek generates Markdown/PDF reports with findings
+5. **Phase 5 - Report Generation**: DeepSeek generates self-contained HTML reports plus debug Markdown
 
 ---
 
@@ -134,9 +134,9 @@ VOLATILITY_THRESHOLD = 0.50 # 50% max amplitude (relaxed from 35%)
 
 | Location | Description |
 |----------|-------------|
-| `charts/{ts_code}.png` | K-line charts with MA overlays |
-| `reports/report_*.md` | Markdown research reports |
-| `reports/report_*.pdf` | PDF reports (via pandoc + xelatex) |
+| `charts/{ts_code}.png` | Optional chart PNG exports |
+| `reports/report_*.html` | Self-contained HTML research reports |
+| `reports/report_*.md` | Debug markdown reports |
 | `reports/audit_trace_*.jsonl` | Audit process traces |
 
 ---
@@ -163,13 +163,7 @@ FORCE_LLM_LOGGING=0  # Print all LLM I/O to screen
 
 ### System Dependencies
 
-```bash
-# Arch Linux
-sudo pacman -S pandoc texlive-xetex
-
-# Debian/Ubuntu
-sudo apt-get install pandoc texlive-xetex
-```
+No Pandoc / XeLaTeX dependency is required for report generation.
 
 ---
 
@@ -298,13 +292,9 @@ Report generation supports tool calling:
 
 ## Troubleshooting
 
-### PDF Generation Fails
+### HTML Report Looks Blank
 
-```bash
-# Install pandoc + xelatex for Chinese PDF rendering
-# Arch: sudo pacman -S pandoc texlive-xetex
-# Ubuntu: sudo apt-get install pandoc texlive-xetex
-```
+Check that the generated `report_*.html` file is opened in a browser with JavaScript enabled.
 
 ### Zhipu Search Not Working
 

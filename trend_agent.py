@@ -16,18 +16,21 @@ import logging
 import os
 import random
 import re
-import subprocess
 import time
 import contextlib
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from html import escape as html_escape
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse
 
 import duckdb
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
+import plotly.io as pio
+from plotly.offline import get_plotlyjs
 from plotly.subplots import make_subplots
 from langchain_core.language_models import BaseChatModel
 from langchain_core.output_parsers import StrOutputParser
@@ -191,6 +194,77 @@ class AuditResult:
             self.growth_catalysts = []
 
 
+@dataclass
+class ChartArtifact:
+    """Chart artifacts used by report renderers."""
+
+    ts_code: str
+    spike_dates: List[str]
+    plotly_html: str
+    png_rel_path: Optional[str] = None
+
+
+@dataclass
+class ReportThemeOverview:
+    """Structured market overview item for rendering."""
+
+    name: str
+    validation_status: str
+    logic: List[str]
+    capital_validation: List[str]
+    watch_items: List[str]
+    source_urls: List[str]
+
+
+@dataclass
+class ReportStockSection:
+    """Structured per-stock report section."""
+
+    ts_code: str
+    name: str
+    matched_themes: List[str]
+    recommendation: str
+    recommendation_label: str
+    research_depth: str
+    summary: str
+    investment_logic: List[str]
+    positive_findings: List[PositiveFinding]
+    growth_catalysts: List[GrowthCatalyst]
+    technical_analysis: List[str]
+    capital_validation: List[str]
+    trade_plan: List[str]
+    risks: List[str]
+    source_urls: List[str]
+    chart: Optional[ChartArtifact] = None
+    audit_summaries: Optional[List[AuditResult]] = None
+
+    def __post_init__(self):
+        if self.audit_summaries is None:
+            self.audit_summaries = []
+
+
+@dataclass
+class ReportModel:
+    """Structured report model rendered into HTML and debug markdown."""
+
+    title: str
+    generated_at: str
+    theme_overviews: List[ReportThemeOverview]
+    core_table_rows: List[Dict[str, str]]
+    theme_table_rows: List[Dict[str, str]]
+    stock_sections: List[ReportStockSection]
+    risks: List[str]
+
+
+@dataclass
+class ReportArtifacts:
+    """Paths to report artifacts produced by Phase 5."""
+
+    html_path: Path
+    markdown_debug_path: Path
+    trace_path: Path
+
+
 def run_search(query: str) -> str:
     """Execute web search using Zhipu AI."""
     if hasattr(zhipu_search, "invoke"):
@@ -284,7 +358,7 @@ def qwen_match_themes(
                 f"code={row.get('ts_code','')}",
                 f"industry={row.get('industry','')}",
                 f"main_business={main_business}",
-                f"business_scope={business_scope}",
+                f"business_scope（工商登记模板，非实际主营）={business_scope}",
                 f"intro={introduction[:500]}",
             ]
         )
@@ -368,11 +442,14 @@ def qwen_match_themes(
                 business_scope = str(row.get("business_scope", "") or "")
                 full_text = f"{combined} {business_scope}"
                 full_hits = sum(1 for tok in toks if tok in full_text)
-                if full_hits >= 1:
+                if main_hits >= 1 or combined_hits >= 2 or full_hits >= 3:
                     kept.append(theme_name)
             else:
                 if main_hits >= 1 or combined_hits >= 2:
                     kept.append(theme_name)
+        if kept:
+            logger.debug(f"validate_match {ts_code}: kept={kept} main_hits={main_hits} combined_hits={combined_hits}"
+                         + (f" full_hits={full_hits}" if relaxed_validation else ""))
         return kept
 
     # Build all batch items (no cache — always send everything to LLM)
@@ -408,6 +485,7 @@ def qwen_match_themes(
                     "- 仅当主营业务/产品/客户链条有实质关联时才可匹配\n"
                     "- 不允许仅凭经营范围模板词（如通信设备制造、AI硬件销售等）直接匹配\n"
                     "- 若证据主要来自经营范围而非主营业务，必须返回空数组\n"
+                    "- business_scope为工商登记经营范围模板词，不反映实际业务，不可作为匹配依据\n"
                     "- 完全无关才返回空数组\n"
                     "- 输出严格JSON：{\"matches\":{\"ts_code\":[\"theme1\",\"theme2\"]},\"notes\":{\"ts_code\":\"reason\"}}\n"
                     "- notes中说明关联逻辑（直接/间接/概念延伸）"
@@ -2164,18 +2242,15 @@ def detect_turnover_spikes(
     return spikes.fillna(False)
 
 
-def phase4_plot_charts(candidates: pd.DataFrame) -> Dict[str, List[str]]:
+def phase4_plot_charts(candidates: pd.DataFrame) -> Dict[str, ChartArtifact]:
     """
-    Generate K-line charts with technical indicators using Plotly.
-
-    Args:
-        candidates: DataFrame of candidate stocks
+    Generate report-ready chart artifacts using Plotly.
 
     Returns:
-        Dictionary mapping stock codes to spike dates
+        Dictionary mapping stock codes to chart artifacts.
     """
     CHART_DIR.mkdir(parents=True, exist_ok=True)
-    chart_notes = {}
+    chart_artifacts: Dict[str, ChartArtifact] = {}
 
     for _, row in candidates.head(8).iterrows():
         ts_code = row["ts_code"]
@@ -2348,13 +2423,33 @@ def phase4_plot_charts(candidates: pd.DataFrame) -> Dict[str, List[str]]:
             gridcolor="rgba(128,128,128,0.2)",
         )
 
-        # Save chart
         chart_path = CHART_DIR / f"{ts_code}.png"
-        fig.write_image(str(chart_path), scale=2)
-        chart_notes[ts_code] = spike_dates
-        logger.debug(f"Generated chart: {chart_path}")
+        png_rel_path: Optional[str] = None
+        try:
+            fig.write_image(str(chart_path), scale=2)
+            png_rel_path = (Path("..") / CHART_DIR / f"{ts_code}.png").as_posix()
+            logger.debug(f"Generated chart PNG: {chart_path}")
+        except Exception as exc:
+            logger.warning(f"PNG chart export failed for {ts_code}: {exc}")
 
-    return chart_notes
+        chart_artifacts[ts_code] = ChartArtifact(
+            ts_code=ts_code,
+            spike_dates=spike_dates,
+            plotly_html=pio.to_html(
+                fig,
+                include_plotlyjs=False,
+                full_html=False,
+                config={
+                    "displayModeBar": True,
+                    "responsive": True,
+                    "scrollZoom": True,
+                },
+                div_id=f"chart-{re.sub(r'[^a-zA-Z0-9]+', '-', ts_code)}",
+            ),
+            png_rel_path=png_rel_path,
+        )
+
+    return chart_artifacts
 
 
 def compute_signals(candidates: pd.DataFrame) -> Dict[str, Dict[str, object]]:
@@ -2546,88 +2641,30 @@ def phase5_report(
 
 def build_deterministic_theme_table(candidates: pd.DataFrame, audits: List[AuditResult], top_n: int = 5) -> str:
     """Build deterministic theme-driven stock markdown table."""
-    if candidates is None or candidates.empty:
+    rows = build_theme_table_rows(candidates, audits, top_n=top_n)
+    if not rows:
         return ""
-    # Filter to theme-driven stocks
-    theme_stocks = candidates[candidates["list_type"].isin(["theme_driven", "both"])] if "list_type" in candidates.columns else pd.DataFrame()
-    if theme_stocks.empty:
-        return ""
-
-    audit_conf = {}
-    for a in audits or []:
-        audit_conf.setdefault(a.ts_code, []).append(float(a.confidence_score or 0.5))
-
-    lines = [
+    return _build_markdown_table(
         "## 【核心金股 - 题材驱动精选】",
-        "",
-        "| 股票 | 匹配题材 | 题材强度 | 动量评分 | Alpha评分 |",
-        "| --- | --- | --- | --- | --- |",
-    ]
-    for _, row in theme_stocks.head(top_n).iterrows():
-        ts_code = str(row.get("ts_code", ""))
-        name = str(row.get("name", ts_code))
-        matched = row.get("matched_themes", [])
-        if not isinstance(matched, list):
-            matched = []
-        theme_text = ", ".join(matched[:2]) if matched else "待确认"
-        theme_strength = float(row.get("theme_strength_score", 0.0))
-        momentum = float(row.get("momentum_score", row.get("composite_score", 0.0)))
-        alpha = float(row.get("alpha_rank_score", 0.0))
-        lines.append(f"| {name}({ts_code}) | {theme_text} | {theme_strength:.2f} | {momentum:.1f} | {alpha:.1f} |")
-    return "\n".join(lines)
+        ["股票", "匹配题材", "题材强度", "动量评分", "Alpha评分"],
+        rows,
+    )
 
 
 def build_deterministic_core_table(candidates: pd.DataFrame, audits: List[AuditResult], top_n: int = 8) -> str:
     """Build deterministic core stock markdown table from ranked candidates (technical alpha)."""
-    # Filter to technical stocks when list_type is available
-    if "list_type" in candidates.columns if candidates is not None else False:
-        tech_stocks = candidates[candidates["list_type"].isin(["technical", "both"])]
-    else:
-        tech_stocks = candidates
-
-    if tech_stocks is None or tech_stocks.empty:
+    rows = build_core_table_rows(candidates, audits, top_n=top_n)
+    if not rows:
         return (
             "## 【核心金股 - 技术形态精选】\n\n"
             "| 股票 | 所属主线 | 形态特征 | 置信度 | 推荐理由 |\n"
             "| --- | --- | --- | --- | --- |\n"
         )
-    audit_conf = {}
-    for a in audits or []:
-        audit_conf.setdefault(a.ts_code, []).append(float(a.confidence_score or 0.5))
-
-    lines = [
+    return _build_markdown_table(
         "## 【核心金股 - 技术形态精选】",
-        "",
-        "| 股票 | 所属主线 | 形态特征 | 置信度 | 推荐理由 |",
-        "| --- | --- | --- | --- | --- |",
-    ]
-    for _, row in tech_stocks.head(top_n).iterrows():
-        ts_code = str(row.get("ts_code", ""))
-        name = str(row.get("name", ts_code))
-        matched = row.get("matched_themes", [])
-        if not isinstance(matched, list):
-            matched = []
-        off_theme = bool(row.get("off_theme", not bool(matched)))
-        if off_theme:
-            theme_text = "技术形态入选"
-        else:
-            theme_text = ", ".join(matched[:2]) if matched else "待确认"
-        shape_parts = []
-        if "consolidation_score" in row:
-            shape_parts.append(f"横盘分{float(row.get('consolidation_score', 0.0)):.0f}")
-        if "volume_boost" in row:
-            shape_parts.append(f"量能{float(row.get('volume_boost', 0.0)):.2f}")
-        shape = "，".join(shape_parts) if shape_parts else "技术形态待补充"
-        conf_list = audit_conf.get(ts_code, [])
-        confidence = float(np.mean(conf_list)) if conf_list else 0.5
-        reason_parts = []
-        if "alpha_rank_score" in row:
-            reason_parts.append(f"alpha评分{float(row.get('alpha_rank_score', 0.0)):.1f}")
-        if "toplist_recency_score" in row:
-            reason_parts.append(f"拥挤度{float(row.get('toplist_recency_score', 0.0)):.2f}")
-        reason = "；".join(reason_parts) if reason_parts else "综合评分靠前"
-        lines.append(f"| {name}({ts_code}) | {theme_text} | {shape} | {confidence:.2f} | {reason} |")
-    return "\n".join(lines)
+        ["股票", "所属主线", "形态特征", "置信度", "推荐理由"],
+        rows,
+    )
 
 
 def upsert_core_table_in_report(report_md: str, table_sections_md: str) -> str:
@@ -2648,76 +2685,301 @@ def upsert_core_table_in_report(report_md: str, table_sections_md: str) -> str:
     return table_sections_md + "\n\n" + report_md
 
 
+def _coerce_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _clean_bullet_text(text: str) -> str:
+    cleaned = re.sub(r"^\s*(?:[-*•]+|\d+[.)])\s*", "", str(text or "").strip())
+    cleaned = re.sub(r"\burl\d+\b", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s{2,}", " ", cleaned)
+    return cleaned.strip()
+
+
+def _coerce_lines(value: Any) -> List[str]:
+    if value is None:
+        return []
+    items: List[str] = []
+    if isinstance(value, list):
+        for item in value:
+            if isinstance(item, dict):
+                text = (
+                    item.get("description")
+                    or item.get("summary")
+                    or item.get("title")
+                    or item.get("text")
+                    or item.get("name")
+                )
+                if text:
+                    items.append(str(text))
+            elif item is not None:
+                items.append(str(item))
+    elif isinstance(value, str):
+        chunks = [seg for seg in re.split(r"\n+", value) if seg.strip()]
+        items.extend(chunks or [value])
+    else:
+        items.append(str(value))
+    normalized: List[str] = []
+    for item in items:
+        cleaned = _clean_bullet_text(item)
+        if cleaned and cleaned not in normalized:
+            normalized.append(cleaned)
+    return normalized
+
+
+def _normalize_source_urls(*values: Any) -> List[str]:
+    urls: List[str] = []
+    for value in values:
+        if value is None:
+            continue
+        if isinstance(value, list):
+            candidates = value
+        else:
+            candidates = [value]
+        for candidate in candidates:
+            if candidate is None:
+                continue
+            if isinstance(candidate, dict):
+                candidate = candidate.get("source_url") or candidate.get("url") or candidate.get("source")
+            for url in extract_urls(str(candidate)):
+                if url not in urls:
+                    urls.append(url)
+    return urls
+
+
+def _build_markdown_table(title: str, headers: List[str], rows: List[Dict[str, str]]) -> str:
+    lines = [title, "", "| " + " | ".join(headers) + " |", "| " + " | ".join(["---"] * len(headers)) + " |"]
+    for row in rows:
+        lines.append("| " + " | ".join(str(row.get(header, "")) for header in headers) + " |")
+    return "\n".join(lines)
+
+
+def build_theme_table_rows(candidates: pd.DataFrame, audits: List[AuditResult], top_n: int = 5) -> List[Dict[str, str]]:
+    """Build deterministic theme-driven stock table rows."""
+    if candidates is None or candidates.empty or "list_type" not in candidates.columns:
+        return []
+    theme_stocks = candidates[candidates["list_type"].isin(["theme_driven", "both"])]
+    if theme_stocks.empty:
+        return []
+    rows: List[Dict[str, str]] = []
+    for _, row in theme_stocks.head(top_n).iterrows():
+        ts_code = str(row.get("ts_code", ""))
+        name = str(row.get("name", ts_code))
+        matched = row.get("matched_themes", [])
+        if not isinstance(matched, list):
+            matched = []
+        rows.append(
+            {
+                "股票": f"{name}({ts_code})",
+                "匹配题材": ", ".join(matched[:2]) if matched else "待确认",
+                "题材强度": f"{_coerce_float(row.get('theme_strength_score', 0.0)):.2f}",
+                "动量评分": f"{_coerce_float(row.get('momentum_score', row.get('composite_score', 0.0))):.1f}",
+                "Alpha评分": f"{_coerce_float(row.get('alpha_rank_score', 0.0)):.1f}",
+            }
+        )
+    return rows
+
+
+def build_core_table_rows(candidates: pd.DataFrame, audits: List[AuditResult], top_n: int = 8) -> List[Dict[str, str]]:
+    """Build deterministic technical-alpha stock table rows."""
+    if candidates is None:
+        return []
+    tech_stocks = candidates[candidates["list_type"].isin(["technical", "both"])] if "list_type" in candidates.columns else candidates
+    if tech_stocks is None or tech_stocks.empty:
+        return []
+    audit_conf: Dict[str, List[float]] = {}
+    for audit in audits or []:
+        audit_conf.setdefault(audit.ts_code, []).append(float(audit.confidence_score or 0.5))
+    rows: List[Dict[str, str]] = []
+    for _, row in tech_stocks.head(top_n).iterrows():
+        ts_code = str(row.get("ts_code", ""))
+        name = str(row.get("name", ts_code))
+        matched = row.get("matched_themes", [])
+        if not isinstance(matched, list):
+            matched = []
+        off_theme = bool(row.get("off_theme", not bool(matched)))
+        shape_parts = []
+        if "consolidation_score" in row:
+            shape_parts.append(f"横盘分{_coerce_float(row.get('consolidation_score', 0.0)):.0f}")
+        if "volume_boost" in row:
+            shape_parts.append(f"量能{_coerce_float(row.get('volume_boost', 0.0)):.2f}")
+        reason_parts = []
+        if "alpha_rank_score" in row:
+            reason_parts.append(f"alpha评分{_coerce_float(row.get('alpha_rank_score', 0.0)):.1f}")
+        if "toplist_recency_score" in row:
+            reason_parts.append(f"拥挤度{_coerce_float(row.get('toplist_recency_score', 0.0)):.2f}")
+        conf_list = audit_conf.get(ts_code, [])
+        rows.append(
+            {
+                "股票": f"{name}({ts_code})",
+                "所属主线": "技术形态入选" if off_theme else (", ".join(matched[:2]) if matched else "待确认"),
+                "形态特征": "，".join(shape_parts) if shape_parts else "技术形态待补充",
+                "置信度": f"{(float(np.mean(conf_list)) if conf_list else 0.5):.2f}",
+                "推荐理由": "；".join(reason_parts) if reason_parts else "综合评分靠前",
+            }
+        )
+    return rows
+
+
 _MARKET_OVERVIEW_SYSTEM_PROMPT = (
     "你是资深A股投研团队负责人，遵循\"重势、通过滤、待时机\"理念。\n"
-    "请仅生成【市场风向标】部分。\n\n"
-    "## 【市场风向标】\n"
-    "每个主题分析：\n"
-    "- 主题名称和验证状态（confirmed/web_only/capital_only/weak）\n"
-    "- 主题逻辑（从web search获取的新闻情绪、政策催化）\n"
-    "- **资金验证**<font color='purple'>（从龙虎榜获取的资金信号：上榜次数、净买入额、资金结构、趋势）</font>\n"
-    "- 持续观察指标\n\n"
-    "## 要求：\n"
-    "- 输出JSON：{\"market_overview\": \"## 【市场风向标】\\n...\"}\n"
-    "- 对于confirmed主题，必须展示龙虎榜资金信号\n"
-    "- 引用真实URL，不使用占位符\n"
+    "只返回严格JSON，不要Markdown，不要代码块。\n"
+    "输出格式："
+    "{\"themes\":[{\"name\":\"主题名称\",\"validation_status\":\"confirmed|web_only|capital_only|weak\","
+    "\"logic\":[\"主题逻辑要点\"],\"capital_validation\":[\"资金验证要点\"],"
+    "\"watch_items\":[\"持续观察点\"],\"source_urls\":[\"https://...\"]}]}\n"
+    "要求：对confirmed主题必须写出龙虎榜/资金验证；引用真实URL；数组为空时返回空数组。"
 )
 
 _STOCK_SECTION_SYSTEM_PROMPT = (
     "你是资深A股投研分析师，遵循\"重势、通过滤、待时机\"理念。\n"
-    "请为给定的单只股票生成深度分析，作为研报【深度图解】的一个子章节。\n\n"
-    "## 分析内容（必须包含）：\n\n"
-    "**【投资逻辑】**<font color='blue'>\n"
-    "- 观察现象：量能异动、技术形态、题材契合\n"
-    "- 分析意义：资金态度、趋势方向、突破可能\n"
-    "- 验证方式：龙虎榜、财报、公告\n"
-    "- 结论：交易机会评级（强烈推荐/推荐/谨慎）\n"
-    "</font>\n\n"
-    "**【正面催化发现】**<font color='green'>（从positive_findings提取）\n"
-    "- 列出发现的正面信息（订单、客户、政策、技术突破、产能扩张等）\n"
-    "- 每个发现标注类别和置信度\n"
-    "- 引用来源URL\n"
-    "</font>\n\n"
-    "**【增长催化剂】**<font color='red'>（从growth_catalysts提取）\n"
-    "- 催化剂类型：policy/tech_breakthrough/market_expansion/competitive_moat\n"
-    "- 时间框架：near_term/medium_term/long_term\n"
-    "- 置信度评估\n"
-    "</font>\n\n"
-    "**【技术分析】**横盘时长/波动率、量能信号、均线排列、箱体位置\n"
-    "- ignition信号：是否处于温和放量阶段(1.2-3.0x)\n"
-    "- ready_to_break信号：是否接近箱体突破\n\n"
-    "**【资金验证】**<font color='purple'>（从capital_signal_summary提取）\n"
-    "- 龙虎榜资金信号\n"
-    "- 机构游资动向\n"
-    "- 估值水平、市值适合度\n"
-    "</font>\n\n"
-    "**【交易建议】**<font color='green'>买入时机/仓位/止盈止损/持仓周期</font>\n\n"
-    "**【风险提示】**<font color='orange'>核心风险及应对</font>\n\n"
-    "- 量能异动日：[列表]\n"
-    "![股票名称 代码](../charts/代码.png)\n"
-    "- 尽调结论：pass/warn/fail（说明+来源）\n"
-    "- 研究深度：standard/deep\n\n"
-    "## 要求：\n"
-    "- 输出JSON：{\"stock_section\": \"### 股票名称 代码\\n...\"}\n"
-    "- 引用真实URL，不使用占位符\n"
-    "- 突出\"待时机\"：箱体上沿+温和放量(1.2-3.0x)+均线粘合\n"
-    "- 先展示发现的机会（正面催化），再展示风险（审计结果）\n"
-    "- 如果需要额外信息，可调用工具：\n"
-    "  - {\"tool\": \"web_search\", \"input\": \"查询内容\"}\n"
-    "  - {\"tool\": \"duckdb\", \"input\": \"SQL语句\"}\n"
-    "  - {\"tool\": \"python\", \"input\": \"代码\"}\n"
+    "只返回严格JSON，不要Markdown，不要代码块。\n"
+    "如需补充信息，可先返回工具调用："
+    "{\"tool\":\"web_search|duckdb|python\",\"input\":\"...\"}\n"
+    "最终输出格式："
+    "{\"stock\":{\"ts_code\":\"000001.SZ\",\"name\":\"示例\","
+    "\"recommendation\":\"strong_buy|buy|watch|avoid\",\"summary\":\"一句话摘要\","
+    "\"investment_logic\":[\"投资逻辑\"],"
+    "\"positive_findings\":[{\"category\":\"policy\",\"description\":\"...\",\"evidence\":\"...\","
+    "\"confidence\":0.7,\"source_url\":\"https://...\",\"date\":\"2026-01-01\"}],"
+    "\"growth_catalysts\":[{\"catalyst_type\":\"policy\",\"description\":\"...\","
+    "\"timeframe\":\"near_term|medium_term|long_term\",\"confidence\":0.7}],"
+    "\"technical_analysis\":[\"技术分析\"],\"capital_validation\":[\"资金验证\"],"
+    "\"trade_plan\":[\"交易建议\"],\"risks\":[\"风险提示\"],"
+    "\"source_urls\":[\"https://...\"],\"research_depth\":\"standard|deep\"}}\n"
+    "要求：真实URL；机会先于风险；突出箱体上沿、温和放量、均线收敛与资金验证。"
 )
+
+
+def _normalize_validation_status(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    if text in {"confirmed", "web_only", "capital_only", "weak"}:
+        return text
+    return "weak"
+
+
+def _normalize_recommendation(value: Any) -> tuple[str, str]:
+    text = str(value or "").strip().lower()
+    if text in {"strong_buy", "strongbuy", "强烈推荐"} or "强烈" in text:
+        return "strong_buy", "强烈推荐"
+    if text in {"buy", "推荐"} or text == "pass":
+        return "buy", "推荐"
+    if text in {"avoid", "回避"} or text == "fail":
+        return "avoid", "回避"
+    return "watch", "观察"
+
+
+def _domain_label(url: str) -> str:
+    parsed = urlparse(url)
+    return parsed.netloc or url[:40]
+
+
+def _render_html_list(items: List[str], empty_text: str = "暂无") -> str:
+    if not items:
+        return f"<p class=\"muted\">{html_escape(empty_text)}</p>"
+    return "<ul class=\"bullet-list\">" + "".join(f"<li>{html_escape(item)}</li>" for item in items) + "</ul>"
+
+
+def _render_source_links(urls: List[str]) -> str:
+    if not urls:
+        return "<p class=\"muted\">暂无来源</p>"
+    links = []
+    for url in urls:
+        links.append(
+            f"<a class=\"source-link\" href=\"{html_escape(url)}\" target=\"_blank\" rel=\"noreferrer\">"
+            f"{html_escape(_domain_label(url))}</a>"
+        )
+    return "<div class=\"source-links\">" + "".join(links) + "</div>"
+
+
+def _normalize_positive_findings(items: Any, fallback: Optional[List[PositiveFinding]] = None) -> List[PositiveFinding]:
+    normalized: List[PositiveFinding] = []
+    for item in items if isinstance(items, list) else []:
+        if not isinstance(item, dict):
+            continue
+        description = str(item.get("description", "")).strip()
+        if not description:
+            continue
+        normalized.append(
+            PositiveFinding(
+                category=str(item.get("category", "other")).strip() or "other",
+                description=description,
+                evidence=str(item.get("evidence", "")).strip(),
+                confidence=_coerce_float(item.get("confidence"), 0.5),
+                source_url=(_normalize_source_urls(item.get("source_url"), item.get("url")) or [""])[0],
+                date=str(item.get("date", "")).strip() or None,
+            )
+        )
+    if normalized:
+        return normalized
+    return list(fallback or [])
+
+
+def _normalize_growth_catalysts(items: Any, fallback: Optional[List[GrowthCatalyst]] = None) -> List[GrowthCatalyst]:
+    normalized: List[GrowthCatalyst] = []
+    for item in items if isinstance(items, list) else []:
+        if not isinstance(item, dict):
+            continue
+        description = str(item.get("description", "")).strip()
+        if not description:
+            continue
+        normalized.append(
+            GrowthCatalyst(
+                catalyst_type=str(item.get("catalyst_type", "market_expansion")).strip() or "market_expansion",
+                description=description,
+                timeframe=str(item.get("timeframe", "medium_term")).strip() or "medium_term",
+                confidence=_coerce_float(item.get("confidence"), 0.5),
+            )
+        )
+    if normalized:
+        return normalized
+    return list(fallback or [])
+
+
+def _fallback_market_overview(themes: List[ThemeItem]) -> List[ReportThemeOverview]:
+    items: List[ReportThemeOverview] = []
+    for theme in themes:
+        logic = _coerce_lines(theme.summary) or _coerce_lines(theme.evidence) or ["题材逻辑待补充。"]
+        capital = _coerce_lines(theme.capital_signal) or ["龙虎榜资金信号待补充。"]
+        watch_items = [f"持续跟踪 {theme.name} 的政策催化、成交额和资金持续性。"]
+        items.append(
+            ReportThemeOverview(
+                name=theme.name,
+                validation_status=_normalize_validation_status(theme.validation_status),
+                logic=logic,
+                capital_validation=capital,
+                watch_items=watch_items,
+                source_urls=_normalize_source_urls(theme.sources),
+            )
+        )
+    return items
+
+
+def _normalize_market_overview_item(raw: Optional[dict], fallback_theme: ThemeItem) -> ReportThemeOverview:
+    raw = raw or {}
+    return ReportThemeOverview(
+        name=str(raw.get("name") or fallback_theme.name),
+        validation_status=_normalize_validation_status(raw.get("validation_status", fallback_theme.validation_status)),
+        logic=_coerce_lines(raw.get("logic")) or _coerce_lines(fallback_theme.summary) or ["题材逻辑待补充。"],
+        capital_validation=_coerce_lines(raw.get("capital_validation")) or _coerce_lines(fallback_theme.capital_signal) or ["龙虎榜资金信号待补充。"],
+        watch_items=_coerce_lines(raw.get("watch_items")) or [f"持续跟踪 {fallback_theme.name} 的政策催化与资金延续性。"],
+        source_urls=_normalize_source_urls(raw.get("source_urls"), raw.get("logic"), fallback_theme.sources),
+    )
 
 
 def _build_stock_context(
     row: dict,
     stock_audits: List[AuditResult],
-    chart_notes: Dict[str, List[str]],
+    chart_artifacts: Dict[str, ChartArtifact],
     signals: Dict[str, Dict[str, object]],
     theme_context: str,
 ) -> dict:
     """Build per-stock context dict for DeepSeek report generation."""
     ts_code = row["ts_code"]
+    chart = chart_artifacts.get(ts_code)
     return {
         "ts_code": ts_code,
         "name": row.get("name", ts_code),
@@ -2732,65 +2994,189 @@ def _build_stock_context(
                 "confidence_score": a.confidence_score,
                 "capital_signal_summary": a.capital_signal_summary,
                 "positive_findings": [
-                    {"category": f.category, "description": f.description,
-                     "evidence": f.evidence[:200], "confidence": f.confidence,
-                     "source_url": f.source_url, "date": f.date}
+                    {
+                        "category": f.category,
+                        "description": f.description,
+                        "evidence": f.evidence[:200],
+                        "confidence": f.confidence,
+                        "source_url": f.source_url,
+                        "date": f.date,
+                    }
                     for f in (a.positive_findings or [])
                 ],
                 "growth_catalysts": [
-                    {"catalyst_type": c.catalyst_type, "description": c.description,
-                     "timeframe": c.timeframe, "confidence": c.confidence}
+                    {
+                        "catalyst_type": c.catalyst_type,
+                        "description": c.description,
+                        "timeframe": c.timeframe,
+                        "confidence": c.confidence,
+                    }
                     for c in (a.growth_catalysts or [])
                 ],
             }
             for a in stock_audits
         ],
-        "chart_notes": chart_notes.get(ts_code, []),
+        "chart_notes": chart.spike_dates if chart else [],
         "signals": signals.get(ts_code, {}),
     }
 
 
-def _generate_market_overview(theme_summary: list, trace_path: Path) -> Optional[str]:
-    """Generate market overview section via DeepSeek."""
+def _generate_market_overview(theme_summary: list, trace_path: Path, themes: List[ThemeItem]) -> List[ReportThemeOverview]:
+    """Generate structured market overview via DeepSeek with fallback."""
+    if not themes:
+        return []
     messages = [
         {"role": "system", "content": _MARKET_OVERVIEW_SYSTEM_PROMPT},
-        {"role": "user", "content": "请生成【市场风向标】部分。\n" + json.dumps({"themes": theme_summary}, ensure_ascii=False)},
+        {"role": "user", "content": json.dumps({"themes": theme_summary}, ensure_ascii=False)},
     ]
     trace_append(trace_path, "overview_request", {})
     content = deepseek_chat(messages) if deepseek_chat else None
     if not content:
-        return None
+        return _fallback_market_overview(themes)
+    trace_append(trace_path, "overview_response", {"content": truncate(content, 8000)})
     parsed = safe_json_loads(content)
-    result = parsed.get("market_overview")
-    if result:
-        return result
-    if content.lstrip().startswith("#"):
-        return content
-    return None
+    raw_items = parsed.get("themes") if isinstance(parsed, dict) else None
+    if not isinstance(raw_items, list):
+        return _fallback_market_overview(themes)
+    by_name = {
+        str(item.get("name")).strip(): item
+        for item in raw_items
+        if isinstance(item, dict) and str(item.get("name", "")).strip()
+    }
+    return [_normalize_market_overview_item(by_name.get(theme.name), theme) for theme in themes]
 
 
-def _generate_stock_section(ctx: dict, trace_path: Path, candidates_df: pd.DataFrame) -> Optional[str]:
-    """Generate one stock's deep analysis section via DeepSeek with tool loop."""
+def _fallback_stock_section(
+    row: dict,
+    stock_audits: List[AuditResult],
+    chart: Optional[ChartArtifact],
+    signal: Optional[Dict[str, object]],
+) -> ReportStockSection:
+    """Deterministic stock section fallback when DeepSeek output is invalid."""
+    ts_code = str(row.get("ts_code", ""))
+    name = str(row.get("name", ts_code))
+    matched = row.get("matched_themes", [])
+    if not isinstance(matched, list):
+        matched = []
+    verdicts = {normalize_verdict(a.verdict) for a in stock_audits}
+    if "fail" in verdicts:
+        recommendation, label = ("avoid", "回避")
+    elif bool(signal and signal.get("ready_to_break")):
+        recommendation, label = ("buy", "推荐")
+    else:
+        recommendation, label = ("watch", "观察")
+    spike_note = "、".join(chart.spike_dates[:6]) if chart and chart.spike_dates else "未检测到明显量能异动"
+    technical_analysis = [
+        f"量能异动日：{spike_note}",
+        f"温和放量倍数：{_coerce_float((signal or {}).get('turnover_mult'), 0.0):.2f}",
+        f"距箱体上沿：{_coerce_float((signal or {}).get('dist_to_box_top'), 0.0) * 100:.1f}%",
+    ]
+    capital_validation = _coerce_lines([a.capital_signal_summary for a in stock_audits if a.capital_signal_summary])
+    if not capital_validation:
+        capital_validation = [f"尽调结论：{a.theme} {normalize_verdict(a.verdict)} - {a.rationale}" for a in stock_audits[:3]] or ["资金验证待补充。"]
+    risks = [
+        f"{a.theme}: {a.rationale}"
+        for a in stock_audits
+        if normalize_verdict(a.verdict) in {"warn", "fail"}
+    ] or ["题材轮动快，需关注市场主线是否持续。"]
+    positive_findings: List[PositiveFinding] = []
+    growth_catalysts: List[GrowthCatalyst] = []
+    for audit in stock_audits:
+        positive_findings.extend(audit.positive_findings or [])
+        growth_catalysts.extend(audit.growth_catalysts or [])
+    return ReportStockSection(
+        ts_code=ts_code,
+        name=name,
+        matched_themes=matched,
+        recommendation=recommendation,
+        recommendation_label=label,
+        research_depth="deep" if any(a.research_depth == "deep" for a in stock_audits) else "standard",
+        summary=(stock_audits[0].rationale if stock_audits else "结构化回退内容，供HTML报告兜底渲染。"),
+        investment_logic=[
+            f"题材归属：{', '.join(matched[:3]) if matched else '技术形态入选'}",
+            f"量能与位置：放量倍数 {_coerce_float((signal or {}).get('turnover_mult'), 0.0):.2f}，ready_to_break={bool((signal or {}).get('ready_to_break'))}",
+        ],
+        positive_findings=positive_findings[:5],
+        growth_catalysts=growth_catalysts[:5],
+        technical_analysis=technical_analysis,
+        capital_validation=capital_validation,
+        trade_plan=[
+            "等待箱体上沿附近的确认信号再考虑分批介入。",
+            "若放量失败或主线转弱，优先降低仓位。",
+        ],
+        risks=risks,
+        source_urls=_normalize_source_urls([a.sources for a in stock_audits]),
+        chart=chart,
+        audit_summaries=list(stock_audits),
+    )
+
+
+def _normalize_stock_section_payload(
+    payload: dict,
+    row: dict,
+    stock_audits: List[AuditResult],
+    chart: Optional[ChartArtifact],
+    signal: Optional[Dict[str, object]],
+) -> ReportStockSection:
+    fallback = _fallback_stock_section(row, stock_audits, chart, signal)
+    recommendation, label = _normalize_recommendation(payload.get("recommendation"))
+    positive_findings = _normalize_positive_findings(payload.get("positive_findings"), fallback.positive_findings)
+    growth_catalysts = _normalize_growth_catalysts(payload.get("growth_catalysts"), fallback.growth_catalysts)
+    source_urls = _normalize_source_urls(
+        payload.get("source_urls"),
+        [finding.source_url for finding in positive_findings],
+        payload.get("summary"),
+        [audit.sources for audit in stock_audits],
+    ) or fallback.source_urls
+    return ReportStockSection(
+        ts_code=str(payload.get("ts_code") or row.get("ts_code", "")),
+        name=str(payload.get("name") or row.get("name", "")),
+        matched_themes=row.get("matched_themes", []) if isinstance(row.get("matched_themes", []), list) else [],
+        recommendation=recommendation,
+        recommendation_label=label,
+        research_depth=str(payload.get("research_depth", fallback.research_depth)).strip() or fallback.research_depth,
+        summary=_clean_bullet_text(str(payload.get("summary", fallback.summary)).strip()) or fallback.summary,
+        investment_logic=_coerce_lines(payload.get("investment_logic")) or fallback.investment_logic,
+        positive_findings=positive_findings,
+        growth_catalysts=growth_catalysts,
+        technical_analysis=_coerce_lines(payload.get("technical_analysis")) or fallback.technical_analysis,
+        capital_validation=_coerce_lines(payload.get("capital_validation")) or fallback.capital_validation,
+        trade_plan=_coerce_lines(payload.get("trade_plan")) or fallback.trade_plan,
+        risks=_coerce_lines(payload.get("risks")) or fallback.risks,
+        source_urls=source_urls,
+        chart=chart,
+        audit_summaries=list(stock_audits),
+    )
+
+
+def _generate_stock_section(
+    ctx: dict,
+    trace_path: Path,
+    candidates_df: pd.DataFrame,
+    row: dict,
+    stock_audits: List[AuditResult],
+    chart: Optional[ChartArtifact],
+) -> ReportStockSection:
+    """Generate one structured stock section via DeepSeek with tool loop."""
     ts_code = ctx["ts_code"]
     name = ctx["name"]
     messages = [
         {"role": "system", "content": _STOCK_SECTION_SYSTEM_PROMPT},
-        {"role": "user", "content": f"请为 {name}({ts_code}) 生成深度分析。\n" + json.dumps(ctx, ensure_ascii=False, default=str)},
+        {"role": "user", "content": json.dumps(ctx, ensure_ascii=False, default=str)},
     ]
     trace_append(trace_path, "stock_section_request", {"ts_code": ts_code, "name": name})
-
     tool_context = {
         "candidates_df": candidates_df,
         "signals": ctx.get("signals", {}),
+        "stock_data": ctx.get("stock_data", {}),
     }
-
     for _ in range(5):
         content = deepseek_chat(messages) if deepseek_chat else None
         if not content:
             break
         trace_append(trace_path, "stock_section_response", {"ts_code": ts_code, "content": truncate(content, 8000)})
         parsed = safe_json_loads(content)
-        tool = parsed.get("tool")
+        tool = parsed.get("tool") if isinstance(parsed, dict) else None
         if tool:
             if tool == "web_search":
                 result = run_search(parsed.get("input", ""))
@@ -2803,51 +3189,28 @@ def _generate_stock_section(ctx: dict, trace_path: Path, candidates_df: pd.DataF
             trace_append(trace_path, "stock_tool_result", {"ts_code": ts_code, "tool": tool})
             messages.append({"role": "user", "content": f"TOOL_RESULT:\n{result}"})
             continue
-        section = parsed.get("stock_section")
-        if section:
-            return section
-        if content.lstrip().startswith("#"):
-            return content
-        messages.append({"role": "user", "content": "请按JSON格式返回 {\"stock_section\": \"### markdown...\"}"})
-    return None
+        payload = None
+        if isinstance(parsed, dict):
+            candidate_payload = parsed.get("stock") or parsed.get("stock_section")
+            if isinstance(candidate_payload, dict):
+                payload = candidate_payload
+        if payload is not None:
+            return _normalize_stock_section_payload(payload, row, stock_audits, chart, ctx.get("signals"))
+        messages.append({"role": "user", "content": "仅返回JSON对象 {\"stock\": {...}}，不要Markdown，不要代码块。"})
+    return _fallback_stock_section(row, stock_audits, chart, ctx.get("signals"))
 
 
-def _fallback_stock_section(row, stock_audits, chart_notes):
-    """Minimal deterministic fallback when DeepSeek fails for a stock."""
-    ts_code = row["ts_code"]
-    name = row.get("name", ts_code)
-    spikes = chart_notes.get(ts_code, [])
-    spike_note = ", ".join(spikes) if spikes else "未检测到明显量能异动"
-    lines = [
-        f"### {name} {ts_code}\n",
-        f"- 量能异动日：{spike_note}",
-        f"![{name} {ts_code}](../charts/{ts_code}.png)\n",
-    ]
-    for a in stock_audits:
-        lines.append(f"- 尽调结论({a.theme})：{a.verdict}")
-        lines.append(f"  - 说明：{a.rationale}")
-        lines.append(f"  - 来源：{', '.join(a.sources)}")
-    lines.append("")
-    return "\n".join(lines)
-
-
-def phase5_report_with_deepseek(
+def _build_report_model(
     themes: List[ThemeItem],
     candidates: pd.DataFrame,
     audits: List[AuditResult],
-    chart_notes: Dict[str, List[str]],
+    chart_artifacts: Dict[str, ChartArtifact],
     signals: Dict[str, Dict[str, object]],
-) -> Path:
-    REPORT_DIR.mkdir(parents=True, exist_ok=True)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    md_path = REPORT_DIR / f"report_{timestamp}.md"
-    trace_path = REPORT_DIR / f"deepseek_trace_{timestamp}.jsonl"
-
-    # Build audit lookup
-    audit_map = {}
-    for a in audits:
-        audit_map.setdefault(a.ts_code, []).append(a)
-
+    trace_path: Path,
+) -> ReportModel:
+    audit_map: Dict[str, List[AuditResult]] = {}
+    for audit in audits:
+        audit_map.setdefault(audit.ts_code, []).append(audit)
     candidates_with_flag = candidates.copy()
     if "off_theme" not in candidates_with_flag.columns:
         candidates_with_flag["off_theme"] = False
@@ -2856,370 +3219,483 @@ def phase5_report_with_deepseek(
     if "list_type" not in candidates_with_flag.columns:
         candidates_with_flag["list_type"] = "technical"
 
-    # --- Part A: Market overview (themes only) ---
     theme_summary = [
         {
-            "name": t.name, "keywords": t.keywords, "summary": t.summary,
-            "sources": t.sources, "validation_status": t.validation_status,
-            "capital_signal": t.capital_signal, "evidence": t.evidence,
+            "name": t.name,
+            "keywords": t.keywords,
+            "summary": t.summary,
+            "sources": t.sources,
+            "validation_status": t.validation_status,
+            "capital_signal": t.capital_signal,
+            "evidence": t.evidence,
         }
         for t in themes
     ]
-    logger.info("Phase 5: generating market overview...")
-    overview_md = _generate_market_overview(theme_summary, trace_path)
-
-    # --- Part B: Deterministic core tables (dual-list) ---
-    theme_table_md = build_deterministic_theme_table(
-        candidates_with_flag, audits, top_n=5
-    )
-    core_table_md = build_deterministic_core_table(
-        candidates_with_flag, audits, top_n=min(10, len(candidates_with_flag))
-    )
-    # Combined table sections
-    table_sections = []
-    table_sections.append(core_table_md)
-    if theme_table_md:
-        table_sections.append(theme_table_md)
-    combined_tables_md = "\n\n".join(table_sections)
-
-    # --- Part C: Per-stock deep sections ---
-    stock_sections = []
+    logger.info("Phase 5: generating market overview data...")
+    overview_items = _generate_market_overview(theme_summary, trace_path, themes)
+    core_rows = build_core_table_rows(candidates_with_flag, audits, top_n=min(10, len(candidates_with_flag)))
+    theme_rows = build_theme_table_rows(candidates_with_flag, audits, top_n=5)
     theme_context = "; ".join(f"{t.name}({t.validation_status})" for t in themes)
-
+    stock_sections: List[ReportStockSection] = []
     stock_limit = min(10, len(candidates_with_flag))
     for idx, (_, row) in enumerate(candidates_with_flag.head(stock_limit).iterrows()):
-        ts_code = row["ts_code"]
+        ts_code = str(row["ts_code"])
         name = row.get("name", ts_code)
         stock_audits = audit_map.get(ts_code, [])
-        ctx = _build_stock_context(row.to_dict(), stock_audits, chart_notes, signals, theme_context)
-
-        logger.info(f"Phase 5: generating stock section {idx+1}/{stock_limit} for {name}({ts_code})...")
-        section_md = _generate_stock_section(ctx, trace_path, candidates_with_flag)
-        if section_md:
-            stock_sections.append(section_md)
-        else:
-            stock_sections.append(_fallback_stock_section(row, stock_audits, chart_notes))
-
-    # --- Assemble ---
-    report_parts = [
-        "# A股趋势跟踪研报\n",
-        overview_md or "## 【市场风向标】\n\n（生成失败，请参考审计数据）\n",
-        "\n",
-        combined_tables_md,
-        "\n\n## 【深度图解】\n",
-    ]
-    report_parts.extend(stock_sections)
-    report_parts.append(
-        "\n## 【风险提示】\n"
-        "- 题材轮动快，注意情绪退潮风险。\n"
-        "- 量能异动需配合市场主线验证。\n"
-    )
-
-    report_md = "\n".join(report_parts)
-
-    # Fix placeholder URLs
-    if "url1" in report_md:
-        real_urls = []
-        for theme in themes:
-            for url in theme.sources:
-                if url not in real_urls:
-                    real_urls.append(url)
-        if real_urls:
-            report_md = report_md.replace("url1", real_urls[0])
-
-    report_md = upsert_core_table_in_report(report_md, combined_tables_md)
-    md_path.write_text(report_md, encoding="utf-8")
-    return md_path
-
-
-def postprocess_markdown(md_path: Path) -> Path:
-    """
-    Post-process markdown to fix formatting issues for better PDF output.
-
-    Args:
-        md_path: Path to original Markdown file
-
-    Returns:
-        Path to processed Markdown file
-    """
-    import re
-    from urllib.parse import urlparse
-
-    content = md_path.read_text(encoding="utf-8")
-    processed_path = md_path.parent / f"{md_path.stem}_processed.md"
-
-    def split_inline_items(line: str) -> List[str]:
-        """
-        Split list items that were collapsed into a single line.
-        Example:
-          【技术分析】 - A。- B。- C
-        ->
-          【技术分析】
-          - A。
-          - B。
-          - C
-        """
-        normalized = re.sub(r"([。；])\s*-\s", r"\1\n- ", line)
-        normalized = re.sub(
-            r"^(\s*(?:\*\*)?【[^】]+】(?:\*\*)?)\s+-\s",
-            r"\1\n- ",
-            normalized
+        chart = chart_artifacts.get(ts_code)
+        ctx = _build_stock_context(row.to_dict(), stock_audits, chart_artifacts, signals, theme_context)
+        logger.info(f"Phase 5: generating stock section {idx + 1}/{stock_limit} for {name}({ts_code})...")
+        stock_sections.append(
+            _generate_stock_section(ctx, trace_path, candidates_with_flag, row.to_dict(), stock_audits, chart)
         )
-
-        if "\n" in normalized:
-            return [seg for seg in normalized.split("\n") if seg.strip()]
-        return [line]
-
-    lines = content.split("\n")
-    processed_lines = []
-
-    for line in lines:
-        candidate_lines = split_inline_items(line)
-        for line in candidate_lines:
-            # Avoid pandoc YAML misparse for bare '---' separators in body text.
-            # Keep visual separator semantics using markdown horizontal rule '***'.
-            if line.strip() == "---":
-                processed_lines.append("***")
-                continue
-
-            # Fix long comma-separated date lists - break them into multiple lines
-            if "量能异动日：" in line and "," in line:
-                match = re.search(r"(.*?)量能异动日：(.*?)(?:$|!)", line)
-                if match:
-                    prefix = match.group(1)
-                    dates_str = match.group(2).strip()
-                    dates = [d.strip() for d in dates_str.split(",")]
-                    processed_lines.append(f"{prefix}量能异动日：")
-                    # Group dates into lines of 8
-                    for i in range(0, len(dates), 8):
-                        processed_lines.append(", ".join(dates[i:i+8]))
-                    continue
-
-            # Fix long source lines - break into multiple lines BEFORE URL processing
-            if "- 来源：" in line:
-                match = re.search(r"(.*?- 来源：)(.*?)(?:$)", line)
-                if match:
-                    prefix = match.group(1)
-                    sources_str = match.group(2).strip()
-
-                    # Extract URLs from the sources
-                    url_pattern = r"https?://[^\s,]+"
-                    urls = re.findall(url_pattern, sources_str)
-
-                    if urls:
-                        processed_lines.append(prefix)
-                        # Create clickable links, 2 per line
-                        for i in range(0, len(urls), 2):
-                            link_parts = []
-                            for url in urls[i:i+2]:
-                                parsed = urlparse(url)
-                                domain = parsed.netloc or parsed.path[:30]
-                                link_parts.append(f"[{domain}]({url})")
-                            processed_lines.append("  " + "  ".join(link_parts))
-                        continue
-
-            # Fix bare URLs in other lines - make them clickable
-            url_pattern = r"(https?://[^\s\]\),]+)"
-            def replace_url(match):
-                url = match.group(1)
-                # Skip if already in markdown link format
-                if f"]({url})" in line or f"](<{url}>)" in line:
-                    return url
-                # Extract domain for link text
-                parsed = urlparse(url)
-                domain = parsed.netloc or parsed.path[:30]
-                return f"[{domain}]({url})"
-
-            line = re.sub(url_pattern, replace_url, line)
-
-            processed_lines.append(line)
-
-    processed_content = "\n".join(processed_lines)
-    # Normalize malformed bold markers so stars do not leak into PDF text.
-    # Example: "** 估值水平 **" -> "**估值水平**"
-    processed_content = re.sub(r"\*\*\s+([^*\n][^*\n]*?)\s+\*\*", r"**\1**", processed_content)
-
-    # Convert HTML font color tags to pandoc raw LaTeX for PDF rendering
-    # Pattern: <font color='red'>text</font> or <font color="red">text</font>
-    def convert_font_color(match):
-        color_name = match.group(1).strip('"\'')
-        text = match.group(2)
-        # Map HTML color names to LaTeX colors
-        color_map = {
-            'red': 'highlightred',
-            'green': 'highlightgreen',
-            'blue': 'highlightblue',
-            'orange': 'highlightorange',
-            'purple': 'highlightpurple',
-        }
-        latex_color = color_map.get(color_name.lower(), color_name)
-        # Escape LaTeX special characters in text (except backslash which is handled by raw attribute)
-        # Only escape characters that would break the \textcolor{} command
-        def escape_latex_text(s: str) -> str:
-            # Escape braces first to avoid interfering with other replacements
-            s = s.replace('{', '\\{').replace('}', '\\}')
-            # Escape other LaTeX special characters
-            replacements = [
-                ('#', '\\#'),
-                ('$', '\\$'),
-                ('%', '\\%'),
-                ('&', '\\&'),
-                ('_', '\\_'),
-                ('^', '\\^{}'),
-                ('~', '\\textasciitilde{}'),
-            ]
-            for orig, repl in replacements:
-                s = s.replace(orig, repl)
-            return s
-        # Preserve markdown bold semantics as LaTeX bold within colored text.
-        # We escape plain/bold fragments separately so LaTeX braces are not escaped.
-        segments: List[str] = []
-        cursor = 0
-        for bold_match in re.finditer(r"\*\*\s*(.*?)\s*\*\*", text, flags=re.DOTALL):
-            if bold_match.start() > cursor:
-                segments.append(escape_latex_text(text[cursor:bold_match.start()]))
-            bold_text = escape_latex_text(bold_match.group(1))
-            segments.append(f"\\textbf{{{bold_text}}}")
-            cursor = bold_match.end()
-        if cursor < len(text):
-            segments.append(escape_latex_text(text[cursor:]))
-        text = "".join(segments)
-        # For multiline content, use fenced code block raw LaTeX
-        # For single-line, use inline raw attribute syntax
-        if '\n' in text:
-            # Use {\color{name}...} instead of \textcolor for multiline content
-            # because \textcolor cannot contain paragraph breaks
-            return f'\n\n```{{=latex}}\n{{\\color{{{latex_color}}} {text}}}\n```\n\n'
-        else:
-            # Inline raw attribute syntax: `\textcolor{color}{text}`{=latex}
-            return f'`\\textcolor{{{latex_color}}}{{{text}}}`{{=latex}}'
-    # Use a more robust regex that handles nested structures
-    processed_content = re.sub(
-        r"<font\s+color=['\"]([^'\"]+)['\"]>(.*?)</font>",
-        convert_font_color,
-        processed_content,
-        flags=re.IGNORECASE | re.DOTALL
+    return ReportModel(
+        title="A股趋势跟踪研报",
+        generated_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        theme_overviews=overview_items,
+        core_table_rows=core_rows,
+        theme_table_rows=theme_rows,
+        stock_sections=stock_sections,
+        risks=[
+            "题材轮动快，注意情绪退潮风险。",
+            "量能异动需配合市场主线验证。",
+            "若出现监管函、立案调查等硬伤，直接剔除。",
+        ],
     )
 
-    # Add spacing improvements
-    processed_content = re.sub(r"\n{3,}", "\n\n", processed_content)  # Fix excessive blank lines
 
-    # Fix relative image paths - convert ../charts/ to absolute paths for pandoc
-    charts_abs_path = (md_path.parent.parent / "charts").resolve()
-    processed_content = re.sub(
-        r"!\[([^\]]*)\]\(\.\./charts/([^)]+)\)",
-        lambda m: f"![{m.group(1)}]({charts_abs_path / m.group(2)})",
-        processed_content
+def render_report_markdown_debug(report: ReportModel) -> str:
+    """Render structured report as markdown for debugging."""
+    lines = [f"# {report.title}", "", f"_生成时间：{report.generated_at}_", "", "## 【市场风向标】", ""]
+    for item in report.theme_overviews:
+        lines.append(f"### {item.name} ({item.validation_status})")
+        for bullet in item.logic:
+            lines.append(f"- 主题逻辑：{bullet}")
+        for bullet in item.capital_validation:
+            lines.append(f"- 资金验证：{bullet}")
+        for bullet in item.watch_items:
+            lines.append(f"- 持续观察：{bullet}")
+        if item.source_urls:
+            lines.append(f"- 来源：{', '.join(item.source_urls)}")
+        lines.append("")
+    lines.append(
+        _build_markdown_table(
+            "## 【核心金股 - 技术形态精选】",
+            ["股票", "所属主线", "形态特征", "置信度", "推荐理由"],
+            report.core_table_rows,
+        )
+        if report.core_table_rows
+        else "## 【核心金股 - 技术形态精选】\n\n（无数据）"
     )
-
-    processed_path.write_text(processed_content, encoding="utf-8")
-    return processed_path
-
-
-def build_pdf(md_path: Path) -> Optional[Path]:
-    """
-    Build PDF from Markdown using pandoc with improved formatting.
-
-    Args:
-        md_path: Path to Markdown file
-
-    Returns:
-        Path to generated PDF, or None if generation failed
-    """
-    # Post-process markdown for better formatting
-    processed_md = postprocess_markdown(md_path)
-
-    pdf_path = md_path.with_suffix(".pdf")
-
-    # Create LaTeX header for better styling
-    latex_header = r"""\usepackage{geometry}
-\usepackage{hyperref}
-\usepackage{longtable}
-\usepackage{booktabs}
-\usepackage{xcolor}
-\usepackage{graphicx}
-
-% Page geometry
-\geometry{
-    a4paper,
-    left=25mm,
-    right=25mm,
-    top=25mm,
-    bottom=25mm,
-}
-
-% Hyperlink setup
-\hypersetup{
-    colorlinks=true,
-    linkcolor=blue,
-    urlcolor=blue,
-    citecolor=blue,
-    pdftitle={A股趋势跟踪研报},
-    pdfauthor={Trend Agent},
-}
-
-% Table styling
-\renewcommand{\arraystretch}{1.3}
-
-% Image styling - center all images
-\makeatletter
-\def\maxwidth{\ifdim\Gin@nat@width>\linewidth\linewidth\else\Gin@nat@width\fi}
-\def\maxheight{\ifdim\Gin@nat@height>\textheight\textheight\else\Gin@nat@height\fi}
-\makeatother
-
-% Center images and scale if needed
-\setkeys{Gin}{width=\maxwidth,height=\maxheight,keepaspectratio}
-\makeatletter
-\g@addto@macro\@floatboxreset\centering
-\makeatother
-
-% Define colors for highlights
-\definecolor{highlightred}{RGB}{220, 50, 50}
-\definecolor{highlightgreen}{RGB}{50, 160, 50}
-\definecolor{highlightblue}{RGB}{50, 100, 220}
-\definecolor{highlightorange}{RGB}{220, 120, 20}
-\definecolor{highlightpurple}{RGB}{140, 50, 180}
-"""
-
-    # Write header to temp file
-    header_path = md_path.parent / "header.tex"
-    header_path.write_text(latex_header, encoding="utf-8")
-
-    build_sh = md_path.parent / "build.sh"
-    build_sh.write_text(
-        f'#!/usr/bin/env bash\ncd "{md_path.parent}" && pandoc --from=markdown+raw_attribute "{processed_md.name}" -o "{pdf_path.name}" --pdf-engine=xelatex -H header.tex -V CJKmainfont="{CHART_FONT}" --toc --number-sections\n',
-        encoding="utf-8",
-    )
-    build_sh.chmod(0o755)
-
-    try:
-        # Run pandoc with improved options for better formatting
-        subprocess.run(
+    if report.theme_table_rows:
+        lines.extend(
             [
-                "pandoc",
-                "--from=markdown+raw_attribute",
-                processed_md.name,
-                "-o",
-                pdf_path.name,
-                "--pdf-engine=xelatex",
-                "-H", "header.tex",
-                "-V", f"CJKmainfont={CHART_FONT}",
-                "--toc",
-                "--number-sections",
-                "--wrap=none",  # Don't wrap lines automatically
-                "--columns=80",  # Set line length
-            ],
-            cwd=str(md_path.parent),
-            check=True,
-            capture_output=True,
+                "",
+                _build_markdown_table(
+                    "## 【核心金股 - 题材驱动精选】",
+                    ["股票", "匹配题材", "题材强度", "动量评分", "Alpha评分"],
+                    report.theme_table_rows,
+                ),
+            ]
         )
-        logger.info(f"PDF generated: {pdf_path}")
-        return pdf_path
-    except (subprocess.CalledProcessError, FileNotFoundError) as exc:
-        logger.warning(f"Pandoc PDF generation failed: {exc}")
-        if hasattr(exc, "stderr") and exc.stderr:
-            logger.debug(f"Pandoc stderr: {exc.stderr.decode('utf-8', errors='ignore')}")
-        return None
+    lines.extend(["", "## 【深度图解】", ""])
+    for section in report.stock_sections:
+        lines.append(f"### {section.name} {section.ts_code}")
+        lines.append(f"- 结论：{section.recommendation_label}")
+        lines.append(f"- 摘要：{section.summary}")
+        for bullet in section.investment_logic:
+            lines.append(f"- 投资逻辑：{bullet}")
+        for finding in section.positive_findings:
+            lines.append(f"- 正面催化：[{finding.category}] {finding.description} (置信度 {finding.confidence:.2f})")
+        for catalyst in section.growth_catalysts:
+            lines.append(f"- 增长催化：[{catalyst.catalyst_type}] {catalyst.description} ({catalyst.timeframe}, {catalyst.confidence:.2f})")
+        for bullet in section.technical_analysis:
+            lines.append(f"- 技术分析：{bullet}")
+        for bullet in section.capital_validation:
+            lines.append(f"- 资金验证：{bullet}")
+        for bullet in section.trade_plan:
+            lines.append(f"- 交易建议：{bullet}")
+        for bullet in section.risks:
+            lines.append(f"- 风险提示：{bullet}")
+        if section.chart and section.chart.png_rel_path:
+            lines.append(f"![{section.name} {section.ts_code}]({section.chart.png_rel_path})")
+        if section.source_urls:
+            lines.append(f"- 来源：{', '.join(section.source_urls)}")
+        lines.append("")
+    lines.extend(["## 【风险提示】", *[f"- {risk}" for risk in report.risks], ""])
+    return "\n".join(lines)
+
+
+def _render_html_table(title: str, rows: List[Dict[str, str]]) -> str:
+    if not rows:
+        return ""
+    headers = list(rows[0].keys())
+    thead = "".join(f"<th>{html_escape(header)}</th>" for header in headers)
+    body_rows = []
+    for row in rows:
+        body_rows.append("<tr>" + "".join(f"<td>{html_escape(str(row.get(header, '')))}</td>" for header in headers) + "</tr>")
+    return (
+        f"<section class=\"table-section\"><h2>{html_escape(title)}</h2><div class=\"table-shell\">"
+        f"<table><thead><tr>{thead}</tr></thead><tbody>{''.join(body_rows)}</tbody></table></div></section>"
+    )
+
+
+def render_report_html(report: ReportModel) -> str:
+    """Render structured report as a self-contained interactive HTML page."""
+    all_theme_names = sorted(
+        {
+            theme.name for theme in report.theme_overviews
+        }.union(
+            {theme for section in report.stock_sections for theme in section.matched_themes}
+        )
+    )
+    theme_options = "<option value=\"\">全部主题</option>" + "".join(
+        f"<option value=\"{html_escape(theme)}\">{html_escape(theme)}</option>" for theme in all_theme_names
+    )
+    overview_cards = []
+    for item in report.theme_overviews:
+        overview_cards.append(
+            "<article class=\"theme-card\">"
+            f"<div class=\"card-head\"><h3>{html_escape(item.name)}</h3><span class=\"status {html_escape(item.validation_status)}\">{html_escape(item.validation_status)}</span></div>"
+            "<div class=\"card-grid\">"
+            f"<section><h4>主题逻辑</h4>{_render_html_list(item.logic)}</section>"
+            f"<section><h4>资金验证</h4>{_render_html_list(item.capital_validation)}</section>"
+            f"<section><h4>持续观察</h4>{_render_html_list(item.watch_items)}</section>"
+            f"<section><h4>来源</h4>{_render_source_links(item.source_urls)}</section>"
+            "</div></article>"
+        )
+
+    stock_cards = []
+    for idx, section in enumerate(report.stock_sections):
+        theme_badges = "".join(f"<span class=\"pill\">{html_escape(theme)}</span>" for theme in (section.matched_themes or ["技术形态入选"]))
+        findings_html = "".join(
+            "<article class=\"mini-card\">"
+            f"<div class=\"mini-meta\">{html_escape(finding.category)} · 置信度 {finding.confidence:.2f}</div>"
+            f"<p>{html_escape(finding.description)}</p>"
+            f"{('<p class=\"muted\">' + html_escape(finding.evidence) + '</p>') if finding.evidence else ''}"
+            f"{('<a class=\"source-link\" href=\"' + html_escape(finding.source_url) + '\" target=\"_blank\" rel=\"noreferrer\">来源</a>') if finding.source_url else ''}"
+            "</article>"
+            for finding in section.positive_findings
+        ) or "<p class=\"muted\">暂无显著正面催化。</p>"
+        catalysts_html = "".join(
+            "<article class=\"mini-card\">"
+            f"<div class=\"mini-meta\">{html_escape(catalyst.catalyst_type)} · {html_escape(catalyst.timeframe)} · {catalyst.confidence:.2f}</div>"
+            f"<p>{html_escape(catalyst.description)}</p>"
+            "</article>"
+            for catalyst in section.growth_catalysts
+        ) or "<p class=\"muted\">暂无显著增长催化。</p>"
+        stock_cards.append(
+            f"<details class=\"stock-card\" {'open' if idx < 2 else ''} "
+            f"data-search=\"{html_escape((section.name + ' ' + section.ts_code + ' ' + ' '.join(section.matched_themes)).lower())}\" "
+            f"data-themes=\"{html_escape('|'.join(section.matched_themes))}\">"
+            "<summary>"
+            f"<div><h3>{html_escape(section.name)} <span>{html_escape(section.ts_code)}</span></h3><p>{html_escape(section.summary)}</p></div>"
+            f"<div class=\"summary-meta\"><span class=\"status rec-{html_escape(section.recommendation)}\">{html_escape(section.recommendation_label)}</span>{theme_badges}</div>"
+            "</summary>"
+            "<div class=\"details-grid\">"
+            f"<section><h4>投资逻辑</h4>{_render_html_list(section.investment_logic)}</section>"
+            f"<section><h4>技术分析</h4>{_render_html_list(section.technical_analysis)}</section>"
+            f"<section><h4>资金验证</h4>{_render_html_list(section.capital_validation)}</section>"
+            f"<section><h4>交易建议</h4>{_render_html_list(section.trade_plan)}</section>"
+            "</div>"
+            f"<section><h4>正面催化发现</h4><div class=\"mini-grid\">{findings_html}</div></section>"
+            f"<section><h4>增长催化剂</h4><div class=\"mini-grid\">{catalysts_html}</div></section>"
+            f"<section><h4>风险提示</h4>{_render_html_list(section.risks)}</section>"
+            f"<section><h4>交互图表</h4>{section.chart.plotly_html if section.chart else '<p class=\"muted\">图表不可用。</p>'}</section>"
+            f"<section><h4>来源</h4>{_render_source_links(section.source_urls)}</section>"
+            "</details>"
+        )
+
+    css = """
+    :root {
+        --bg: #f5efe2;
+        --paper: rgba(255, 252, 246, 0.92);
+        --ink: #182028;
+        --muted: #5f6770;
+        --line: rgba(24, 32, 40, 0.14);
+        --accent: #c4542b;
+        --accent-2: #006d77;
+        --shadow: 0 18px 45px rgba(39, 35, 31, 0.12);
+        --radius: 18px;
+        --font: "Avenir Next", "Segoe UI", "PingFang SC", "Noto Sans CJK SC", sans-serif;
+    }
+    * { box-sizing: border-box; }
+    body {
+        margin: 0;
+        color: var(--ink);
+        background:
+            radial-gradient(circle at top left, rgba(196, 84, 43, 0.18), transparent 28%),
+            radial-gradient(circle at top right, rgba(0, 109, 119, 0.18), transparent 24%),
+            linear-gradient(180deg, #f7f2e8 0%, #f1eadf 100%);
+        font-family: var(--font);
+    }
+    a { color: var(--accent-2); }
+    .layout { max-width: 1320px; margin: 0 auto; padding: 32px 20px 64px; }
+    .hero {
+        background: var(--paper);
+        border: 1px solid var(--line);
+        border-radius: calc(var(--radius) + 8px);
+        padding: 28px;
+        box-shadow: var(--shadow);
+        margin-bottom: 20px;
+    }
+    .hero h1 { margin: 0 0 8px; font-size: clamp(32px, 4vw, 52px); line-height: 1.02; }
+    .hero p { margin: 0; color: var(--muted); max-width: 900px; }
+    .hero-meta { margin-top: 18px; display: flex; gap: 10px; flex-wrap: wrap; }
+    .pill, .status {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        border-radius: 999px;
+        padding: 6px 12px;
+        font-size: 12px;
+        font-weight: 700;
+        border: 1px solid var(--line);
+        background: rgba(255, 255, 255, 0.6);
+    }
+    .status.confirmed, .status.rec-strong_buy { background: rgba(1, 135, 134, 0.13); color: #005d63; }
+    .status.web_only, .status.rec-buy { background: rgba(196, 84, 43, 0.13); color: #8b3a1d; }
+    .status.capital_only, .status.rec-watch { background: rgba(58, 91, 166, 0.13); color: #28498c; }
+    .status.weak, .status.rec-avoid { background: rgba(120, 53, 15, 0.12); color: #6d3d17; }
+    .nav {
+        position: sticky;
+        top: 0;
+        z-index: 20;
+        display: flex;
+        gap: 10px;
+        flex-wrap: wrap;
+        background: rgba(245, 239, 226, 0.86);
+        backdrop-filter: blur(12px);
+        padding: 12px 0 16px;
+    }
+    .nav a, .controls button {
+        text-decoration: none;
+        background: var(--paper);
+        color: var(--ink);
+        border: 1px solid var(--line);
+        border-radius: 999px;
+        padding: 10px 14px;
+        box-shadow: 0 8px 18px rgba(34, 28, 24, 0.08);
+    }
+    .controls {
+        display: grid;
+        grid-template-columns: 1fr 220px auto auto;
+        gap: 12px;
+        margin: 16px 0 24px;
+    }
+    .controls input, .controls select {
+        width: 100%;
+        border-radius: 14px;
+        border: 1px solid var(--line);
+        padding: 12px 14px;
+        background: rgba(255, 255, 255, 0.85);
+        font: inherit;
+    }
+    section, .theme-card, .stock-card, .table-section {
+        scroll-margin-top: 88px;
+    }
+    .theme-grid, .mini-grid {
+        display: grid;
+        gap: 16px;
+        grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+    }
+    .theme-card, .table-section, .risk-section {
+        background: var(--paper);
+        border: 1px solid var(--line);
+        border-radius: var(--radius);
+        box-shadow: var(--shadow);
+        padding: 20px;
+        margin-bottom: 18px;
+    }
+    .card-head {
+        display: flex;
+        justify-content: space-between;
+        gap: 12px;
+        align-items: center;
+        margin-bottom: 12px;
+    }
+    .card-head h3 { margin: 0; font-size: 22px; }
+    .card-grid, .details-grid {
+        display: grid;
+        gap: 16px;
+        grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+    }
+    .bullet-list { margin: 0; padding-left: 18px; }
+    .bullet-list li { margin: 0 0 8px; }
+    .muted { color: var(--muted); }
+    .table-shell { overflow-x: auto; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { padding: 12px 14px; border-bottom: 1px solid var(--line); text-align: left; }
+    th { font-size: 13px; text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted); }
+    .stock-card {
+        background: var(--paper);
+        border: 1px solid var(--line);
+        border-radius: var(--radius);
+        box-shadow: var(--shadow);
+        margin-bottom: 18px;
+        overflow: hidden;
+    }
+    .stock-card summary {
+        list-style: none;
+        cursor: pointer;
+        display: flex;
+        justify-content: space-between;
+        gap: 16px;
+        padding: 22px;
+        align-items: center;
+    }
+    .stock-card summary::-webkit-details-marker { display: none; }
+    .stock-card summary h3 { margin: 0 0 6px; font-size: 24px; }
+    .stock-card summary h3 span { color: var(--muted); font-size: 16px; }
+    .stock-card summary p { margin: 0; color: var(--muted); }
+    .summary-meta { display: flex; flex-wrap: wrap; gap: 8px; justify-content: flex-end; }
+    .stock-card > section, .stock-card > .details-grid { padding: 0 22px 22px; }
+    .mini-card {
+        background: rgba(255, 255, 255, 0.58);
+        border: 1px solid var(--line);
+        border-radius: 14px;
+        padding: 14px;
+    }
+    .mini-meta { font-size: 12px; color: var(--muted); margin-bottom: 8px; font-weight: 700; }
+    .source-links { display: flex; flex-wrap: wrap; gap: 8px; }
+    .source-link {
+        display: inline-flex;
+        align-items: center;
+        padding: 7px 10px;
+        border-radius: 999px;
+        border: 1px solid var(--line);
+        background: rgba(255, 255, 255, 0.65);
+        text-decoration: none;
+    }
+    .risk-list {
+        display: grid;
+        gap: 10px;
+        grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    }
+    .risk-item {
+        background: rgba(196, 84, 43, 0.08);
+        border: 1px solid rgba(196, 84, 43, 0.2);
+        border-radius: 14px;
+        padding: 14px;
+    }
+    @media (max-width: 920px) {
+        .controls { grid-template-columns: 1fr; }
+        .stock-card summary { flex-direction: column; align-items: flex-start; }
+        .summary-meta { justify-content: flex-start; }
+    }
+    @media print {
+        body { background: #fff; }
+        .nav, .controls { display: none !important; }
+        .layout { max-width: none; padding: 0; }
+        .hero, .theme-card, .table-section, .risk-section, .stock-card { box-shadow: none; border-color: #d4d4d4; }
+        details { break-inside: avoid; }
+        details[open] summary { margin-bottom: 12px; }
+    }
+    """
+    script = """
+    document.addEventListener('DOMContentLoaded', () => {
+      const search = document.getElementById('stock-search');
+      const theme = document.getElementById('theme-filter');
+      const cards = Array.from(document.querySelectorAll('.stock-card'));
+      const count = document.getElementById('stock-count');
+      const applyFilters = () => {
+        const term = (search.value || '').trim().toLowerCase();
+        const activeTheme = theme.value || '';
+        let visible = 0;
+        cards.forEach((card) => {
+          const hay = card.dataset.search || '';
+          const themes = (card.dataset.themes || '').split('|').filter(Boolean);
+          const matchesTerm = !term || hay.includes(term);
+          const matchesTheme = !activeTheme || themes.includes(activeTheme);
+          const show = matchesTerm && matchesTheme;
+          card.style.display = show ? '' : 'none';
+          if (show) visible += 1;
+        });
+        count.textContent = `${visible} / ${cards.length}`;
+      };
+      document.getElementById('expand-all').addEventListener('click', () => cards.forEach((card) => { if (card.style.display !== 'none') card.open = true; }));
+      document.getElementById('collapse-all').addEventListener('click', () => cards.forEach((card) => { card.open = false; }));
+      search.addEventListener('input', applyFilters);
+      theme.addEventListener('change', applyFilters);
+      applyFilters();
+    });
+    """
+    return f"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>{html_escape(report.title)}</title>
+  <style>{css}</style>
+  <script>{get_plotlyjs()}</script>
+</head>
+<body>
+  <div class="layout">
+    <header class="hero" id="top">
+      <h1>{html_escape(report.title)}</h1>
+      <p>单文件自包含 HTML 研报，包含结构化结论、交互筛选和内嵌 Plotly 图表。Markdown 仅保留为调试输出。</p>
+      <div class="hero-meta">
+        <span class="pill">生成时间 {html_escape(report.generated_at)}</span>
+        <span class="pill">{len(report.theme_overviews)} 个主题</span>
+        <span class="pill">{len(report.stock_sections)} 只股票</span>
+      </div>
+    </header>
+    <nav class="nav">
+      <a href="#overview">市场风向标</a>
+      <a href="#core-table">技术形态精选</a>
+      <a href="#theme-table">题材驱动精选</a>
+      <a href="#stocks">深度图解</a>
+      <a href="#risks">风险提示</a>
+    </nav>
+    <section class="controls" aria-label="筛选器">
+      <input id="stock-search" type="search" placeholder="搜索股票、代码或题材" />
+      <select id="theme-filter">{theme_options}</select>
+      <button id="expand-all" type="button">展开可见项</button>
+      <button id="collapse-all" type="button">收起全部</button>
+    </section>
+    <p class="muted">当前显示 <strong id="stock-count"></strong> 只股票。</p>
+    <section id="overview">
+      <h2>【市场风向标】</h2>
+      <div class="theme-grid">{''.join(overview_cards)}</div>
+    </section>
+    <section id="core-table">{_render_html_table("【核心金股 - 技术形态精选】", report.core_table_rows)}</section>
+    <section id="theme-table">{_render_html_table("【核心金股 - 题材驱动精选】", report.theme_table_rows)}</section>
+    <section id="stocks">
+      <h2>【深度图解】</h2>
+      {''.join(stock_cards)}
+    </section>
+    <section class="risk-section" id="risks">
+      <h2>【风险提示】</h2>
+      <div class="risk-list">{''.join(f'<article class="risk-item">{html_escape(item)}</article>' for item in report.risks)}</div>
+    </section>
+  </div>
+  <script>{script}</script>
+</body>
+</html>"""
+
+
+def phase5_report_with_deepseek(
+    themes: List[ThemeItem],
+    candidates: pd.DataFrame,
+    audits: List[AuditResult],
+    chart_artifacts: Dict[str, ChartArtifact],
+    signals: Dict[str, Dict[str, object]],
+) -> ReportArtifacts:
+    REPORT_DIR.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    html_path = REPORT_DIR / f"report_{timestamp}.html"
+    md_path = REPORT_DIR / f"report_{timestamp}.md"
+    trace_path = REPORT_DIR / f"deepseek_trace_{timestamp}.jsonl"
+
+    report = _build_report_model(themes, candidates, audits, chart_artifacts, signals, trace_path)
+    html_path.write_text(render_report_html(report), encoding="utf-8")
+    md_path.write_text(render_report_markdown_debug(report), encoding="utf-8")
+    if not trace_path.exists():
+        trace_path.write_text("", encoding="utf-8")
+    return ReportArtifacts(
+        html_path=html_path,
+        markdown_debug_path=md_path,
+        trace_path=trace_path,
+    )
 
 
 def main() -> None:
@@ -3268,20 +3744,16 @@ def main() -> None:
 
     # Phase 4
     logger.info("Phase 4: Visualization...")
-    chart_notes = phase4_plot_charts(candidates)
+    chart_artifacts = phase4_plot_charts(candidates)
     signals = compute_signals(candidates)
 
     # Phase 5
     logger.info("Phase 5: Report Generation...")
-    md_path = phase5_report_with_deepseek(themes, candidates, audits, chart_notes, signals)
-    pdf_path = build_pdf(md_path)
+    report_artifacts = phase5_report_with_deepseek(themes, candidates, audits, chart_artifacts, signals)
 
     logger.info("=" * 60)
-    logger.info(f"Report generated: {md_path}")
-    if pdf_path:
-        logger.info(f"PDF generated: {pdf_path}")
-    else:
-        logger.info("PDF not generated (pandoc may not be available)")
+    logger.info(f"HTML report generated: {report_artifacts.html_path}")
+    logger.info(f"Debug markdown generated: {report_artifacts.markdown_debug_path}")
     logger.info("=" * 60)
 
 

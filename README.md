@@ -22,7 +22,7 @@ flowchart TD
     P2["Phase 2: Quantitative Mining<br/>输出: 技术面候选股票池<br/>- 市值过滤 20-300亿<br/>- 120日横盘振幅 < 35%<br/>- MA20/60/120 粘合度 < 15%<br/>- 量能 1.2-3.0x<br/>- Qwen语义题材匹配"]
     P3["Phase 3: Deep Research (Audit)<br/>输出: 尽调结论 + 排雷<br/>- 多轮检索验证题材真实性<br/>- 一票否决: 立案/诉讼/减持/退市风险/伪概念<br/>- 监管事件近2年时效<br/>- 信源优先级: cninfo > 交易所 > 其他"]
     P4["Phase 4: Visualization<br/>输出: K线图表 + 技术信号<br/>- mplfinance K线<br/>- MA20/60/120叠加<br/>- 量能异动点标注<br/>- 箱体位置与突破距离"]
-    P5["Phase 5: Report Generation<br/>输出: 研究报告 (MD + PDF)<br/>- DeepSeek V3.2 结构化研报<br/>- 工具调用: web_search / duckdb / python<br/>- 彩色标注投资逻辑/资金验证/催化/建议<br/>- Pandoc + XeLaTeX 输出中文PDF"]
+    P5["Phase 5: Report Generation<br/>输出: 自包含HTML研报 + 调试Markdown<br/>- DeepSeek V3.2 结构化JSON section<br/>- 工具调用: web_search / duckdb / python<br/>- 交互式筛选/折叠/导航<br/>- 内嵌 Plotly 图表，无需 PDF/LaTeX"]
 
     P1 --> P2 --> P3 --> P4 --> P5
 ```
@@ -448,26 +448,15 @@ def detect_turnover_spikes(df, window=20, multiple=1.5):
 <font color='orange'>- 若出现监管函、立案调查等硬伤，直接剔除。</font>
 ```
 
-### 颜色标注系统
+### HTML报告
 
-| 颜色 | LaTeX定义 | 用途 |
-|------|-----------|------|
-| 蓝色 | highlightblue | 投资逻辑 |
-| 紫色 | highlightpurple | 资金验证 |
-| 红色 | highlightred | 核心催化 |
-| 绿色 | highlightgreen | 交易建议 |
-| 橙色 | highlightorange | 风险提示 |
-
-### PDF生成
-
-**工具链**: Markdown → Pandoc → XeLaTeX → PDF
+**输出契约**: `reports/report_*.html` 为正式产物，`reports/report_*.md` 仅用于调试。
 
 **特性**:
-- 中文字体支持 (Source Han Sans CN)
-- 自动目录生成
-- 彩色标注转换
-- 图表居中缩放
-- 长URL自动换行
+- 单文件自包含 HTML
+- 内嵌 Plotly JS 与交互图表
+- 主题/股票筛选、折叠、粘性导航
+- 浏览器打印可作为 PDF fallback
 
 ---
 
@@ -490,8 +479,8 @@ trend-agent/
 │   └── ...
 │
 ├── reports/                       # 输出研报
-│   ├── report_20250123_120000.md
-│   ├── report_20250123_120000.pdf
+│   ├── report_20250123_120000.html
+│   ├── report_20250123_120000.md    # 调试用
 │   ├── audit_trace_*.jsonl       # 审计过程trace
 │   └── deepseek_trace_*.jsonl    # 报告生成trace
 │
@@ -543,15 +532,9 @@ pip install -U pandas numpy duckdb mplfinance matplotlib \
                langchain-core langchain-community python-dotenv
 ```
 
-### 系统依赖 (PDF生成)
+### 系统依赖
 
-```bash
-# Arch Linux
-sudo pacman -S pandoc texlive-xetex
-
-# Debian/Ubuntu
-sudo apt-get install pandoc texlive-xetex
-```
+无额外 PDF/LaTeX 依赖；HTML 报告直接由 Python 生成。
 
 ### 环境变量 (.env)
 
@@ -644,19 +627,18 @@ python trend_agent.py
 - 量能异动日标注 (红色三角)
 - 中文标题
 
-### 2) Markdown研报 (reports/report_*.md)
+### 2) HTML研报 (reports/report_*.html)
 
-- 结构化章节
-- 彩色标注 (HTML font tags)
-- 来源URL链接
-- 图表引用
+- 单文件自包含
+- 交互式筛选、折叠、导航
+- 内嵌 Plotly 图表
+- 浏览器可直接打印导出
 
-### 3) PDF研报 (reports/report_*.pdf)
+### 3) Debug Markdown (reports/report_*.md)
 
-- 自动目录
-- 彩色标注 (LaTeX)
-- 图表居中
-- 适合打印和分享
+- 与 HTML 同源的调试输出
+- 无 PDF 专用格式处理
+- 便于快速 diff 和排查 LLM 输出
 
 ### 4) Trace文件
 
@@ -698,13 +680,9 @@ python trend_agent.py
 
 ## 常见问题
 
-### Q: PDF生成失败？
+### Q: HTML报告打开后没有交互图表？
 
-A: 检查是否安装 `pandoc` 和 `xelatex`:
-```bash
-pandoc --version
-xelatex --version
-```
+A: 检查浏览器是否禁用了页面脚本，或确认生成的 `report_*.html` 文件没有被截断。
 
 ### Q: Zhipu搜索报错？
 
