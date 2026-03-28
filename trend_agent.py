@@ -909,27 +909,184 @@ def run_python(code: str, context: Dict) -> str:
     return output or "ok"
 
 
-def run_duckdb_sql(sql: str, context: Dict[str, pd.DataFrame]) -> str:
+DUCKDB_REPO_TABLE_SPECS: Dict[str, Dict[str, Any]] = {
+    "stock_basic": {
+        "path_parts": ("stock_basic", "stock_basic.parquet"),
+        "columns": ["ts_code", "symbol", "name", "area", "industry", "list_date", "market", "exchange"],
+        "sql": "CREATE VIEW stock_basic AS SELECT * FROM parquet_scan(?)",
+    },
+    "stock_company": {
+        "path_parts": ("stock_company", "stock_company.parquet"),
+        "columns": [
+            "ts_code", "chairman", "manager", "secretary", "reg_capital", "setup_date", "province",
+            "city", "introduction", "website", "employees", "main_business", "business_scope",
+        ],
+        "sql": "CREATE VIEW stock_company AS SELECT * FROM parquet_scan(?)",
+    },
+    "stock_ticks": {
+        "path_parts": ("stock_ticks", "*.parquet"),
+        "columns": [
+            "ts_code", "trade_date", "open", "high", "low", "close", "pre_close", "change", "pct_chg",
+            "vol", "amount", "turnover_rate", "volume_ratio", "pe", "pe_ttm", "pb", "ps", "ps_ttm",
+            "dv_ratio", "dv_ttm", "total_share", "float_share", "free_share", "total_mv", "circ_mv",
+        ],
+        "sql": "CREATE VIEW stock_ticks AS SELECT * FROM parquet_scan(?)",
+    },
+    "stock_basic_daily": {
+        "path_parts": ("stock_ticks", "*.parquet"),
+        "columns": ["ts_code", "date", "open", "high", "low", "close", "volume", "turnover_rate", "amount", "pe", "pb", "total_mv", "circ_mv"],
+        "sql": (
+            "CREATE VIEW stock_basic_daily AS "
+            "SELECT ts_code, trade_date AS date, open, high, low, close, vol AS volume, "
+            "turnover_rate, amount, pe, pb, total_mv, circ_mv "
+            "FROM parquet_scan(?)"
+        ),
+    },
+    "top_list": {
+        "path_parts": ("top_list", "*.parquet"),
+        "columns": [
+            "trade_date", "ts_code", "name", "close", "pct_change", "turnover_rate", "amount",
+            "l_sell", "l_buy", "l_amount", "net_amount", "net_rate", "amount_rate", "float_values", "reason",
+        ],
+        "sql": "CREATE VIEW top_list AS SELECT * FROM parquet_scan(?)",
+    },
+    "top_inst": {
+        "path_parts": ("top_inst", "*.parquet"),
+        "columns": ["trade_date", "ts_code", "exalter", "buy", "buy_rate", "sell", "sell_rate", "net_buy", "side", "reason"],
+        "sql": "CREATE VIEW top_inst AS SELECT * FROM parquet_scan(?)",
+    },
+}
+
+
+def _duckdb_repo_table_path(spec: Dict[str, Any]) -> Path:
+    return DATA_ROOT.joinpath(*spec["path_parts"])
+
+
+def _context_table_columns(value: Any) -> List[str]:
+    if isinstance(value, pd.DataFrame):
+        return [str(col) for col in value.columns]
+    if isinstance(value, dict):
+        return [str(key) for key in value.keys()]
+    if isinstance(value, pd.Series):
+        return [str(key) for key in value.index]
+    return []
+
+
+def _coerce_context_relation(value: Any) -> Optional[pd.DataFrame]:
+    if isinstance(value, pd.DataFrame):
+        return value
+    if isinstance(value, pd.Series):
+        return value.to_frame().T
+    if isinstance(value, dict):
+        return pd.DataFrame([value])
+    return None
+
+
+def _is_read_only_duckdb_sql(sql: str) -> bool:
+    stripped = (sql or "").strip()
+    if not stripped:
+        return False
+    if ";" in stripped.rstrip(";"):
+        return False
+    forbidden = re.compile(
+        r"\b(insert|update|delete|merge|create|replace|alter|drop|copy|attach|detach|truncate|grant|revoke|call|export|import|use|set|install|load)\b",
+        flags=re.IGNORECASE,
+    )
+    if forbidden.search(stripped):
+        return False
+    return bool(re.match(r"^\s*(select|with|show|describe|desc|explain|pragma)\b", stripped, flags=re.IGNORECASE))
+
+
+def _register_repo_duckdb_tables(con: duckdb.DuckDBPyConnection) -> List[str]:
+    available: List[str] = []
+    for table_name, spec in DUCKDB_REPO_TABLE_SPECS.items():
+        path = _duckdb_repo_table_path(spec)
+        if "*" in path.as_posix():
+            if not list(path.parent.glob(path.name)):
+                continue
+        elif not path.exists():
+                continue
+        try:
+            path_sql = path.as_posix().replace("'", "''")
+            con.execute(spec["sql"].replace("?", f"'{path_sql}'"))
+            available.append(table_name)
+        except Exception as exc:
+            logger.warning(f"Failed to register DuckDB repo table {table_name}: {exc}")
+    return available
+
+
+def _build_duckdb_schema_prompt(context: Dict[str, Any]) -> str:
+    lines = [
+        "DuckDB tool is read-only.",
+        "Allowed SQL: SELECT, WITH, SHOW, DESCRIBE, EXPLAIN, PRAGMA.",
+        "Do not use INSERT/UPDATE/DELETE/CREATE/ALTER/DROP/COPY or multiple statements.",
+        "Available DuckDB tables and columns:",
+    ]
+    for name, value in context.items():
+        columns = _context_table_columns(value)
+        if columns:
+            lines.append(f"- {name}({', '.join(columns)})")
+    for name, spec in DUCKDB_REPO_TABLE_SPECS.items():
+        path = _duckdb_repo_table_path(spec)
+        exists = bool(list(path.parent.glob(path.name))) if "*" in path.as_posix() else path.exists()
+        if exists:
+            lines.append(f"- {name}({', '.join(spec['columns'])})")
+    lines.append("Use stock_basic_daily for daily price queries with columns date/open/high/low/close/volume/turnover_rate.")
+    lines.append("Use stock_ticks if you need raw trade_date/vol fields.")
+    return "\n".join(lines)
+
+
+def run_duckdb_sql(sql: str, context: Dict[str, Any]) -> str:
     """
     Execute DuckDB SQL query on registered DataFrames.
 
     Args:
         sql: SQL query to execute
-        context: Dictionary of DataFrame names to DataFrames
+        context: Dictionary of SQL-registerable objects plus auxiliary values
 
     Returns:
         Query results as markdown table or error message
     """
+    stripped_sql = (sql or "").strip()
+    if not _is_read_only_duckdb_sql(stripped_sql):
+        return "duckdb_error: only read-only SELECT/WITH/SHOW/DESCRIBE/EXPLAIN/PRAGMA queries are allowed"
+
     con = duckdb.connect()
-    for name, df in context.items():
-        con.register(name, df)
+    registered_names: List[str] = []
+    for name, value in context.items():
+        relation = _coerce_context_relation(value)
+        if relation is not None:
+            con.register(name, relation)
+            registered_names.append(name)
+    registered_names.extend(_register_repo_duckdb_tables(con))
 
     try:
-        df = con.execute(sql).df()
-        return df.head(20).to_markdown(index=False)
+        df = con.execute(stripped_sql).df()
+        head = df.head(20)
+        try:
+            return head.to_markdown(index=False)
+        except Exception:
+            return head.to_string(index=False)
     except Exception as exc:
         logger.warning(f"DuckDB query failed: {exc}")
+        if registered_names:
+            return f"duckdb_error: {exc} | available_tables={', '.join(sorted(registered_names))}"
         return f"duckdb_error: {exc}"
+
+
+def _execute_agent_tool(tool: str, tool_input: str, tool_context: Dict[str, Any]) -> str:
+    """Execute an LLM-requested tool and always return a string result."""
+    try:
+        if tool == "web_search":
+            return run_search(tool_input)
+        if tool == "duckdb":
+            return run_duckdb_sql(tool_input, tool_context)
+        if tool == "python":
+            return run_python(tool_input, tool_context)
+        return f"tool_error: unknown_tool '{tool}'"
+    except Exception as exc:
+        logger.warning(f"Agentic tool execution failed: tool={tool} error={exc}")
+        return f"tool_error: {tool} failed with {type(exc).__name__}: {exc}"
 
 
 def init_llm():
@@ -2834,11 +2991,12 @@ _MARKET_OVERVIEW_SYSTEM_PROMPT = (
     "要求：对confirmed主题必须写出龙虎榜/资金验证；引用真实URL；数组为空时返回空数组。"
 )
 
-_STOCK_SECTION_SYSTEM_PROMPT = (
+_STOCK_SECTION_SYSTEM_PROMPT_TEMPLATE = (
     "你是资深A股投研分析师，遵循\"重势、通过滤、待时机\"理念。\n"
     "只返回严格JSON，不要Markdown，不要代码块。\n"
     "如需补充信息，可先返回工具调用："
     "{\"tool\":\"web_search|duckdb|python\",\"input\":\"...\"}\n"
+    "__DUCKDB_SCHEMA__\n"
     "最终输出格式："
     "{\"stock\":{\"ts_code\":\"000001.SZ\",\"name\":\"示例\","
     "\"recommendation\":\"strong_buy|buy|watch|avoid\",\"summary\":\"一句话摘要\","
@@ -2852,6 +3010,13 @@ _STOCK_SECTION_SYSTEM_PROMPT = (
     "\"source_urls\":[\"https://...\"],\"research_depth\":\"standard|deep\"}}\n"
     "要求：真实URL；机会先于风险；突出箱体上沿、温和放量、均线收敛与资金验证。"
 )
+
+
+def _build_stock_section_system_prompt(tool_context: Dict[str, Any]) -> str:
+    return _STOCK_SECTION_SYSTEM_PROMPT_TEMPLATE.replace(
+        "__DUCKDB_SCHEMA__",
+        _build_duckdb_schema_prompt(tool_context),
+    )
 
 
 def _normalize_validation_status(value: Any) -> str:
@@ -3160,16 +3325,16 @@ def _generate_stock_section(
     """Generate one structured stock section via DeepSeek with tool loop."""
     ts_code = ctx["ts_code"]
     name = ctx["name"]
-    messages = [
-        {"role": "system", "content": _STOCK_SECTION_SYSTEM_PROMPT},
-        {"role": "user", "content": json.dumps(ctx, ensure_ascii=False, default=str)},
-    ]
-    trace_append(trace_path, "stock_section_request", {"ts_code": ts_code, "name": name})
     tool_context = {
         "candidates_df": candidates_df,
         "signals": ctx.get("signals", {}),
         "stock_data": ctx.get("stock_data", {}),
     }
+    messages = [
+        {"role": "system", "content": _build_stock_section_system_prompt(tool_context)},
+        {"role": "user", "content": json.dumps(ctx, ensure_ascii=False, default=str)},
+    ]
+    trace_append(trace_path, "stock_section_request", {"ts_code": ts_code, "name": name})
     for _ in range(5):
         content = deepseek_chat(messages) if deepseek_chat else None
         if not content:
@@ -3178,16 +3343,22 @@ def _generate_stock_section(
         parsed = safe_json_loads(content)
         tool = parsed.get("tool") if isinstance(parsed, dict) else None
         if tool:
-            if tool == "web_search":
-                result = run_search(parsed.get("input", ""))
-            elif tool == "duckdb":
-                result = run_duckdb_sql(parsed.get("input", ""), tool_context)
-            elif tool == "python":
-                result = run_python(parsed.get("input", ""), tool_context)
-            else:
-                result = "unknown_tool"
-            trace_append(trace_path, "stock_tool_result", {"ts_code": ts_code, "tool": tool})
-            messages.append({"role": "user", "content": f"TOOL_RESULT:\n{result}"})
+            result = _execute_agent_tool(tool, parsed.get("input", ""), tool_context)
+            trace_append(
+                trace_path,
+                "stock_tool_result",
+                {"ts_code": ts_code, "tool": tool, "result": truncate(result, 4000)},
+            )
+            messages.append(
+                {
+                    "role": "user",
+                    "content": (
+                        f"TOOL_RESULT:\n{result}\n\n"
+                        "如果工具报错，请修正查询或换用可用表/字段后继续；"
+                        "如果信息已经足够，请直接返回最终JSON。"
+                    ),
+                }
+            )
             continue
         payload = None
         if isinstance(parsed, dict):

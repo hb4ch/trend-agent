@@ -545,6 +545,490 @@ def test_phase5_report_with_deepseek_writes_html_and_md(monkeypatch, tmp_path):
     assert "# 测试研报" in artifacts.markdown_debug_path.read_text(encoding="utf-8")
 
 
+def test_run_duckdb_sql_ignores_non_dataframe_context():
+    context = {
+        "candidates_df": pd.DataFrame([{"ts_code": "000001.SZ", "score": 1.23}]),
+        "signals": {"000001.SZ": {"ready_to_break": True}},
+    }
+    result = trend_agent.run_duckdb_sql("SELECT ts_code, score FROM candidates_df", context)
+    assert "000001.SZ" in result
+    assert "score" in result
+
+
+def test_run_duckdb_sql_returns_error_for_unknown_table():
+    context = {
+        "candidates_df": pd.DataFrame([{"ts_code": "000001.SZ", "score": 1.23}]),
+        "signals": {"000001.SZ": {"ready_to_break": True}},
+    }
+    result = trend_agent.run_duckdb_sql("SELECT * FROM table_that_does_not_exist", context)
+    assert result.startswith("duckdb_error:")
+    assert "available_tables=" in result
+
+
+def test_run_duckdb_sql_returns_error_for_invalid_sql():
+    context = {
+        "candidates_df": pd.DataFrame([{"ts_code": "000001.SZ", "score": 1.23}]),
+    }
+    result = trend_agent.run_duckdb_sql("SELECT FROM candidates_df", context)
+    assert result.startswith("duckdb_error:")
+    assert "available_tables=candidates_df" in result
+
+
+def test_run_duckdb_sql_rejects_write_queries():
+    context = {
+        "candidates_df": pd.DataFrame([{"ts_code": "000001.SZ", "score": 1.23}]),
+    }
+    result = trend_agent.run_duckdb_sql("DROP TABLE candidates_df", context)
+    assert result == "duckdb_error: only read-only SELECT/WITH/SHOW/DESCRIBE/EXPLAIN/PRAGMA queries are allowed"
+
+
+def test_build_duckdb_schema_prompt_lists_real_tables():
+    prompt = trend_agent._build_duckdb_schema_prompt(
+        {
+            "candidates_df": pd.DataFrame([{"ts_code": "000001.SZ", "name": "测试股"}]),
+            "signals": {"ready_to_break": True, "turnover_mult": 1.5},
+            "stock_data": {"ts_code": "000001.SZ", "name": "测试股"},
+        }
+    )
+    assert "candidates_df(ts_code, name)" in prompt
+    assert "signals(ready_to_break, turnover_mult)" in prompt
+    assert "stock_data(ts_code, name)" in prompt
+    assert "stock_basic(" in prompt
+    assert "stock_company(" in prompt
+    assert "stock_ticks(" in prompt
+    assert "stock_basic_daily(" in prompt
+    assert "top_list(" in prompt
+    assert "top_inst(" in prompt
+
+
+def test_run_duckdb_sql_stock_basic_daily_query_works_under_context(monkeypatch, tmp_path):
+    monkeypatch.setattr(trend_agent, "DATA_ROOT", tmp_path / "data")
+    data_root = tmp_path / "data"
+    (data_root / "stock_ticks").mkdir(parents=True)
+    trend_agent.duckdb.execute(
+        f"""
+        COPY (
+            SELECT
+                '000731.SZ' AS ts_code,
+                '2026-02-03' AS trade_date,
+                10.0 AS open,
+                10.5 AS high,
+                9.8 AS low,
+                10.2 AS close,
+                9.9 AS pre_close,
+                0.3 AS change,
+                3.0 AS pct_chg,
+                123456.0 AS vol,
+                999999.0 AS amount,
+                4.2 AS turnover_rate,
+                1.1 AS volume_ratio,
+                15.0 AS pe,
+                14.5 AS pe_ttm,
+                2.1 AS pb,
+                3.2 AS ps,
+                3.1 AS ps_ttm,
+                0.0 AS dv_ratio,
+                0.0 AS dv_ttm,
+                1000000.0 AS total_share,
+                800000.0 AS float_share,
+                700000.0 AS free_share,
+                500000000.0 AS total_mv,
+                400000000.0 AS circ_mv
+        ) TO '{(data_root / "stock_ticks" / "000731.SZ.parquet").as_posix()}' (FORMAT PARQUET)
+        """
+    )
+    sql = (
+        "SELECT date, open, high, low, close, volume, turnover_rate "
+        "FROM stock_basic_daily WHERE ts_code = '000731.SZ' "
+        "AND date >= '2026-02-01' ORDER BY date DESC LIMIT 30"
+    )
+    result = trend_agent.run_duckdb_sql(sql, {"candidates_df": pd.DataFrame([{"ts_code": "000731.SZ"}])})
+    assert "2026-02-03" in result
+    assert "123456" in result
+    assert "turnover_rate" in result
+
+
+def test_build_stock_section_system_prompt_includes_duckdb_schema():
+    prompt = trend_agent._build_stock_section_system_prompt(
+        {
+            "candidates_df": pd.DataFrame([{"ts_code": "000001.SZ", "name": "测试股"}]),
+            "signals": {"ready_to_break": True},
+            "stock_data": {"ts_code": "000001.SZ", "name": "测试股"},
+        }
+    )
+    assert "DuckDB tool is read-only." in prompt
+    assert "stock_basic_daily" in prompt
+    assert "Use stock_basic_daily for daily price queries" in prompt
+    assert "candidates_df(ts_code, name)" in prompt
+
+
+def test_execute_agent_tool_catches_duckdb_exception(monkeypatch):
+    monkeypatch.setattr(trend_agent, "run_duckdb_sql", lambda sql, context: (_ for _ in ()).throw(RuntimeError("bad duckdb")))
+    result = trend_agent._execute_agent_tool("duckdb", "select 1", {"candidates_df": pd.DataFrame()})
+    assert result == "tool_error: duckdb failed with RuntimeError: bad duckdb"
+
+
+def test_execute_agent_tool_runs_web_search(monkeypatch):
+    monkeypatch.setattr(trend_agent, "run_search", lambda query: f"search_result: {query}")
+    result = trend_agent._execute_agent_tool("web_search", "AI应用 最新进展", {})
+    assert result == "search_result: AI应用 最新进展"
+
+
+def test_execute_agent_tool_catches_web_search_exception(monkeypatch):
+    monkeypatch.setattr(trend_agent, "run_search", lambda query: (_ for _ in ()).throw(RuntimeError("search down")))
+    result = trend_agent._execute_agent_tool("web_search", "AI应用 最新进展", {})
+    assert result == "tool_error: web_search failed with RuntimeError: search down"
+
+
+def test_execute_agent_tool_runs_python(monkeypatch):
+    monkeypatch.setattr(trend_agent, "run_python", lambda code, context: "python_result: ok")
+    result = trend_agent._execute_agent_tool("python", "result = 1", {"stock_data": {"ts_code": "000001.SZ"}})
+    assert result == "python_result: ok"
+
+
+def test_execute_agent_tool_catches_python_exception(monkeypatch):
+    monkeypatch.setattr(trend_agent, "run_python", lambda code, context: (_ for _ in ()).throw(ValueError("bad python")))
+    result = trend_agent._execute_agent_tool("python", "result = 1", {})
+    assert result == "tool_error: python failed with ValueError: bad python"
+
+
+def test_execute_agent_tool_reports_unknown_tool():
+    result = trend_agent._execute_agent_tool("shell", "echo 1", {})
+    assert result == "tool_error: unknown_tool 'shell'"
+
+
+def test_generate_stock_section_retries_after_duckdb_error(monkeypatch, tmp_path):
+    calls = {"n": 0}
+    seen_tool_feedback = {"value": ""}
+
+    def fake_deepseek_chat(messages):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return json.dumps({"tool": "duckdb", "input": "SELECT * FROM stock_basic_daily"}, ensure_ascii=False)
+        seen_tool_feedback["value"] = messages[-1]["content"]
+        return json.dumps(
+            {
+                "stock": {
+                    "ts_code": "000001.SZ",
+                    "name": "测试股",
+                    "recommendation": "buy",
+                    "summary": "修正查询后完成分析",
+                    "investment_logic": ["逻辑A"],
+                    "technical_analysis": ["技术A"],
+                    "capital_validation": ["资金A"],
+                    "trade_plan": ["计划A"],
+                    "risks": ["风险A"],
+                    "source_urls": ["https://example.com/report"],
+                    "research_depth": "standard",
+                }
+            },
+            ensure_ascii=False,
+        )
+
+    monkeypatch.setattr(trend_agent, "deepseek_chat", fake_deepseek_chat)
+    monkeypatch.setattr(
+        trend_agent,
+        "run_duckdb_sql",
+        lambda sql, context: "duckdb_error: Table with name stock_basic_daily does not exist | available_tables=candidates_df",
+    )
+
+    ctx = {
+        "ts_code": "000001.SZ",
+        "name": "测试股",
+        "stock_data": {"ts_code": "000001.SZ", "name": "测试股"},
+        "signals": {"ready_to_break": True},
+        "audits": [],
+        "chart_notes": [],
+    }
+    row = {"ts_code": "000001.SZ", "name": "测试股", "matched_themes": ["AI应用"]}
+    section = trend_agent._generate_stock_section(
+        ctx,
+        tmp_path / "trace.jsonl",
+        pd.DataFrame([{"ts_code": "000001.SZ", "name": "测试股"}]),
+        row,
+        [],
+        None,
+    )
+    assert section.summary == "修正查询后完成分析"
+    assert "TOOL_RESULT:" in seen_tool_feedback["value"]
+    assert "duckdb_error:" in seen_tool_feedback["value"]
+    assert "available_tables=candidates_df" in seen_tool_feedback["value"]
+
+
+def test_generate_stock_section_retries_after_web_search_result(monkeypatch, tmp_path):
+    calls = {"n": 0}
+    seen_tool_feedback = {"value": ""}
+
+    def fake_deepseek_chat(messages):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return json.dumps({"tool": "web_search", "input": "川润股份 AI应用 最新进展"}, ensure_ascii=False)
+        seen_tool_feedback["value"] = messages[-1]["content"]
+        return json.dumps(
+            {
+                "stock": {
+                    "ts_code": "000001.SZ",
+                    "name": "测试股",
+                    "recommendation": "buy",
+                    "summary": "结合搜索结果完成分析",
+                    "investment_logic": ["逻辑A"],
+                    "technical_analysis": ["技术A"],
+                    "capital_validation": ["资金A"],
+                    "trade_plan": ["计划A"],
+                    "risks": ["风险A"],
+                    "source_urls": ["https://example.com/report"],
+                    "research_depth": "standard",
+                }
+            },
+            ensure_ascii=False,
+        )
+
+    monkeypatch.setattr(trend_agent, "deepseek_chat", fake_deepseek_chat)
+    monkeypatch.setattr(trend_agent, "run_search", lambda query: f"search_result: {query}")
+
+    ctx = {
+        "ts_code": "000001.SZ",
+        "name": "测试股",
+        "stock_data": {"ts_code": "000001.SZ", "name": "测试股"},
+        "signals": {"ready_to_break": True},
+        "audits": [],
+        "chart_notes": [],
+    }
+    row = {"ts_code": "000001.SZ", "name": "测试股", "matched_themes": ["AI应用"]}
+    section = trend_agent._generate_stock_section(
+        ctx,
+        tmp_path / "trace.jsonl",
+        pd.DataFrame([{"ts_code": "000001.SZ", "name": "测试股"}]),
+        row,
+        [],
+        None,
+    )
+    assert section.summary == "结合搜索结果完成分析"
+    assert "TOOL_RESULT:" in seen_tool_feedback["value"]
+    assert "search_result: 川润股份 AI应用 最新进展" in seen_tool_feedback["value"]
+
+
+def test_generate_stock_section_retries_after_python_result(monkeypatch, tmp_path):
+    calls = {"n": 0}
+    seen_tool_feedback = {"value": ""}
+
+    def fake_deepseek_chat(messages):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return json.dumps({"tool": "python", "input": "result = context['signals'].get('ready_to_break', False)"}, ensure_ascii=False)
+        seen_tool_feedback["value"] = messages[-1]["content"]
+        return json.dumps(
+            {
+                "stock": {
+                    "ts_code": "000001.SZ",
+                    "name": "测试股",
+                    "recommendation": "watch",
+                    "summary": "结合Python结果完成分析",
+                    "investment_logic": ["逻辑B"],
+                    "technical_analysis": ["技术B"],
+                    "capital_validation": ["资金B"],
+                    "trade_plan": ["计划B"],
+                    "risks": ["风险B"],
+                    "source_urls": [],
+                    "research_depth": "standard",
+                }
+            },
+            ensure_ascii=False,
+        )
+
+    monkeypatch.setattr(trend_agent, "deepseek_chat", fake_deepseek_chat)
+    monkeypatch.setattr(trend_agent, "run_python", lambda code, context: "result: True")
+
+    ctx = {
+        "ts_code": "000001.SZ",
+        "name": "测试股",
+        "stock_data": {"ts_code": "000001.SZ", "name": "测试股"},
+        "signals": {"ready_to_break": True},
+        "audits": [],
+        "chart_notes": [],
+    }
+    row = {"ts_code": "000001.SZ", "name": "测试股", "matched_themes": []}
+    section = trend_agent._generate_stock_section(
+        ctx,
+        tmp_path / "trace.jsonl",
+        pd.DataFrame([{"ts_code": "000001.SZ", "name": "测试股"}]),
+        row,
+        [],
+        None,
+    )
+    assert section.summary == "结合Python结果完成分析"
+    assert "TOOL_RESULT:" in seen_tool_feedback["value"]
+    assert "result: True" in seen_tool_feedback["value"]
+
+
+def test_generate_stock_section_retries_after_web_search_exception(monkeypatch, tmp_path):
+    calls = {"n": 0}
+    seen_tool_feedback = {"value": ""}
+
+    def fake_deepseek_chat(messages):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return json.dumps({"tool": "web_search", "input": "测试股 新闻"}, ensure_ascii=False)
+        seen_tool_feedback["value"] = messages[-1]["content"]
+        return json.dumps(
+            {
+                "stock": {
+                    "ts_code": "000001.SZ",
+                    "name": "测试股",
+                    "recommendation": "watch",
+                    "summary": "搜索异常后仍完成分析",
+                    "investment_logic": ["逻辑C"],
+                    "technical_analysis": ["技术C"],
+                    "capital_validation": ["资金C"],
+                    "trade_plan": ["计划C"],
+                    "risks": ["风险C"],
+                    "source_urls": [],
+                    "research_depth": "standard",
+                }
+            },
+            ensure_ascii=False,
+        )
+
+    monkeypatch.setattr(trend_agent, "deepseek_chat", fake_deepseek_chat)
+    monkeypatch.setattr(
+        trend_agent,
+        "_execute_agent_tool",
+        lambda tool, tool_input, tool_context: "tool_error: web_search failed with RuntimeError: search timeout",
+    )
+
+    ctx = {
+        "ts_code": "000001.SZ",
+        "name": "测试股",
+        "stock_data": {"ts_code": "000001.SZ", "name": "测试股"},
+        "signals": {"ready_to_break": False},
+        "audits": [],
+        "chart_notes": [],
+    }
+    row = {"ts_code": "000001.SZ", "name": "测试股", "matched_themes": []}
+    section = trend_agent._generate_stock_section(
+        ctx,
+        tmp_path / "trace.jsonl",
+        pd.DataFrame([{"ts_code": "000001.SZ", "name": "测试股"}]),
+        row,
+        [],
+        None,
+    )
+    assert section.summary == "搜索异常后仍完成分析"
+    assert "tool_error: web_search failed with RuntimeError: search timeout" in seen_tool_feedback["value"]
+
+
+def test_generate_stock_section_retries_after_python_exception(monkeypatch, tmp_path):
+    calls = {"n": 0}
+    seen_tool_feedback = {"value": ""}
+
+    def fake_deepseek_chat(messages):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return json.dumps({"tool": "python", "input": "raise Exception('boom')"}, ensure_ascii=False)
+        seen_tool_feedback["value"] = messages[-1]["content"]
+        return json.dumps(
+            {
+                "stock": {
+                    "ts_code": "000001.SZ",
+                    "name": "测试股",
+                    "recommendation": "watch",
+                    "summary": "Python异常后仍完成分析",
+                    "investment_logic": ["逻辑D"],
+                    "technical_analysis": ["技术D"],
+                    "capital_validation": ["资金D"],
+                    "trade_plan": ["计划D"],
+                    "risks": ["风险D"],
+                    "source_urls": [],
+                    "research_depth": "standard",
+                }
+            },
+            ensure_ascii=False,
+        )
+
+    monkeypatch.setattr(trend_agent, "deepseek_chat", fake_deepseek_chat)
+    monkeypatch.setattr(
+        trend_agent,
+        "_execute_agent_tool",
+        lambda tool, tool_input, tool_context: "tool_error: python failed with ValueError: bad python",
+    )
+
+    ctx = {
+        "ts_code": "000001.SZ",
+        "name": "测试股",
+        "stock_data": {"ts_code": "000001.SZ", "name": "测试股"},
+        "signals": {"ready_to_break": False},
+        "audits": [],
+        "chart_notes": [],
+    }
+    row = {"ts_code": "000001.SZ", "name": "测试股", "matched_themes": []}
+    section = trend_agent._generate_stock_section(
+        ctx,
+        tmp_path / "trace.jsonl",
+        pd.DataFrame([{"ts_code": "000001.SZ", "name": "测试股"}]),
+        row,
+        [],
+        None,
+    )
+    assert section.summary == "Python异常后仍完成分析"
+    assert "tool_error: python failed with ValueError: bad python" in seen_tool_feedback["value"]
+
+
+def test_generate_stock_section_does_not_crash_on_tool_exception(monkeypatch, tmp_path):
+    calls = {"n": 0}
+    seen_tool_feedback = {"value": ""}
+
+    def fake_deepseek_chat(messages):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return json.dumps({"tool": "duckdb", "input": "SELECT * FROM candidates_df"}, ensure_ascii=False)
+        seen_tool_feedback["value"] = messages[-1]["content"]
+        return json.dumps(
+            {
+                "stock": {
+                    "ts_code": "000001.SZ",
+                    "name": "测试股",
+                    "recommendation": "watch",
+                    "summary": "工具异常后仍成功回退",
+                    "investment_logic": ["逻辑B"],
+                    "technical_analysis": ["技术B"],
+                    "capital_validation": ["资金B"],
+                    "trade_plan": ["计划B"],
+                    "risks": ["风险B"],
+                    "source_urls": [],
+                    "research_depth": "standard",
+                }
+            },
+            ensure_ascii=False,
+        )
+
+    monkeypatch.setattr(trend_agent, "deepseek_chat", fake_deepseek_chat)
+    monkeypatch.setattr(
+        trend_agent,
+        "_execute_agent_tool",
+        lambda tool, tool_input, tool_context: "tool_error: duckdb failed with RuntimeError: boom",
+    )
+
+    ctx = {
+        "ts_code": "000001.SZ",
+        "name": "测试股",
+        "stock_data": {"ts_code": "000001.SZ", "name": "测试股"},
+        "signals": {"ready_to_break": False},
+        "audits": [],
+        "chart_notes": [],
+    }
+    row = {"ts_code": "000001.SZ", "name": "测试股", "matched_themes": []}
+    section = trend_agent._generate_stock_section(
+        ctx,
+        tmp_path / "trace.jsonl",
+        pd.DataFrame([{"ts_code": "000001.SZ", "name": "测试股"}]),
+        row,
+        [],
+        None,
+    )
+    assert section.summary == "工具异常后仍成功回退"
+    assert "tool_error: duckdb failed with RuntimeError: boom" in seen_tool_feedback["value"]
+
+
 def test_qwen_match_guard_blocks_scope_only_false_positive(monkeypatch, tmp_path):
     def fake_invoke(provider, messages, temperature=0.1):
         payload = json.loads(messages[-1]["content"])
