@@ -203,10 +203,10 @@ ORDER BY composite_score DESC
 }
 ```
 
-**缓存优化**:
-- 基于 `[name, industry, main_business, business_scope, introduction]` 生成指纹
-- 缓存结果避免重复LLM调用
-- 批处理: 每批8只股票
+**执行优化**:
+- 每次基于当前主题集重新执行匹配，避免旧主题结果污染当前筛选
+- 批处理: 每批8只股票（可通过运行时配置调整）
+- 通过请求间隔与重试控制应对本地/远端模型限流
 
 ---
 
@@ -564,7 +564,6 @@ TOPLIST_CROWDED_MIN_HITS=4
 HARD_FAIL_REQUIRE_RECENCY=1
 HARD_FAIL_MAX_AGE_DAYS=730
 HARD_FAIL_REDUCE_MATERIALITY_THRESHOLD=0.03
-THEME_CACHE_VERSION=2
 THEME_MATCH_POLICY=conservative
 MAX_NAMES_PER_THEME=4
 MAX_NAMES_PER_INDUSTRY=4

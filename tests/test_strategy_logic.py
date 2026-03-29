@@ -12,7 +12,7 @@ from trend_agent import (
 )
 
 
-def test_theme_cache_invalidation_by_theme_set(monkeypatch, tmp_path):
+def test_theme_matches_reflect_current_theme_set(monkeypatch, tmp_path):
     call_count = {"n": 0}
 
     def fake_invoke(provider, messages, temperature=0.1):
@@ -36,19 +36,13 @@ def test_theme_cache_invalidation_by_theme_set(monkeypatch, tmp_path):
             }
         ]
     )
-    cache_path = tmp_path / "qwen_cache.json"
-
     out_a = trend_agent.qwen_match_themes(
         themes=[ThemeItem(name="主题A", keywords=["a"], summary="", sources=[])],
         candidates=candidates,
-        cache_path=cache_path,
-        cache_version="2",
     )
     out_b = trend_agent.qwen_match_themes(
         themes=[ThemeItem(name="主题B", keywords=["b"], summary="", sources=[])],
         candidates=candidates,
-        cache_path=cache_path,
-        cache_version="2",
     )
 
     assert out_a.iloc[0]["matched_themes"] == ["主题A"]
@@ -182,7 +176,7 @@ def test_phase2_off_theme_fallback_mixed_labels(monkeypatch):
         ),
     )
 
-    def fake_match(themes, candidates, cache_path, cache_version="2", config=None):
+    def fake_match(themes, candidates, config=None, relaxed_validation=False, named_stock_codes=None):
         out = candidates.copy()
         out["matched_themes"] = [[] for _ in range(len(out))]
         return out
@@ -239,7 +233,7 @@ def test_phase2_conservative_blocks_heuristic_false_positive(monkeypatch):
         ),
     )
 
-    def fake_match(themes, candidates, cache_path, cache_version="3", config=None):
+    def fake_match(themes, candidates, config=None, relaxed_validation=False, named_stock_codes=None):
         out = candidates.copy()
         out["matched_themes"] = [[] for _ in range(len(out))]
         return out
@@ -300,7 +294,7 @@ def test_phase2_conservative_no_qwen_match_returns_off_theme(monkeypatch):
         ),
     )
 
-    def fake_match(themes, candidates, cache_path, cache_version="3", config=None):
+    def fake_match(themes, candidates, config=None, relaxed_validation=False, named_stock_codes=None):
         out = candidates.copy()
         out["matched_themes"] = [[] for _ in range(len(out))]
         return out
@@ -1059,7 +1053,7 @@ def test_qwen_match_guard_blocks_scope_only_false_positive(monkeypatch, tmp_path
             sources=[],
         )
     ]
-    out = trend_agent.qwen_match_themes(themes, candidates, cache_path=tmp_path / "cache.json", cache_version="3")
+    out = trend_agent.qwen_match_themes(themes, candidates)
     assert out.iloc[0]["matched_themes"] == []
 
 
@@ -1093,7 +1087,7 @@ def test_qwen_match_guard_keeps_valid_chemical_match(monkeypatch, tmp_path):
             sources=[],
         )
     ]
-    out = trend_agent.qwen_match_themes(themes, candidates, cache_path=tmp_path / "cache.json", cache_version="3")
+    out = trend_agent.qwen_match_themes(themes, candidates)
     assert out.iloc[0]["matched_themes"] == ["化工与周期材料"]
 
 
@@ -1149,8 +1143,6 @@ def test_qwen_match_retries_then_succeeds(monkeypatch, tmp_path):
     out = trend_agent.qwen_match_themes(
         themes,
         candidates,
-        cache_path=tmp_path / "cache.json",
-        cache_version="3",
         config=cfg,
     )
     assert call_count["n"] == 3
@@ -1158,10 +1150,13 @@ def test_qwen_match_retries_then_succeeds(monkeypatch, tmp_path):
 
 
 def test_qwen_match_exhausted_rate_limit_degrades_to_empty(monkeypatch, tmp_path):
+    call_count = {"n": 0}
+
     def fake_sleep(_seconds):
         return None
 
     def fake_invoke(provider, messages, temperature=0.1):
+        call_count["n"] += 1
         raise DummyRateLimitError("TPM limit reached", retry_after="0")
 
     monkeypatch.setattr(trend_agent.time, "sleep", fake_sleep)
@@ -1186,17 +1181,13 @@ def test_qwen_match_exhausted_rate_limit_degrades_to_empty(monkeypatch, tmp_path
         qwen_rate_limit_max_delay_sec=0.05,
         qwen_request_interval_sec=0.0,
     )
-    cache_path = tmp_path / "cache.json"
     out = trend_agent.qwen_match_themes(
         themes,
         candidates,
-        cache_path=cache_path,
-        cache_version="3",
         config=cfg,
     )
+    assert call_count["n"] == 2
     assert out.iloc[0]["matched_themes"] == []
-    cache_payload = json.loads(cache_path.read_text(encoding="utf-8"))
-    assert any(v.get("note") == "rate_limited_exhausted" for v in cache_payload.values() if isinstance(v, dict))
 
 
 def test_qwen_match_respects_configured_batch_size(monkeypatch, tmp_path):
@@ -1229,8 +1220,6 @@ def test_qwen_match_respects_configured_batch_size(monkeypatch, tmp_path):
     out = trend_agent.qwen_match_themes(
         themes,
         candidates,
-        cache_path=tmp_path / "cache.json",
-        cache_version="3",
         config=cfg,
     )
     assert call_count["n"] == 3

@@ -16,10 +16,15 @@ import os
 import sys
 from pathlib import Path
 
+import pytest
+
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent))
 
 from llm_provider import get_deepseek_thinking_client, DeepSeekThinkingClient
+
+
+pytestmark = [pytest.mark.integration, pytest.mark.live_llm]
 
 # Test configuration
 THINKING_BUDGET = 2048  # 2K tokens for reasoning during tests
@@ -45,9 +50,7 @@ def test_1_basic_thinking_mode():
         max_tokens=500,
     )
 
-    if "error" in result:
-        print(f"❌ ERROR: {result['error']}")
-        return False
+    assert "error" not in result, result.get("error")
 
     print(f"\n📊 Token Usage:")
     if result["usage"]:
@@ -77,7 +80,7 @@ def test_1_basic_thinking_mode():
     print(f"  - Has content: {has_answer}")
     print(f"  - No tool calls (expected): {has_tool_calls}")
 
-    return success
+    assert success
 
 
 def test_2_multi_turn_conversation():
@@ -104,9 +107,7 @@ def test_2_multi_turn_conversation():
     print(f"Reasoning: {result1['reasoning_content'][:100]}...")
     print(f"Answer: {result1['content']}")
 
-    if "error" in result1:
-        print(f"❌ ERROR: {result1['error']}")
-        return False
+    assert "error" not in result1, result1.get("error")
 
     # Prepare for Turn 2 - IMPORTANT: Only pass content, not reasoning_content
     messages.append({
@@ -141,7 +142,7 @@ def test_2_multi_turn_conversation():
     print(f"  - Has content: {has_answer_2}")
     print(f"  - Answer is correct (360): {answer_correct}")
 
-    return has_reasoning_2 and has_answer_2 and answer_correct
+    assert has_reasoning_2 and has_answer_2 and answer_correct
 
 
 def test_3_thinking_with_tools():
@@ -207,7 +208,7 @@ def test_3_thinking_with_tools():
     print(f"  - Used date tool: {used_date_tool}")
     print(f"  - Used weather tool: {used_weather_tool}")
 
-    return has_trace and has_final_answer and no_error
+    assert has_trace and has_final_answer and no_error and used_date_tool and used_weather_tool
 
 
 def test_4_streaming_thinking_mode():
@@ -231,9 +232,7 @@ def test_4_streaming_thinking_mode():
         stream=True,
     )
 
-    if "error" in result:
-        print(f"❌ ERROR: {result['error']}")
-        return False
+    assert "error" not in result, result.get("error")
 
     print(f"\n📊 Token Usage:")
     if result["usage"]:
@@ -257,7 +256,7 @@ def test_4_streaming_thinking_mode():
     print(f"  - Has content: {has_answer}")
     print(f"  - Contains counting (1-5): {contains_counting}")
 
-    return has_reasoning and has_answer and contains_counting
+    assert has_reasoning and has_answer and contains_counting
 
 
 def test_5_clear_reasoning_from_messages():
@@ -297,7 +296,7 @@ def test_5_clear_reasoning_from_messages():
     print(f"  - No reasoning_content remains: {not has_any_reasoning}")
     print(f"  - All messages have content: {all_have_content}")
 
-    return not has_any_reasoning and all_have_content
+    assert not has_any_reasoning and all_have_content
 
 
 def run_all_tests():
@@ -319,8 +318,8 @@ def run_all_tests():
     results = []
     for name, test_func in tests:
         try:
-            passed = test_func()
-            results.append((name, passed))
+            test_func()
+            results.append((name, True))
         except Exception as e:
             print(f"\n❌ {name} raised exception: {e}")
             results.append((name, False))

@@ -1459,6 +1459,13 @@ def phase2_quant_filter(themes: List[ThemeItem], config: Optional[StrategyConfig
     if screen_df is None or screen_df.empty:
         logger.warning("No screening results from screen_all_stocks()")
         return pd.DataFrame()
+    theme_order_col = (
+        "momentum_score"
+        if "momentum_score" in screen_df.columns
+        else "composite_score"
+        if "composite_score" in screen_df.columns
+        else None
+    )
 
     if "ts_code" in screen_df.columns:
         screen_df = screen_df.copy()
@@ -1498,16 +1505,27 @@ def phase2_quant_filter(themes: List[ThemeItem], config: Optional[StrategyConfig
         logger.info(f"Found {len(named_codes)} stocks named in theme evidence")
 
         # A2: Minimal filter from screen_df — only volume_boost >= 0.5
-        con_a = duckdb.connect()
-        con_a.register("screen", screen_df)
-        theme_pool = con_a.execute("""
-            SELECT *
-            FROM screen
-            WHERE volume_boost >= 0.5
-            ORDER BY momentum_score DESC
-            LIMIT 100
-        """).df()
-        con_a.close()
+        if theme_order_col:
+            con_a = duckdb.connect()
+            try:
+                con_a.register("screen", screen_df)
+                theme_pool = con_a.execute(
+                    f"""
+                    SELECT *
+                    FROM screen
+                    WHERE volume_boost >= 0.5
+                    ORDER BY {theme_order_col} DESC
+                    LIMIT 100
+                    """
+                ).df()
+            finally:
+                con_a.close()
+        else:
+            logger.warning("Theme pool ranking columns missing; falling back to volume filter without explicit ordering")
+            if "volume_boost" in screen_df.columns:
+                theme_pool = screen_df[screen_df["volume_boost"] >= 0.5].head(100).copy()
+            else:
+                theme_pool = screen_df.head(100).copy()
 
         # Ensure named stocks are in the pool even if they didn't make top-100 momentum
         if named_codes:
@@ -1607,12 +1625,22 @@ def phase2_quant_filter(themes: List[ThemeItem], config: Optional[StrategyConfig
             tech_pool = tech_pool[~tech_pool["ts_code"].astype(str).isin(theme_codes)]
 
         tech_pool = normalize_match_columns(tech_pool)
+        if theme_list.empty:
+            heuristic_passes = {
+                "conservative": 0,
+                "balanced": 2,
+                "aggressive": 4,
+            }.get(config.theme_match_policy, 0)
+            heuristic_themes = expanded_themes or confirmed_themes or themes
+            for _ in range(heuristic_passes):
+                tech_pool = heuristic_match_themes(heuristic_themes, tech_pool)
+            tech_pool = normalize_match_columns(tech_pool)
         tech_pool["theme_strength_score"] = 0.0
         tech_pool["alpha_rank_score"] = tech_pool["composite_score"]
 
         tech_list = tech_pool.head(tech_budget).copy()
         tech_list["list_type"] = "technical"
-        tech_list["filter_tier"] = "technical"
+        tech_list["filter_tier"] = "OFF_THEME_FALLBACK" if theme_list.empty else "technical"
     else:
         tech_list = pd.DataFrame()
 
@@ -2371,15 +2399,28 @@ def phase3_deep_audit(
 
 def load_price_data(ts_code: str) -> pd.DataFrame:
     parquet_path = DATA_ROOT / "stock_ticks" / f"{ts_code}.parquet"
+    if not parquet_path.exists():
+        logger.warning(f"Price parquet not found for {ts_code}: {parquet_path}")
+        return pd.DataFrame()
+
     con = duckdb.connect()
-    df = con.execute(
-        """
-        SELECT trade_date, open, high, low, close, vol, turnover_rate
-        FROM parquet_scan(?)
-        ORDER BY trade_date
-        """,
-        [str(parquet_path)],
-    ).df()
+    try:
+        df = con.execute(
+            """
+            SELECT trade_date, open, high, low, close, vol, turnover_rate
+            FROM parquet_scan(?)
+            ORDER BY trade_date
+            """,
+            [str(parquet_path)],
+        ).df()
+    except Exception as exc:
+        logger.warning(f"Failed to load price data for {ts_code}: {exc}")
+        return pd.DataFrame()
+    finally:
+        con.close()
+
+    if df.empty:
+        return pd.DataFrame()
     df["trade_date"] = pd.to_datetime(df["trade_date"])
     df = df.set_index("trade_date")
     df = df.rename(columns={"vol": "volume"})

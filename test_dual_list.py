@@ -19,6 +19,7 @@ from pathlib import Path
 
 import pandas as pd
 import numpy as np
+import pytest
 
 sys.path.insert(0, str(Path(__file__).parent))
 
@@ -32,6 +33,9 @@ from trend_agent import (
     extract_theme_named_stocks,
     qwen_match_themes,
 )
+
+
+pytestmark = [pytest.mark.integration, pytest.mark.live_llm]
 
 
 def make_screen_df(stocks: list[dict]) -> pd.DataFrame:
