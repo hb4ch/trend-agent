@@ -94,6 +94,56 @@ def test_compute_signals_breakout_boundaries(monkeypatch):
     assert signals["D"]["ready_to_break"] is False
 
 
+def test_invoke_with_timeout_retries_retries_on_timeout(monkeypatch):
+    calls = {"n": 0}
+    sleeps = []
+
+    def flaky_call():
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise TimeoutError("simulated timeout")
+        return "ok"
+
+    monkeypatch.setattr(trend_agent.time, "sleep", lambda seconds: sleeps.append(seconds))
+    monkeypatch.setattr(trend_agent.random, "uniform", lambda a, b: 0.0)
+
+    out = trend_agent.invoke_with_timeout_retries(
+        flaky_call,
+        description="test call",
+        max_retries=3,
+        base_delay_sec=5.0,
+        max_delay_sec=90.0,
+    )
+
+    assert out == "ok"
+    assert calls["n"] == 3
+    assert sleeps == [5.0, 10.0]
+
+
+def test_invoke_with_timeout_retries_raises_after_exhaustion(monkeypatch):
+    sleeps = []
+
+    monkeypatch.setattr(trend_agent.time, "sleep", lambda seconds: sleeps.append(seconds))
+    monkeypatch.setattr(trend_agent.random, "uniform", lambda a, b: 0.0)
+
+    def always_times_out():
+        raise TimeoutError("simulated timeout")
+
+    try:
+        trend_agent.invoke_with_timeout_retries(
+            always_times_out,
+            description="test call",
+            max_retries=2,
+            base_delay_sec=5.0,
+            max_delay_sec=90.0,
+        )
+        assert False, "expected timeout to be raised"
+    except TimeoutError:
+        pass
+
+    assert sleeps == [5.0, 10.0]
+
+
 def test_hard_fail_requires_relevance_and_material_reduce():
     unrelated = {
         "title": "其他公司公告减持5%",
@@ -580,13 +630,15 @@ def test_build_duckdb_schema_prompt_lists_real_tables():
     prompt = trend_agent._build_duckdb_schema_prompt(
         {
             "candidates_df": pd.DataFrame([{"ts_code": "000001.SZ", "name": "测试股"}]),
-            "signals": {"ready_to_break": True, "turnover_mult": 1.5},
-            "stock_data": {"ts_code": "000001.SZ", "name": "测试股"},
+            "signal_row": {"ready_to_break": True, "turnover_mult": 1.5},
+            "stock_profile": {"ts_code": "000001.SZ", "name": "测试股"},
+            "audit_rows": [{"theme": "AI", "verdict": "warn", "confidence_score": 0.5}],
         }
     )
     assert "candidates_df(ts_code, name)" in prompt
-    assert "signals(ready_to_break, turnover_mult)" in prompt
-    assert "stock_data(ts_code, name)" in prompt
+    assert "signal_row(ready_to_break, turnover_mult)" in prompt
+    assert "stock_profile(ts_code, name)" in prompt
+    assert "audit_rows(theme, verdict, confidence_score)" in prompt
     assert "stock_basic(" in prompt
     assert "stock_company(" in prompt
     assert "stock_ticks(" in prompt
@@ -646,14 +698,136 @@ def test_build_stock_section_system_prompt_includes_duckdb_schema():
     prompt = trend_agent._build_stock_section_system_prompt(
         {
             "candidates_df": pd.DataFrame([{"ts_code": "000001.SZ", "name": "测试股"}]),
-            "signals": {"ready_to_break": True},
-            "stock_data": {"ts_code": "000001.SZ", "name": "测试股"},
+            "signal_row": {"ready_to_break": True},
+            "stock_profile": {"ts_code": "000001.SZ", "name": "测试股"},
         }
     )
     assert "DuckDB tool is read-only." in prompt
     assert "stock_basic_daily" in prompt
     assert "Use stock_basic_daily for daily price queries" in prompt
     assert "candidates_df(ts_code, name)" in prompt
+    assert "stock_profile(dict)" in prompt
+    assert "signal_row(dict)" in prompt
+    assert "优先顺序：1) 直接使用上下文；2) 用python做检查" in prompt
+
+
+def test_run_python_exposes_open_runtime_utilities(monkeypatch, tmp_path):
+    monkeypatch.setattr(trend_agent, "DATA_ROOT", tmp_path / "data")
+    data_root = tmp_path / "data"
+    (data_root / "stock_ticks").mkdir(parents=True)
+    trend_agent.duckdb.execute(
+        f"""
+        COPY (
+            SELECT
+                '000001.SZ' AS ts_code,
+                '2026-03-01' AS trade_date,
+                10.0 AS open,
+                10.5 AS high,
+                9.8 AS low,
+                10.2 AS close,
+                9.9 AS pre_close,
+                0.3 AS change,
+                3.0 AS pct_chg,
+                123456.0 AS vol,
+                999999.0 AS amount,
+                4.2 AS turnover_rate,
+                1.1 AS volume_ratio,
+                15.0 AS pe,
+                14.5 AS pe_ttm,
+                2.1 AS pb,
+                3.2 AS ps,
+                3.1 AS ps_ttm,
+                0.0 AS dv_ratio,
+                0.0 AS dv_ttm,
+                1000000.0 AS total_share,
+                800000.0 AS float_share,
+                700000.0 AS free_share,
+                500000000.0 AS total_mv,
+                400000000.0 AS circ_mv
+        ) TO '{(data_root / "stock_ticks" / "000001.SZ.parquet").as_posix()}' (FORMAT PARQUET)
+        """
+    )
+    context = {
+        "stock_profile": {"ts_code": "000001.SZ", "name": "测试股"},
+        "signal_row": {"ready_to_break": True, "turnover_mult": 1.8},
+        "audit_rows": [{"theme": "AI", "verdict": "warn", "rationale": "题材验证不足", "sources": ["https://example.com"]}],
+        "chart_notes": ["2026-02-28"],
+        "candidates_df": pd.DataFrame([{"ts_code": "000001.SZ", "name": "测试股"}]),
+    }
+    result = trend_agent.run_python(
+        "show(current_stock_df()); prices = recent_prices(days=30); result = {'rows': len(prices), 'ready': signal_row['ready_to_break'], 'sources': audit_summary()['sources']}",
+        context,
+    )
+    assert "stdout:" in result
+    assert "turnover_mult" in result
+    assert "result_type: dict" in result
+    assert '"rows": 1' in result
+    assert '"ready": true' in result
+
+
+def test_run_python_error_includes_runtime_hints():
+    result = trend_agent.run_python("result = boom", {"stock_profile": {"ts_code": "000001.SZ"}})
+    assert result.startswith("python_error[NameError]:")
+    assert "available_vars=stock_profile, signal_row, audit_rows, chart_notes, candidates_df, pd, np, duckdb" in result
+    assert "utilities=show, to_df, current_stock_df, recent_prices, audit_summary" in result
+
+
+def test_run_duckdb_sql_lazy_registers_only_referenced_tables(monkeypatch, tmp_path):
+    monkeypatch.setattr(trend_agent, "DATA_ROOT", tmp_path / "data")
+    data_root = tmp_path / "data"
+    (data_root / "boom").mkdir(parents=True)
+    (data_root / "boom" / "bad.parquet").write_text("not parquet", encoding="utf-8")
+    monkeypatch.setattr(
+        trend_agent,
+        "DUCKDB_REPO_TABLE_SPECS",
+        {
+            "bad_table": {
+                "path_parts": ("boom", "bad.parquet"),
+                "columns": ["x"],
+                "sql": "CREATE VIEW bad_table AS SELECT FROM",
+            }
+        },
+    )
+    result = trend_agent.run_duckdb_sql(
+        "SELECT ts_code, score FROM candidates_df",
+        {"candidates_df": pd.DataFrame([{"ts_code": "000001.SZ", "score": 1.23}])},
+    )
+    assert "000001.SZ" in result
+    assert "score" in result
+
+
+def test_run_duckdb_sql_invalid_column_reports_schema_hint(monkeypatch, tmp_path):
+    monkeypatch.setattr(trend_agent, "DATA_ROOT", tmp_path / "data")
+    data_root = tmp_path / "data"
+    (data_root / "stock_ticks").mkdir(parents=True)
+    trend_agent.duckdb.execute(
+        f"""
+        COPY (
+            SELECT
+                '000731.SZ' AS ts_code,
+                '2026-02-03' AS trade_date,
+                10.2 AS close,
+                123456.0 AS vol,
+                4.2 AS turnover_rate,
+                999999.0 AS amount,
+                10.0 AS open,
+                10.5 AS high,
+                9.8 AS low,
+                2.1 AS pb,
+                15.0 AS pe,
+                500000000.0 AS total_mv,
+                400000000.0 AS circ_mv
+        ) TO '{(data_root / "stock_ticks" / "000731.SZ.parquet").as_posix()}' (FORMAT PARQUET)
+        """
+    )
+    result = trend_agent.run_duckdb_sql(
+        "SELECT ts_code, name, close FROM stock_basic_daily WHERE ts_code = '000731.SZ'",
+        {"stock_profile": {"ts_code": "000731.SZ"}},
+    )
+    assert result.startswith("duckdb_error:")
+    assert "referenced_table=stock_basic_daily" in result
+    assert "valid_columns=ts_code, date, open, high, low, close, volume, turnover_rate, amount, pe, pb, total_mv, circ_mv" in result
+    assert "suggestion=SELECT date, close, volume, turnover_rate FROM stock_basic_daily" in result
 
 
 def test_execute_agent_tool_catches_duckdb_exception(monkeypatch):
@@ -744,9 +918,17 @@ def test_generate_stock_section_retries_after_duckdb_error(monkeypatch, tmp_path
         None,
     )
     assert section.summary == "修正查询后完成分析"
-    assert "TOOL_RESULT:" in seen_tool_feedback["value"]
+    assert "TOOL_STATUS: error" in seen_tool_feedback["value"]
+    assert "TOOL_NAME: duckdb" in seen_tool_feedback["value"]
     assert "duckdb_error:" in seen_tool_feedback["value"]
     assert "available_tables=candidates_df" in seen_tool_feedback["value"]
+    assert "DuckDB查询失败" in seen_tool_feedback["value"]
+    trace_lines = (tmp_path / "trace.jsonl").read_text(encoding="utf-8").strip().splitlines()
+    tool_event = next(json.loads(line) for line in trace_lines if json.loads(line)["event"] == "stock_tool_result")
+    assert tool_event["event"] == "stock_tool_result"
+    assert tool_event["payload"]["status"] == "error"
+    assert "duration_ms" in tool_event["payload"]
+    assert tool_event["payload"]["input_preview"] == "SELECT * FROM stock_basic_daily"
 
 
 def test_generate_stock_section_retries_after_web_search_result(monkeypatch, tmp_path):
@@ -798,7 +980,7 @@ def test_generate_stock_section_retries_after_web_search_result(monkeypatch, tmp
         None,
     )
     assert section.summary == "结合搜索结果完成分析"
-    assert "TOOL_RESULT:" in seen_tool_feedback["value"]
+    assert "TOOL_STATUS: success" in seen_tool_feedback["value"]
     assert "search_result: 川润股份 AI应用 最新进展" in seen_tool_feedback["value"]
 
 
@@ -851,8 +1033,9 @@ def test_generate_stock_section_retries_after_python_result(monkeypatch, tmp_pat
         None,
     )
     assert section.summary == "结合Python结果完成分析"
-    assert "TOOL_RESULT:" in seen_tool_feedback["value"]
+    assert "TOOL_STATUS: success" in seen_tool_feedback["value"]
     assert "result: True" in seen_tool_feedback["value"]
+    assert "Python已返回可用分析结果" in seen_tool_feedback["value"]
 
 
 def test_generate_stock_section_retries_after_web_search_exception(monkeypatch, tmp_path):
@@ -909,6 +1092,7 @@ def test_generate_stock_section_retries_after_web_search_exception(monkeypatch, 
     )
     assert section.summary == "搜索异常后仍完成分析"
     assert "tool_error: web_search failed with RuntimeError: search timeout" in seen_tool_feedback["value"]
+    assert "TOOL_STATUS: error" in seen_tool_feedback["value"]
 
 
 def test_generate_stock_section_retries_after_python_exception(monkeypatch, tmp_path):
@@ -965,6 +1149,7 @@ def test_generate_stock_section_retries_after_python_exception(monkeypatch, tmp_
     )
     assert section.summary == "Python异常后仍完成分析"
     assert "tool_error: python failed with ValueError: bad python" in seen_tool_feedback["value"]
+    assert "Python运行失败" in seen_tool_feedback["value"]
 
 
 def test_generate_stock_section_does_not_crash_on_tool_exception(monkeypatch, tmp_path):
@@ -1021,6 +1206,72 @@ def test_generate_stock_section_does_not_crash_on_tool_exception(monkeypatch, tm
     )
     assert section.summary == "工具异常后仍成功回退"
     assert "tool_error: duckdb failed with RuntimeError: boom" in seen_tool_feedback["value"]
+
+
+def test_generate_stock_section_switches_to_python_after_duckdb_error(monkeypatch, tmp_path):
+    calls = {"n": 0}
+    seen_tool_feedback = []
+
+    def fake_deepseek_chat(messages):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return json.dumps({"tool": "duckdb", "input": "SELECT bad_col FROM stock_basic_daily"}, ensure_ascii=False)
+        if calls["n"] == 2:
+            seen_tool_feedback.append(messages[-1]["content"])
+            return json.dumps({"tool": "python", "input": "result = {'ready': signal_row.get('ready_to_break')}"}, ensure_ascii=False)
+        seen_tool_feedback.append(messages[-1]["content"])
+        return json.dumps(
+            {
+                "stock": {
+                    "ts_code": "000001.SZ",
+                    "name": "测试股",
+                    "recommendation": "watch",
+                    "summary": "DuckDB失败后改用Python完成分析",
+                    "investment_logic": ["逻辑E"],
+                    "technical_analysis": ["技术E"],
+                    "capital_validation": ["资金E"],
+                    "trade_plan": ["计划E"],
+                    "risks": ["风险E"],
+                    "source_urls": [],
+                    "research_depth": "standard",
+                }
+            },
+            ensure_ascii=False,
+        )
+
+    def fake_tool(tool, tool_input, tool_context):
+        if tool == "duckdb":
+            return "duckdb_error: Binder Error: Referenced column bad_col not found | available_tables=candidates_df, stock_basic_daily"
+        if tool == "python":
+            return "result_type: dict\nresult_preview:\n{\n  \"ready\": true\n}"
+        raise AssertionError(tool)
+
+    monkeypatch.setattr(trend_agent, "deepseek_chat", fake_deepseek_chat)
+    monkeypatch.setattr(trend_agent, "_execute_agent_tool", fake_tool)
+
+    ctx = {
+        "ts_code": "000001.SZ",
+        "name": "测试股",
+        "stock_data": {"ts_code": "000001.SZ", "name": "测试股"},
+        "signals": {"ready_to_break": True},
+        "audits": [],
+        "chart_notes": [],
+    }
+    row = {"ts_code": "000001.SZ", "name": "测试股", "matched_themes": []}
+    tool_stats = {"total_calls": 0, "per_tool": {}, "python_after_duckdb_failure": 0}
+    section = trend_agent._generate_stock_section(
+        ctx,
+        tmp_path / "trace.jsonl",
+        pd.DataFrame([{"ts_code": "000001.SZ", "name": "测试股"}]),
+        row,
+        [],
+        None,
+        tool_stats=tool_stats,
+    )
+    assert section.summary == "DuckDB失败后改用Python完成分析"
+    assert tool_stats["python_after_duckdb_failure"] == 1
+    assert any("DuckDB查询失败" in msg for msg in seen_tool_feedback)
+    assert any("TOOL_NAME: python" in msg for msg in seen_tool_feedback)
 
 
 def test_qwen_match_guard_blocks_scope_only_false_positive(monkeypatch, tmp_path):

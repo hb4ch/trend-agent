@@ -212,6 +212,8 @@ ZHIPU_API_KEY = os.environ.get("ZHIPUAI_API_KEY")
 SILICONFLOW_BASE_URL = os.environ.get("SILICONFLOW_BASE_URL", os.environ.get("DEEPSEEK_BASE_URL", "https://api.siliconflow.cn/v1"))
 SILICONFLOW_API_KEY = os.environ.get("SILICONFLOW_API_KEY", os.environ.get("DEEPSEEK_API_KEY"))
 DEEPSEEK_MODEL = os.environ.get("DEEPSEEK_MODEL", "Pro/deepseek-ai/DeepSeek-V3.2")
+DEEPSEEK_TIMEOUT_SEC = float(os.environ.get("DEEPSEEK_TIMEOUT_SEC", "600"))
+DEEPSEEK_MAX_RETRIES = max(0, int(os.environ.get("DEEPSEEK_MAX_RETRIES", "8")))
 
 QWEN_MODEL = os.environ.get("QWEN_MODEL", "qwen3.5-35B-A3B")
 QWEN_BASE_URL = os.environ.get("QWEN_BASE_URL", "http://192.168.3.46:8000/v1")
@@ -294,7 +296,8 @@ class LLMProvider:
                 base_url=SILICONFLOW_BASE_URL,
                 api_key=SILICONFLOW_API_KEY,
                 temperature=temperature,
-                timeout=300,  # 5 minutes timeout for long requests
+                timeout=DEEPSEEK_TIMEOUT_SEC,
+                max_retries=DEEPSEEK_MAX_RETRIES,
                 max_completion_tokens=8192,  # Required for thinking mode
             )
 
@@ -559,6 +562,8 @@ class DeepSeekThinkingClient:
         self._client = OpenAIClient(
             api_key=self.api_key,
             base_url=self.base_url,
+            timeout=DEEPSEEK_TIMEOUT_SEC,
+            max_retries=DEEPSEEK_MAX_RETRIES,
         )
 
     def invoke_thinking(

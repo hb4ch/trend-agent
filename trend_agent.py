@@ -13,6 +13,7 @@ Implements a 5-phase pipeline:
 import io
 import json
 import logging
+import math
 import os
 import random
 import re
@@ -22,7 +23,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from html import escape as html_escape
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
 import duckdb
@@ -106,6 +107,9 @@ class StrategyConfig:
     qwen_rate_limit_base_delay_sec: float = 1.0
     qwen_rate_limit_max_delay_sec: float = 20.0
     qwen_request_interval_sec: float = 0.35
+    audit_llm_timeout_max_retries: int = 5
+    audit_llm_timeout_base_delay_sec: float = 5.0
+    audit_llm_timeout_max_delay_sec: float = 90.0
 
     @classmethod
     def from_env(cls) -> "StrategyConfig":
@@ -131,6 +135,9 @@ class StrategyConfig:
             qwen_rate_limit_base_delay_sec=max(0.0, float(os.environ.get("QWEN_RATE_LIMIT_BASE_DELAY_SEC", "1.0"))),
             qwen_rate_limit_max_delay_sec=max(0.0, float(os.environ.get("QWEN_RATE_LIMIT_MAX_DELAY_SEC", "20.0"))),
             qwen_request_interval_sec=max(0.0, float(os.environ.get("QWEN_REQUEST_INTERVAL_SEC", "0.35"))),
+            audit_llm_timeout_max_retries=max(0, int(os.environ.get("AUDIT_LLM_TIMEOUT_MAX_RETRIES", "5"))),
+            audit_llm_timeout_base_delay_sec=max(0.0, float(os.environ.get("AUDIT_LLM_TIMEOUT_BASE_DELAY_SEC", "5.0"))),
+            audit_llm_timeout_max_delay_sec=max(0.0, float(os.environ.get("AUDIT_LLM_TIMEOUT_MAX_DELAY_SEC", "90.0"))),
         )
 
 
@@ -611,10 +618,10 @@ def qwen_match_themes(
             with _flush_lock:
                 matched_map[ts_code] = picked
 
-    # Process in batches — up to 4 concurrent requests to local vLLM
+    # Process in batches — up to 8 concurrent requests to local vLLM
     import concurrent.futures
     chunks = [batch[i:i + config.qwen_batch_size] for i in range(0, len(batch), config.qwen_batch_size)]
-    max_workers = min(4, len(chunks)) if chunks else 1
+    max_workers = min(8, len(chunks)) if chunks else 1
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
         list(executor.map(flush, chunks))
     if total_batches > 0:
@@ -859,38 +866,192 @@ def run_python(code: str, context: Dict) -> str:
             "datetime",
             "re",
             "json",
+            "itertools",
+            "statistics",
+            "collections",
         }
         if name in allowed:
             return __import__(name, globals, locals, fromlist, level)
         raise ImportError(f"import not allowed: {name}")
 
+    def _normalize_python_obj(obj: Any, limit: int = 8) -> str:
+        if isinstance(obj, pd.DataFrame):
+            head = obj.head(limit)
+            try:
+                return head.to_markdown(index=False)
+            except Exception:
+                return head.to_string(index=False)
+        if isinstance(obj, pd.Series):
+            head = obj.head(limit)
+            try:
+                return head.to_frame(name="value").to_markdown()
+            except Exception:
+                return head.to_string()
+        if isinstance(obj, (dict, list, tuple, set)):
+            serializable = list(obj) if isinstance(obj, set) else obj
+            try:
+                return truncate(json.dumps(serializable, ensure_ascii=False, default=str, indent=2), 2000)
+            except Exception:
+                return truncate(repr(obj), 2000)
+        return truncate(repr(obj), 2000)
+
+    def to_df(obj: Any) -> pd.DataFrame:
+        """Normalize common Python objects into a DataFrame."""
+        if isinstance(obj, pd.DataFrame):
+            return obj.copy()
+        if isinstance(obj, pd.Series):
+            return obj.to_frame().T
+        if isinstance(obj, dict):
+            return pd.DataFrame([obj])
+        if isinstance(obj, list):
+            if not obj:
+                return pd.DataFrame()
+            if all(isinstance(item, dict) for item in obj):
+                return pd.DataFrame(obj)
+            return pd.DataFrame({"value": obj})
+        return pd.DataFrame([{"value": obj}])
+
+    def current_stock_df() -> pd.DataFrame:
+        """Build a one-row DataFrame combining the stock profile and current signal row."""
+        merged = {}
+        if isinstance(context.get("stock_profile"), dict):
+            merged.update(context["stock_profile"])
+        if isinstance(context.get("signal_row"), dict):
+            merged.update(context["signal_row"])
+        return pd.DataFrame([merged]) if merged else pd.DataFrame()
+
+    def audit_summary() -> Dict[str, Any]:
+        """Flatten current-stock audits into a compact summary dict."""
+        rows = context.get("audit_rows") or []
+        if not isinstance(rows, list):
+            rows = []
+        verdicts: Dict[str, str] = {}
+        findings: List[Dict[str, Any]] = []
+        risks: List[str] = []
+        sources: List[str] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            theme = str(row.get("theme", "")).strip()
+            verdict = str(row.get("verdict", "")).strip()
+            rationale = str(row.get("rationale", "")).strip()
+            if theme:
+                verdicts[theme] = verdict
+            if rationale and verdict in {"warn", "fail"}:
+                risks.append(f"{theme}: {rationale}" if theme else rationale)
+            for finding in row.get("positive_findings") or []:
+                if isinstance(finding, dict):
+                    findings.append(
+                        {
+                            "theme": theme,
+                            "category": finding.get("category"),
+                            "description": finding.get("description"),
+                            "confidence": finding.get("confidence"),
+                            "source_url": finding.get("source_url"),
+                        }
+                    )
+            for url in row.get("sources") or []:
+                if isinstance(url, str) and url and url not in sources:
+                    sources.append(url)
+        return {
+            "verdicts": verdicts,
+            "positive_findings": findings[:12],
+            "risks": risks[:12],
+            "sources": sources[:20],
+        }
+
+    def recent_prices(ts_code: Optional[str] = None, days: int = 60) -> pd.DataFrame:
+        """Load recent local parquet prices for a stock, defaulting to the current stock."""
+        resolved_code = ts_code or context.get("stock_profile", {}).get("ts_code") or context.get("stock_data", {}).get("ts_code")
+        if not resolved_code:
+            return pd.DataFrame(columns=["date", "open", "high", "low", "close", "volume", "turnover_rate", "amount"])
+        parquet_path = DATA_ROOT / "stock_ticks" / f"{resolved_code}.parquet"
+        if not parquet_path.exists():
+            return pd.DataFrame(columns=["date", "open", "high", "low", "close", "volume", "turnover_rate", "amount"])
+        df = pd.read_parquet(parquet_path)
+        if df.empty:
+            return pd.DataFrame(columns=["date", "open", "high", "low", "close", "volume", "turnover_rate", "amount"])
+        rename_map = {"trade_date": "date", "vol": "volume"}
+        df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
+        if "date" in df.columns:
+            try:
+                date_series = pd.to_datetime(df["date"])
+                cutoff = date_series.max() - pd.Timedelta(days=max(1, int(days)))
+                df = df.loc[date_series >= cutoff].copy()
+            except Exception:
+                pass
+        columns = [col for col in ["ts_code", "date", "open", "high", "low", "close", "volume", "turnover_rate", "amount"] if col in df.columns]
+        if columns:
+            df = df[columns]
+        if "date" in df.columns:
+            try:
+                df = df.sort_values("date", ascending=False)
+            except Exception:
+                pass
+        return df.head(240)
+
+    def show(obj: Any, limit: int = 8) -> str:
+        """Pretty-print an object to stdout and return the rendered preview."""
+        rendered = _normalize_python_obj(obj, limit=limit)
+        print(rendered)
+        return rendered
+
     safe_builtins = {
         "__import__": safe_import,
-        "len": len,
-        "range": range,
-        "min": min,
-        "max": max,
-        "sum": sum,
-        "sorted": sorted,
+        "abs": abs,
+        "bool": bool,
+        "dict": dict,
         "enumerate": enumerate,
+        "Exception": Exception,
+        "float": float,
+        "getattr": getattr,
+        "hasattr": hasattr,
+        "int": int,
+        "isinstance": isinstance,
+        "len": len,
+        "list": list,
+        "max": max,
+        "min": min,
+        "next": next,
+        "print": print,
+        "range": range,
+        "repr": repr,
+        "reversed": reversed,
+        "round": round,
+        "set": set,
+        "sorted": sorted,
+        "str": str,
+        "len": len,
+        "sum": sum,
+        "tuple": tuple,
+        "type": type,
+        "ValueError": ValueError,
         "zip": zip,
         "any": any,
         "all": all,
-        "print": print,
-        "str": str,
-        "int": int,
-        "float": float,
-        "dict": dict,
-        "list": list,
-        "set": set,
-        "tuple": tuple,
     }
 
     local_ctx = dict(context)
     local_ctx["context"] = dict(context)
+    local_ctx.setdefault("stock_profile", dict(context.get("stock_profile") or context.get("stock_data") or {}))
+    local_ctx.setdefault("signal_row", dict(context.get("signal_row") or context.get("signals") or {}))
+    local_ctx.setdefault("audit_rows", list(context.get("audit_rows") or context.get("audits") or []))
+    local_ctx.setdefault("chart_notes", list(context.get("chart_notes") or []))
+    local_ctx.setdefault("stock_data", local_ctx["stock_profile"])
+    local_ctx.setdefault("signals", local_ctx["signal_row"])
+    local_ctx.setdefault("audits", local_ctx["audit_rows"])
     local_ctx.setdefault("pd", pd)
     local_ctx.setdefault("np", np)
     local_ctx.setdefault("duckdb", duckdb)
+    local_ctx.setdefault("json", json)
+    local_ctx.setdefault("math", math)
+    local_ctx.setdefault("datetime", datetime)
+    local_ctx.setdefault("re", re)
+    local_ctx.setdefault("show", show)
+    local_ctx.setdefault("to_df", to_df)
+    local_ctx.setdefault("current_stock_df", current_stock_df)
+    local_ctx.setdefault("recent_prices", recent_prices)
+    local_ctx.setdefault("audit_summary", audit_summary)
     local_ctx["__builtins__"] = safe_builtins
 
     stdout = io.StringIO()
@@ -899,13 +1060,25 @@ def run_python(code: str, context: Dict) -> str:
             exec(code, local_ctx, local_ctx)
     except Exception as exc:
         logger.debug(f"Python execution error: {exc}")
-        return f"python_error: {exc}"
+        available_vars = ["stock_profile", "signal_row", "audit_rows", "chart_notes", "candidates_df", "pd", "np", "duckdb"]
+        utilities = ["show", "to_df", "current_stock_df", "recent_prices", "audit_summary"]
+        return (
+            f"python_error[{type(exc).__name__}]: {exc} | "
+            f"available_vars={', '.join(available_vars)} | "
+            f"utilities={', '.join(utilities)}"
+        )
 
     output = stdout.getvalue().strip()
     result = local_ctx.get("result")
     if result is not None:
-        logger.info(f"Python execution result: {result}")
-        return f"{output}\nresult: {result}".strip()
+        rendered = _normalize_python_obj(result)
+        logger.info(f"Python execution result: {truncate(rendered, 500)}")
+        parts = []
+        if output:
+            parts.append(f"stdout:\n{output}")
+        parts.append(f"result_type: {type(result).__name__}")
+        parts.append(f"result_preview:\n{rendered}")
+        return "\n".join(parts).strip()
     return output or "ok"
 
 
@@ -967,6 +1140,14 @@ def _context_table_columns(value: Any) -> List[str]:
         return [str(col) for col in value.columns]
     if isinstance(value, dict):
         return [str(key) for key in value.keys()]
+    if isinstance(value, list) and value and all(isinstance(item, dict) for item in value):
+        seen: List[str] = []
+        for item in value[:5]:
+            for key in item.keys():
+                skey = str(key)
+                if skey not in seen:
+                    seen.append(skey)
+        return seen
     if isinstance(value, pd.Series):
         return [str(key) for key in value.index]
     return []
@@ -979,6 +1160,8 @@ def _coerce_context_relation(value: Any) -> Optional[pd.DataFrame]:
         return value.to_frame().T
     if isinstance(value, dict):
         return pd.DataFrame([value])
+    if isinstance(value, list) and all(isinstance(item, dict) for item in value):
+        return pd.DataFrame(value)
     return None
 
 
@@ -997,15 +1180,55 @@ def _is_read_only_duckdb_sql(sql: str) -> bool:
     return bool(re.match(r"^\s*(select|with|show|describe|desc|explain|pragma)\b", stripped, flags=re.IGNORECASE))
 
 
-def _register_repo_duckdb_tables(con: duckdb.DuckDBPyConnection) -> List[str]:
+def _extract_referenced_table_names(sql: str, table_names: List[str]) -> List[str]:
+    referenced: List[str] = []
+    for name in sorted(table_names, key=len, reverse=True):
+        if re.search(rf"(?<![\w.]){re.escape(name)}(?![\w.])", sql, flags=re.IGNORECASE):
+            referenced.append(name)
+    return referenced
+
+
+def _extract_sql_ts_code(sql: str) -> Optional[str]:
+    match = re.search(r"\bts_code\s*=\s*'([^']+)'", sql, flags=re.IGNORECASE)
+    if match:
+        return match.group(1).strip()
+    return None
+
+
+def _infer_context_ts_code(context: Dict[str, Any]) -> Optional[str]:
+    for key in ("stock_profile", "stock_data", "signal_row", "signals"):
+        value = context.get(key)
+        if isinstance(value, dict):
+            ts_code = str(value.get("ts_code", "")).strip()
+            if ts_code:
+                return ts_code
+    return None
+
+
+def _resolve_repo_table_path(spec: Dict[str, Any], table_name: str, sql: str, context: Dict[str, Any]) -> Path:
+    path = _duckdb_repo_table_path(spec)
+    if table_name not in {"stock_ticks", "stock_basic_daily"}:
+        return path
+    ts_code = _extract_sql_ts_code(sql) or _infer_context_ts_code(context)
+    if not ts_code:
+        return path
+    specific_path = DATA_ROOT / "stock_ticks" / f"{ts_code}.parquet"
+    if specific_path.exists():
+        return specific_path
+    return path
+
+
+def _register_repo_duckdb_tables(con: duckdb.DuckDBPyConnection, sql: str, context: Dict[str, Any]) -> List[str]:
     available: List[str] = []
-    for table_name, spec in DUCKDB_REPO_TABLE_SPECS.items():
-        path = _duckdb_repo_table_path(spec)
+    referenced = _extract_referenced_table_names(sql, list(DUCKDB_REPO_TABLE_SPECS.keys()))
+    for table_name in referenced:
+        spec = DUCKDB_REPO_TABLE_SPECS[table_name]
+        path = _resolve_repo_table_path(spec, table_name, sql, context)
         if "*" in path.as_posix():
             if not list(path.parent.glob(path.name)):
                 continue
         elif not path.exists():
-                continue
+            continue
         try:
             path_sql = path.as_posix().replace("'", "''")
             con.execute(spec["sql"].replace("?", f"'{path_sql}'"))
@@ -1020,6 +1243,7 @@ def _build_duckdb_schema_prompt(context: Dict[str, Any]) -> str:
         "DuckDB tool is read-only.",
         "Allowed SQL: SELECT, WITH, SHOW, DESCRIBE, EXPLAIN, PRAGMA.",
         "Do not use INSERT/UPDATE/DELETE/CREATE/ALTER/DROP/COPY or multiple statements.",
+        "DuckDB is mainly for raw row retrieval; do transformations in Python when possible.",
         "Available DuckDB tables and columns:",
     ]
     for name, value in context.items():
@@ -1033,7 +1257,56 @@ def _build_duckdb_schema_prompt(context: Dict[str, Any]) -> str:
             lines.append(f"- {name}({', '.join(spec['columns'])})")
     lines.append("Use stock_basic_daily for daily price queries with columns date/open/high/low/close/volume/turnover_rate.")
     lines.append("Use stock_ticks if you need raw trade_date/vol fields.")
+    lines.append("stock_profile and signal_row are one-row current-stock context tables; query them directly without filtering by name.")
     return "\n".join(lines)
+
+
+def _context_columns_map(context: Dict[str, Any]) -> Dict[str, List[str]]:
+    result: Dict[str, List[str]] = {}
+    for name, value in context.items():
+        columns = _context_table_columns(value)
+        if columns:
+            result[name] = columns
+    return result
+
+
+def _table_columns_for_error(context: Dict[str, Any], registered_names: List[str]) -> Dict[str, List[str]]:
+    columns = _context_columns_map(context)
+    for name in registered_names:
+        if name in DUCKDB_REPO_TABLE_SPECS:
+            columns[name] = list(DUCKDB_REPO_TABLE_SPECS[name]["columns"])
+    return columns
+
+
+def _suggest_duckdb_query(table_name: str) -> Optional[str]:
+    if table_name == "stock_basic_daily":
+        return "SELECT date, close, volume, turnover_rate FROM stock_basic_daily WHERE ts_code = '000001.SZ' ORDER BY date DESC LIMIT 20"
+    if table_name == "stock_profile":
+        return "SELECT * FROM stock_profile"
+    if table_name == "signal_row":
+        return "SELECT ts_code, close, dist_to_box_top, turnover_mult FROM signal_row"
+    if table_name == "audit_rows":
+        return "SELECT theme, verdict, confidence_score FROM audit_rows"
+    return None
+
+
+def _format_duckdb_error(exc: Exception, sql: str, context: Dict[str, Any], registered_names: List[str]) -> str:
+    parts = [f"duckdb_error: {exc}"]
+    if registered_names:
+        parts.append(f"available_tables={', '.join(sorted(registered_names))}")
+    referenced = _extract_referenced_table_names(sql, list(_context_columns_map(context).keys()) + list(DUCKDB_REPO_TABLE_SPECS.keys()))
+    if referenced:
+        table_name = referenced[0]
+        table_columns = _table_columns_for_error(context, registered_names)
+        parts.append(f"referenced_table={table_name}")
+        if table_name in table_columns:
+            parts.append(f"valid_columns={', '.join(table_columns[table_name])}")
+        if table_name in {"signal_row", "stock_profile"}:
+            parts.append("hint=this is a single current-stock row; query it directly instead of filtering by name or ts_code")
+        suggestion = _suggest_duckdb_query(table_name)
+        if suggestion:
+            parts.append(f"suggestion={suggestion}")
+    return " | ".join(parts)
 
 
 def run_duckdb_sql(sql: str, context: Dict[str, Any]) -> str:
@@ -1058,7 +1331,7 @@ def run_duckdb_sql(sql: str, context: Dict[str, Any]) -> str:
         if relation is not None:
             con.register(name, relation)
             registered_names.append(name)
-    registered_names.extend(_register_repo_duckdb_tables(con))
+    registered_names.extend(_register_repo_duckdb_tables(con, stripped_sql, context))
 
     try:
         df = con.execute(stripped_sql).df()
@@ -1069,9 +1342,7 @@ def run_duckdb_sql(sql: str, context: Dict[str, Any]) -> str:
             return head.to_string(index=False)
     except Exception as exc:
         logger.warning(f"DuckDB query failed: {exc}")
-        if registered_names:
-            return f"duckdb_error: {exc} | available_tables={', '.join(sorted(registered_names))}"
-        return f"duckdb_error: {exc}"
+        return _format_duckdb_error(exc, stripped_sql, context, registered_names)
 
 
 def _execute_agent_tool(tool: str, tool_input: str, tool_context: Dict[str, Any]) -> str:
@@ -1720,6 +1991,50 @@ def apply_audit_filter(
     return filtered, filtered_audits
 
 
+def is_timeout_error(err: Exception) -> bool:
+    """Best-effort timeout detection across OpenAI/httpx/httpcore wrappers."""
+    name = type(err).__name__.lower()
+    if "timeout" in name:
+        return True
+    cause = getattr(err, "__cause__", None)
+    if cause is not None and cause is not err and is_timeout_error(cause):
+        return True
+    message = str(err).lower()
+    return "timed out" in message or "timeout" in message
+
+
+def invoke_with_timeout_retries(
+    operation: Callable[[], str],
+    *,
+    description: str,
+    max_retries: int,
+    base_delay_sec: float,
+    max_delay_sec: float,
+) -> str:
+    """Retry timeout-prone LLM calls with wider exponential backoff."""
+    max_attempts = max_retries + 1
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return operation()
+        except Exception as err:
+            if not is_timeout_error(err) or attempt >= max_attempts:
+                raise
+            retries_used = attempt - 1
+            backoff_cap = min(max_delay_sec, base_delay_sec * (2 ** retries_used))
+            jitter = random.uniform(0.0, max(0.5, 0.25 * backoff_cap))
+            wait_seconds = min(max_delay_sec, backoff_cap + jitter)
+            logger.warning(
+                "%s timed out (attempt=%s/%s); sleeping %.2fs before retry",
+                description,
+                attempt,
+                max_attempts,
+                wait_seconds,
+            )
+            time.sleep(wait_seconds)
+
+    raise RuntimeError(f"{description} failed without producing a result")
+
+
 def clamp01(value: float) -> float:
     """Clamp numeric value to [0, 1]."""
     return max(0.0, min(1.0, float(value)))
@@ -2288,11 +2603,17 @@ def phase3_deep_audit(
                     trace_append(trace_path, "veto_hard_fail", {"ts_code": row["ts_code"], "name": name, "theme": theme, "sources": sources})
                     break
 
-                output = audit_chain.invoke({
-                    "name": name,
-                    "theme": theme,
-                    "results": json.dumps(merged, ensure_ascii=False),
-                })
+                output = invoke_with_timeout_retries(
+                    lambda: audit_chain.invoke({
+                        "name": name,
+                        "theme": theme,
+                        "results": json.dumps(merged, ensure_ascii=False),
+                    }),
+                    description=f"Phase 3 audit LLM call for {name}/{theme}",
+                    max_retries=config.audit_llm_timeout_max_retries,
+                    base_delay_sec=config.audit_llm_timeout_base_delay_sec,
+                    max_delay_sec=config.audit_llm_timeout_max_delay_sec,
+                )
                 data = safe_json_loads(output)
                 verdict = normalize_verdict(data.get("verdict", verdict))
                 rationale = str(data.get("rationale", rationale) or "").strip()
@@ -3037,6 +3358,13 @@ _STOCK_SECTION_SYSTEM_PROMPT_TEMPLATE = (
     "只返回严格JSON，不要Markdown，不要代码块。\n"
     "如需补充信息，可先返回工具调用："
     "{\"tool\":\"web_search|duckdb|python\",\"input\":\"...\"}\n"
+    "优先顺序：1) 直接使用上下文；2) 用python做检查、衍生指标、证据汇总、数据变换；3) 缺少原始历史行时再用duckdb；4) 缺少外部信息时用web_search。\n"
+    "Python工具保持开放式，不限制写法。可用变量：stock_profile(dict), signal_row(dict), audit_rows(list[dict]), chart_notes(list), candidates_df(DataFrame), pd, np, duckdb, json, math, datetime, re。\n"
+    "Python中额外提供可选工具：show(obj, limit), to_df(obj), current_stock_df(), recent_prices(ts_code=None, days=60), audit_summary()。它们只是方便函数，你也可以自由写任意Python代码。\n"
+    "DuckDB主要用于原始历史行检索。signal_row 和 stock_profile 都是单行当前股票上下文，不是完整股票表，不要按 name/ts_code 再过滤它们。\n"
+    "示例Python调用1：{\"tool\":\"python\",\"input\":\"summary = audit_summary(); show(summary); result = summary\"}\n"
+    "示例Python调用2：{\"tool\":\"python\",\"input\":\"df = recent_prices(days=60); show(df[['date','close','volume']].head(10)); result = df[['date','close','volume']].head(10)\"}\n"
+    "示例DuckDB调用：{\"tool\":\"duckdb\",\"input\":\"SELECT date, close, volume, turnover_rate FROM stock_basic_daily WHERE ts_code = '000001.SZ' ORDER BY date DESC LIMIT 20\"}\n"
     "__DUCKDB_SCHEMA__\n"
     "最终输出格式："
     "{\"stock\":{\"ts_code\":\"000001.SZ\",\"name\":\"示例\","
@@ -3057,6 +3385,61 @@ def _build_stock_section_system_prompt(tool_context: Dict[str, Any]) -> str:
     return _STOCK_SECTION_SYSTEM_PROMPT_TEMPLATE.replace(
         "__DUCKDB_SCHEMA__",
         _build_duckdb_schema_prompt(tool_context),
+    )
+
+
+def _infer_tool_status(tool: str, result: str) -> Tuple[str, Optional[str]]:
+    text = str(result or "")
+    if text.startswith("tool_error:"):
+        match = re.search(r"failed with ([A-Za-z_][A-Za-z0-9_]*Error|[A-Za-z_][A-Za-z0-9_]*)", text)
+        return "error", match.group(1) if match else "ToolError"
+    if tool == "duckdb" and text.startswith("duckdb_error:"):
+        match = re.search(r"duckdb_error:\s*([A-Za-z ]+Error)", text)
+        if match:
+            return "error", match.group(1).replace(" ", "")
+        if "Binder Error" in text:
+            return "error", "BinderError"
+        if "IO Error" in text:
+            return "error", "IOError"
+        return "error", "DuckDBError"
+    if tool == "python" and text.startswith("python_error["):
+        match = re.search(r"python_error\[([^\]]+)\]", text)
+        return "error", match.group(1) if match else "PythonError"
+    return "success", None
+
+
+def _build_tool_feedback_message(
+    tool: str,
+    tool_input: str,
+    result: str,
+    status: str,
+    repeated_failure: bool,
+) -> str:
+    guidance: List[str] = []
+    if status == "error" and tool == "python":
+        guidance.append(
+            "Python运行失败。先检查可用变量(stock_profile, signal_row, audit_rows, chart_notes, candidates_df)；"
+            "必要时用 show(...) 打印中间结果，或简化代码。"
+        )
+    elif status == "error" and tool == "duckdb":
+        guidance.append(
+            "DuckDB查询失败。请修正表/字段，或把后续变换改到Python里完成；"
+            "DuckDB更适合拉取原始历史行，不适合复杂推导。"
+        )
+    elif status == "success" and tool == "duckdb":
+        guidance.append("DuckDB已返回原始数据；如需汇总、筛选、打分，请优先改用Python完成。")
+    elif status == "success" and tool == "python":
+        guidance.append("Python已返回可用分析结果；若信息足够，请直接输出最终JSON。")
+    if repeated_failure:
+        guidance.append("你刚刚重复触发了相似错误，不要重复同类查询/代码；请更换工具或明显改变方案。")
+    guidance.append("如果信息已经足够，请直接返回最终JSON。")
+    return (
+        f"TOOL_STATUS: {status}\n"
+        f"TOOL_NAME: {tool}\n"
+        f"TOOL_INPUT:\n{tool_input}\n\n"
+        f"TOOL_RESULT:\n{result}\n\n"
+        "NEXT_STEP:\n"
+        + "\n".join(f"- {item}" for item in guidance)
     )
 
 
@@ -3362,19 +3745,24 @@ def _generate_stock_section(
     row: dict,
     stock_audits: List[AuditResult],
     chart: Optional[ChartArtifact],
+    tool_stats: Optional[Dict[str, Any]] = None,
 ) -> ReportStockSection:
     """Generate one structured stock section via DeepSeek with tool loop."""
     ts_code = ctx["ts_code"]
     name = ctx["name"]
     tool_context = {
         "candidates_df": candidates_df,
-        "signals": ctx.get("signals", {}),
-        "stock_data": ctx.get("stock_data", {}),
+        "stock_profile": ctx.get("stock_data", {}),
+        "signal_row": ctx.get("signals", {}),
+        "audit_rows": ctx.get("audits", []),
+        "chart_notes": ctx.get("chart_notes", []),
     }
     messages = [
         {"role": "system", "content": _build_stock_section_system_prompt(tool_context)},
         {"role": "user", "content": json.dumps(ctx, ensure_ascii=False, default=str)},
     ]
+    last_failure_signature = None
+    last_failure_tool = None
     trace_append(trace_path, "stock_section_request", {"ts_code": ts_code, "name": name})
     for _ in range(5):
         content = deepseek_chat(messages) if deepseek_chat else None
@@ -3384,22 +3772,57 @@ def _generate_stock_section(
         parsed = safe_json_loads(content)
         tool = parsed.get("tool") if isinstance(parsed, dict) else None
         if tool:
-            result = _execute_agent_tool(tool, parsed.get("input", ""), tool_context)
+            tool_input = parsed.get("input", "")
+            start = time.perf_counter()
+            result = _execute_agent_tool(tool, tool_input, tool_context)
+            duration_ms = int((time.perf_counter() - start) * 1000)
+            status, error_class = _infer_tool_status(tool, result)
+            failure_signature = None
+            if status == "error":
+                failure_signature = f"{tool}|{error_class}|{truncate(result, 180)}"
+            repeated_failure = bool(
+                status == "error"
+                and last_failure_signature
+                and failure_signature == last_failure_signature
+            )
             trace_append(
                 trace_path,
                 "stock_tool_result",
-                {"ts_code": ts_code, "tool": tool, "result": truncate(result, 4000)},
+                {
+                    "ts_code": ts_code,
+                    "tool": tool,
+                    "status": status,
+                    "duration_ms": duration_ms,
+                    "input_preview": truncate(str(tool_input), 800),
+                    "error_class": error_class,
+                    "result": truncate(result, 4000),
+                },
             )
+            if tool_stats is not None:
+                tool_stats["total_calls"] = int(tool_stats.get("total_calls", 0)) + 1
+                per_tool = tool_stats.setdefault("per_tool", {})
+                counters = per_tool.setdefault(tool, {"success": 0, "error": 0})
+                counters[status] = int(counters.get(status, 0)) + 1
+                if tool == "python" and last_failure_tool == "duckdb":
+                    tool_stats["python_after_duckdb_failure"] = int(tool_stats.get("python_after_duckdb_failure", 0)) + 1
             messages.append(
                 {
                     "role": "user",
-                    "content": (
-                        f"TOOL_RESULT:\n{result}\n\n"
-                        "如果工具报错，请修正查询或换用可用表/字段后继续；"
-                        "如果信息已经足够，请直接返回最终JSON。"
+                    "content": _build_tool_feedback_message(
+                        tool=tool,
+                        tool_input=str(tool_input),
+                        result=result,
+                        status=status,
+                        repeated_failure=repeated_failure,
                     ),
                 }
             )
+            if status == "error":
+                last_failure_signature = failure_signature
+                last_failure_tool = tool
+            else:
+                last_failure_signature = None
+                last_failure_tool = None
             continue
         payload = None
         if isinstance(parsed, dict):
@@ -3450,6 +3873,7 @@ def _build_report_model(
     theme_context = "; ".join(f"{t.name}({t.validation_status})" for t in themes)
     stock_sections: List[ReportStockSection] = []
     stock_limit = min(10, len(candidates_with_flag))
+    tool_stats: Dict[str, Any] = {"total_calls": 0, "per_tool": {}, "python_after_duckdb_failure": 0}
     for idx, (_, row) in enumerate(candidates_with_flag.head(stock_limit).iterrows()):
         ts_code = str(row["ts_code"])
         name = row.get("name", ts_code)
@@ -3458,8 +3882,16 @@ def _build_report_model(
         ctx = _build_stock_context(row.to_dict(), stock_audits, chart_artifacts, signals, theme_context)
         logger.info(f"Phase 5: generating stock section {idx + 1}/{stock_limit} for {name}({ts_code})...")
         stock_sections.append(
-            _generate_stock_section(ctx, trace_path, candidates_with_flag, row.to_dict(), stock_audits, chart)
+            _generate_stock_section(ctx, trace_path, candidates_with_flag, row.to_dict(), stock_audits, chart, tool_stats=tool_stats)
         )
+    logger.info(
+        "Phase 5 tool summary: total_calls=%s python=%s duckdb=%s web_search=%s python_after_duckdb_failure=%s",
+        tool_stats.get("total_calls", 0),
+        tool_stats.get("per_tool", {}).get("python", {}),
+        tool_stats.get("per_tool", {}).get("duckdb", {}),
+        tool_stats.get("per_tool", {}).get("web_search", {}),
+        tool_stats.get("python_after_duckdb_failure", 0),
+    )
     return ReportModel(
         title="A股趋势跟踪研报",
         generated_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
