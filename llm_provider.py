@@ -215,14 +215,14 @@ DEEPSEEK_MODEL = os.environ.get("DEEPSEEK_MODEL", "Pro/deepseek-ai/DeepSeek-V3.2
 DEEPSEEK_TIMEOUT_SEC = float(os.environ.get("DEEPSEEK_TIMEOUT_SEC", "600"))
 DEEPSEEK_MAX_RETRIES = max(0, int(os.environ.get("DEEPSEEK_MAX_RETRIES", "8")))
 
-QWEN_MODEL = os.environ.get("QWEN_MODEL", "qwen3.5-35B-A3B")
-QWEN_BASE_URL = os.environ.get("QWEN_BASE_URL", "http://192.168.3.46:8000/v1")
-QWEN_API_KEY = os.environ.get("QWEN_API_KEY", "dummy")
+GEMMA_MODEL = os.environ.get("GEMMA_MODEL", "gemma-4-31B-nvfp4")
+GEMMA_BASE_URL = os.environ.get("GEMMA_BASE_URL", "http://192.168.3.46:8000/v1")
+GEMMA_API_KEY = os.environ.get("GEMMA_API_KEY", "dummy")
 
 # Bypass proxy for local vLLM endpoint
-if "192.168." in QWEN_BASE_URL:
+if "192.168." in GEMMA_BASE_URL:
     _no_proxy = os.environ.get("no_proxy", "")
-    _host = QWEN_BASE_URL.split("//")[-1].split(":")[0].split("/")[0]
+    _host = GEMMA_BASE_URL.split("//")[-1].split(":")[0].split("/")[0]
     if _host not in _no_proxy:
         os.environ["no_proxy"] = f"{_no_proxy},{_host}" if _no_proxy else _host
         os.environ["NO_PROXY"] = os.environ["no_proxy"]
@@ -259,7 +259,7 @@ class LLMProvider:
         Get a langchain LLM instance for the specified model.
 
         Args:
-            model: Model name ("deepseek", "zhipu", or "qwen")
+            model: Model name ("deepseek", "zhipu", or "gemma")
             temperature: Sampling temperature
 
         Returns:
@@ -301,16 +301,16 @@ class LLMProvider:
                 max_completion_tokens=8192,  # Required for thinking mode
             )
 
-        elif model == "qwen":
+        elif model == "gemma":
             return ChatOpenAI(
-                model=QWEN_MODEL,
-                base_url=QWEN_BASE_URL,
-                api_key=QWEN_API_KEY,
+                model=GEMMA_MODEL,
+                base_url=GEMMA_BASE_URL,
+                api_key=GEMMA_API_KEY,
                 temperature=temperature,
             )
 
         else:
-            raise ValueError(f"Unknown model: {model}. Choose from: deepseek, zhipu, qwen")
+            raise ValueError(f"Unknown model: {model}. Choose from: deepseek, zhipu, gemma")
 
     def invoke(
         self,
@@ -324,7 +324,7 @@ class LLMProvider:
         Simple invoke interface.
 
         Args:
-            model: Model name ("deepseek", "zhipu", or "qwen")
+            model: Model name ("deepseek", "zhipu", or "gemma")
             messages: List of message strings (user messages)
             system_prompt: Optional system prompt
             temperature: Sampling temperature
@@ -374,7 +374,7 @@ class LLMProvider:
         Invoke with message dicts in OpenAI format.
 
         Args:
-            model: Model name ("deepseek", "zhipu", or "qwen")
+            model: Model name ("deepseek", "zhipu", or "gemma")
             messages: List of message dicts with "role" and "content" keys
                      e.g., [{"role": "system", "content": "..."}, {"role": "user", "content": "..."}]
             temperature: Sampling temperature
@@ -457,7 +457,7 @@ def get_llm(model: str = "deepseek", temperature: float = 0.2) -> BaseChatModel:
     Convenience function to get an LLM instance.
 
     Args:
-        model: Model name ("deepseek", "zhipu", or "qwen")
+        model: Model name ("deepseek", "zhipu", or "gemma")
         temperature: Sampling temperature
 
     Returns:
@@ -476,7 +476,7 @@ def invoke_llm(
     Convenience function to invoke an LLM.
 
     Args:
-        model: Model name ("deepseek", "zhipu", or "qwen")
+        model: Model name ("deepseek", "zhipu", or "gemma")
         messages: List of message strings
         system_prompt: Optional system prompt
         temperature: Sampling temperature
@@ -496,7 +496,7 @@ def invoke_llm_messages(
     Convenience function to invoke an LLM with message dicts.
 
     Args:
-        model: Model name ("deepseek", "zhipu", or "qwen")
+        model: Model name ("deepseek", "zhipu", or "gemma")
         messages: List of message dicts with "role" and "content" keys
         temperature: Sampling temperature
 

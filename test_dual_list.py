@@ -2,11 +2,11 @@
 """
 Integration test for dual-list stock selection logic.
 
-Uses the real Qwen3-8B model via SiliconFlow (same as production pipeline).
+Uses the real Gemma 4 local model (same as production pipeline).
 
 Tests:
 1. extract_theme_named_stocks() finds stocks in theme evidence
-2. qwen_match_themes() whitespace normalization — real LLM output
+2. gemma_match_themes() whitespace normalization — real LLM output
 3. Named stock merge into theme pool
 4. Themed stocks matched, unrelated stocks rejected
 """
@@ -31,7 +31,7 @@ from trend_agent import (
     ThemeItem,
     StrategyConfig,
     extract_theme_named_stocks,
-    qwen_match_themes,
+    gemma_match_themes,
 )
 
 
@@ -134,21 +134,21 @@ STOCKS = [
 ]
 
 
-class TestQwenMatchThemesLive(unittest.TestCase):
-    """Test qwen_match_themes with real Qwen3-8B model."""
+class TestGemmaMatchThemesLive(unittest.TestCase):
+    """Test gemma_match_themes with the real Gemma 4 model."""
 
     @classmethod
     def setUpClass(cls):
-        """Run Qwen matching once and reuse results."""
+        """Run Gemma matching once and reuse results."""
         cls.screen_df = make_screen_df(STOCKS)
         config = StrategyConfig.from_env()
-        print("\n[SETUP] Calling qwen_match_themes with real Qwen3-8B...")
-        cls.result = qwen_match_themes(
+        print("\n[SETUP] Calling gemma_match_themes with real Gemma 4...")
+        cls.result = gemma_match_themes(
             THEMES,
             cls.screen_df,
             config=config,
         )
-        print("[SETUP] Qwen response received.")
+        print("[SETUP] Gemma response received.")
         # Print raw results for visibility
         for _, row in cls.result.iterrows():
             print(f"  {row['ts_code']} ({row['name']}): {row.get('matched_themes', [])}")
@@ -222,17 +222,17 @@ class TestQwenMatchThemesLive(unittest.TestCase):
 
 
 class TestNamedStockMerge(unittest.TestCase):
-    """Test that named stocks get themes from evidence when Qwen misses them."""
+    """Test that named stocks get themes from evidence when Gemma misses them."""
 
     @classmethod
     def setUpClass(cls):
-        """Run Qwen matching and then apply named stock merge."""
+        """Run Gemma matching and then apply named stock merge."""
         cls.screen_df = make_screen_df(STOCKS)
         config = StrategyConfig.from_env()
 
-        # Run Qwen match
-        print("\n[SETUP] Running Qwen match for named stock merge test...")
-        cls.theme_pool = qwen_match_themes(
+        # Run Gemma match
+        print("\n[SETUP] Running Gemma match for named stock merge test...")
+        cls.theme_pool = gemma_match_themes(
             THEMES,
             cls.screen_df,
             config=config,
@@ -262,7 +262,7 @@ class TestNamedStockMerge(unittest.TestCase):
             print(f"  {row['ts_code']} ({row['name']}): {row.get('matched_themes', [])}")
 
     def test_named_stocks_have_themes(self):
-        """Named stocks should always have themes after merge, even if Qwen missed."""
+        """Named stocks should always have themes after merge, even if Gemma missed."""
         for ts_code in ["600584.SH", "000422.SZ"]:
             row = self.theme_pool[self.theme_pool["ts_code"] == ts_code].iloc[0]
             matched = row["matched_themes"]
@@ -280,7 +280,7 @@ class TestNamedStockMerge(unittest.TestCase):
         """Should have at least 2 matched stocks (the named ones) and <=3 unmatched."""
         match_count = self.theme_pool["matched_themes"].apply(bool).sum()
         self.assertGreaterEqual(match_count, 2, "At least 2 named stocks should have matches")
-        # Could be more if Qwen also matched some
+        # Could be more if Gemma also matched some
         self.assertLessEqual(match_count, 4, "At most 4 stocks should match (3 themed + 1 possible)")
 
 

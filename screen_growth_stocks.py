@@ -10,6 +10,7 @@ import numpy as np
 from pathlib import Path
 from datetime import datetime, timedelta
 import json
+from typing import Dict, List, Optional
 
 from math import exp
 
@@ -30,7 +31,22 @@ VOLATILITY_THRESHOLD = 0.50  # 横盘波动幅度阈值（50%）(relaxed from 0.
 
 # 排除条件
 EXCLUDE_ST = False       # 排除ST股票
-EXCLUDE_HIGH_PE = 100   # 排除PE过高的股票
+
+# 估值参数
+VALUATION_MODE = "blend"
+VALUATION_PEER_MIN_SAMPLES = 5
+VALUATION_OUTLIER_PERCENTILE = 0.97
+VALUATION_ABSOLUTE_CAPS = {
+    "pe": 250.0,
+    "pb": 25.0,
+    "ps_ttm": 40.0,
+}
+VALUATION_METRICS = ("pe", "pb", "ps_ttm")
+VALUATION_WEIGHTS = {
+    "pe": 0.5,
+    "pb": 0.3,
+    "ps_ttm": 0.2,
+}
 
 
 def load_stock_basic() -> pd.DataFrame:
@@ -168,6 +184,115 @@ def range_score(value: float, lo: float, hi: float, max_points: float) -> float:
     return max(0.0, max_points * (1.0 - (value - hi) / (hi - lo + EPSILON)))
 
 
+def safe_positive_float(value) -> Optional[float]:
+    """Return a positive finite float, otherwise None."""
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not np.isfinite(out) or out <= 0:
+        return None
+    return out
+
+
+def _metric_percentile(valid_values: pd.Series, value: Optional[float]) -> float:
+    """Return percentile rank in [0, 1] for a positive metric value."""
+    if value is None:
+        return np.nan
+    sample = pd.Series(valid_values).dropna()
+    if sample.empty:
+        return np.nan
+    return float((sample <= value).mean())
+
+
+def classify_valuation_label(stretch_score: Optional[float]) -> str:
+    """Map valuation stretch score to a readable label."""
+    if stretch_score is None or pd.isna(stretch_score):
+        return "估值待补充"
+    if stretch_score >= 85:
+        return "显著高估"
+    if stretch_score >= 65:
+        return "偏贵"
+    if stretch_score >= 40:
+        return "适中溢价"
+    return "合理"
+
+
+def compute_industry_relative_valuation(
+    df: pd.DataFrame,
+    *,
+    outlier_percentile: float = VALUATION_OUTLIER_PERCENTILE,
+    peer_min_samples: int = VALUATION_PEER_MIN_SAMPLES,
+) -> pd.DataFrame:
+    """
+    Add industry-relative valuation features.
+
+    Higher stretch score means more expensive vs peers.
+    """
+    if df is None or df.empty:
+        return df
+
+    out = df.copy()
+    industry_col = out["industry"].fillna("Unknown").astype(str) if "industry" in out.columns else pd.Series(["Unknown"] * len(out), index=out.index)
+    out["industry"] = industry_col
+
+    valid_metric_values: Dict[str, pd.Series] = {}
+    global_metric_values: Dict[str, pd.Series] = {}
+    for metric in VALUATION_METRICS:
+        if metric not in out.columns:
+            out[metric] = np.nan
+        valid_col = out[metric].apply(safe_positive_float)
+        out[f"{metric}_valid"] = valid_col
+        valid_metric_values[metric] = valid_col
+        global_metric_values[metric] = valid_col.dropna()
+        out[f"{metric}_percentile_industry"] = np.nan
+        out[f"{metric}_baseline_source"] = "none"
+
+    out["valuation_data_points"] = 0
+
+    industry_groups = out.groupby("industry", dropna=False).groups
+    for metric in VALUATION_METRICS:
+        valid_col = valid_metric_values[metric]
+        for industry, idx in industry_groups.items():
+            idx_list = list(idx)
+            industry_values = valid_col.loc[idx_list].dropna()
+            baseline = industry_values if len(industry_values) >= peer_min_samples else global_metric_values[metric]
+            baseline_source = "industry" if len(industry_values) >= peer_min_samples else ("market" if not global_metric_values[metric].empty else "none")
+            if baseline_source == "none":
+                continue
+            for row_idx in idx_list:
+                pct = _metric_percentile(baseline, valid_col.loc[row_idx])
+                out.at[row_idx, f"{metric}_percentile_industry"] = pct
+                out.at[row_idx, f"{metric}_baseline_source"] = baseline_source
+
+    percentile_cols: List[str] = []
+    for metric in VALUATION_METRICS:
+        pct_col = f"{metric}_percentile_industry"
+        percentile_cols.append(pct_col)
+        out["valuation_data_points"] += out[pct_col].notna().astype(int)
+
+    weight_sum = sum(VALUATION_WEIGHTS.values())
+    weighted = []
+    for metric in VALUATION_METRICS:
+        pct_col = f"{metric}_percentile_industry"
+        weighted.append(out[pct_col].fillna(0.5) * VALUATION_WEIGHTS[metric])
+    out["valuation_stretch_score"] = (sum(weighted) / max(weight_sum, EPSILON)) * 100.0
+    out.loc[out["valuation_data_points"] == 0, "valuation_stretch_score"] = 50.0
+    out["valuation_quality_score"] = 100.0 - out["valuation_stretch_score"]
+    out["valuation_label"] = out["valuation_stretch_score"].apply(classify_valuation_label)
+
+    absolute_outlier = pd.Series(False, index=out.index)
+    for metric, cap in VALUATION_ABSOLUTE_CAPS.items():
+        valid_col = out[f"{metric}_valid"] if f"{metric}_valid" in out.columns else pd.Series(np.nan, index=out.index)
+        absolute_outlier = absolute_outlier | (valid_col > cap).fillna(False)
+
+    percentile_outlier = out["valuation_stretch_score"] >= float(outlier_percentile) * 100.0
+    unsupported = (out["valuation_data_points"] == 0) & out["pe"].apply(lambda x: safe_positive_float(x) is None)
+    out["valuation_outlier"] = (absolute_outlier | percentile_outlier | unsupported).astype(bool)
+    out["valuation_has_peer_context"] = out["valuation_data_points"] > 0
+    return out.drop(columns=[f"{metric}_valid" for metric in VALUATION_METRICS], errors="ignore")
+
+
 def analyze_stock_technical(df, current_date=None):
     """
     分析单只股票的技术形态
@@ -276,6 +401,8 @@ def analyze_stock_technical(df, current_date=None):
         'market_cap': market_cap_yuan,
         'pe': latest.get('pe_ttm', latest.get('pe', 0)),
         'pb': latest.get('pb', 0),
+        'ps': latest.get('ps', 0),
+        'ps_ttm': latest.get('ps_ttm', latest.get('ps', 0)),
         'turnover_rate': latest['turnover_rate'],
         'data_days': len(df),
         'atr_ratio': atr_ratio,
@@ -460,12 +587,6 @@ def screen_all_stocks() -> pd.DataFrame:
                 skipped['market_cap'] += 1
             continue
 
-        # 排除PE过高的股票（需要有效的PE值）
-        pe_val = analysis.get('pe')
-        if pe_val is not None and (pe_val > EXCLUDE_HIGH_PE or pe_val < 0):
-            skipped['market_cap'] += 1
-            continue
-
         # 整合结果
         result = {
             'ts_code': ts_code,
@@ -490,12 +611,21 @@ def screen_all_stocks() -> pd.DataFrame:
         logger.warning("No stocks passed the initial filter!")
         return None
 
-    # Composite ranking: consolidation 35%, momentum 25%, volume quality 20%, squeeze readiness 20%
+    results_df = compute_industry_relative_valuation(results_df)
+    before_outlier_filter = len(results_df)
+    results_df = results_df[~results_df["valuation_outlier"]].copy()
+    skipped["market_cap"] += max(0, before_outlier_filter - len(results_df))
+    if results_df.empty:
+        logger.warning("No stocks remained after valuation filter!")
+        return None
+
+    # Composite ranking: trend-first, valuation-aware
     results_df['composite_score'] = (
-        results_df['consolidation_score'] * 0.35 +
+        results_df['consolidation_score'] * 0.30 +
         results_df['momentum_score'] * 0.25 +
-        results_df['volume_quality_score'] * 0.20 +
-        results_df['squeeze_readiness'] * 0.20
+        results_df['volume_quality_score'] * 0.18 +
+        results_df['squeeze_readiness'] * 0.15 +
+        results_df['valuation_quality_score'] * 0.12
     )
     results_df = results_df.sort_values('composite_score', ascending=False)
 
@@ -531,9 +661,14 @@ def save_results(df, output_file='screening_results.json'):
     # 格式化数值
     for record in records:
         record['market_cap_fmt'] = f"{record['market_cap'] / 1e8:.2f}亿"
-        record['pe_fmt'] = f"{record['pe']:.2f}"
-        record['pb_fmt'] = f"{record['pb']:.2f}"
+        pe = safe_positive_float(record.get('pe'))
+        pb = safe_positive_float(record.get('pb'))
+        ps_ttm = safe_positive_float(record.get('ps_ttm'))
+        record['pe_fmt'] = f"{pe:.2f}" if pe is not None else "N/A"
+        record['pb_fmt'] = f"{pb:.2f}" if pb is not None else "N/A"
+        record['ps_ttm_fmt'] = f"{ps_ttm:.2f}" if ps_ttm is not None else "N/A"
         record['composite_score_fmt'] = f"{record['composite_score']:.2f}"
+        record['valuation_quality_score_fmt'] = f"{record.get('valuation_quality_score', 0.0):.2f}"
 
     with open(output_file, 'w', encoding='utf-8') as f:
         json.dump(records, f, ensure_ascii=False, indent=2, default=str)
@@ -549,26 +684,28 @@ def print_summary(df, top_n=30):
 
     summary = df.head(top_n)[[
         'ts_code', 'name', 'industry', 'market_cap',
-        'pe', 'consolidation_score', 'volume_boost',
-        'avg_turnover', 'ma_trend', 'exchange'
+        'pe', 'pb', 'ps_ttm', 'valuation_label', 'valuation_quality_score',
+        'consolidation_score', 'volume_boost', 'avg_turnover', 'ma_trend', 'exchange'
     ]].copy()
 
     # 格式化列
     summary['market_cap_fmt'] = summary['market_cap'].apply(lambda x: f"{x/1e8:.2f}亿" if pd.notna(x) else "N/A")
-    summary['pe_fmt'] = summary['pe'].apply(lambda x: f"{x:.2f}" if pd.notna(x) else "N/A")
+    summary['pe_fmt'] = summary['pe'].apply(lambda x: f"{x:.2f}" if safe_positive_float(x) is not None else "N/A")
+    summary['valuation_score_fmt'] = summary['valuation_quality_score'].apply(lambda x: f"{x:.1f}" if pd.notna(x) else "N/A")
 
-    logger.info("{:<12} {:<8} {:<12} {:<10} {:<8} {:<8} {:<8} {:<8} {:<8} {:<6}".format(
-        "代码", "名称", "行业", "市值", "PE", "横盘分", "量能倍", "换手", "趋势", "交易所"
+    logger.info("{:<12} {:<8} {:<12} {:<10} {:<8} {:<10} {:<8} {:<8} {:<8} {:<8} {:<6}".format(
+        "代码", "名称", "行业", "市值", "PE", "估值", "估值分", "横盘分", "量能倍", "趋势", "交易所"
     ))
     logger.info("-" * 100)
 
     for _, row in summary.iterrows():
-        logger.info("{:<12} {:<8} {:<12} {:<10} {:<8} {:<8} {:<8} {:<8} {:<8} {:<6}".format(
+        logger.info("{:<12} {:<8} {:<12} {:<10} {:<8} {:<10} {:<8} {:<8} {:<8} {:<8} {:<6}".format(
             row['ts_code'], row['name'], row['industry'][:10],
             row['market_cap_fmt'], row['pe_fmt'],
+            row['valuation_label'],
+            row['valuation_score_fmt'],
             f"{row['consolidation_score']:.0f}",
             f"{row['volume_boost']:.2f}",
-            f"{row['avg_turnover']:.2f}",
             row['ma_trend'], row['exchange']
         ))
 

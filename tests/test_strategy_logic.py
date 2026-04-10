@@ -2,6 +2,7 @@ import json
 
 import pandas as pd
 
+import screen_growth_stocks
 import trend_agent
 from trend_agent import (
     AuditResult,
@@ -36,11 +37,11 @@ def test_theme_matches_reflect_current_theme_set(monkeypatch, tmp_path):
             }
         ]
     )
-    out_a = trend_agent.qwen_match_themes(
+    out_a = trend_agent.gemma_match_themes(
         themes=[ThemeItem(name="主题A", keywords=["a"], summary="", sources=[])],
         candidates=candidates,
     )
-    out_b = trend_agent.qwen_match_themes(
+    out_b = trend_agent.gemma_match_themes(
         themes=[ThemeItem(name="主题B", keywords=["b"], summary="", sources=[])],
         candidates=candidates,
     )
@@ -242,7 +243,7 @@ def test_phase2_off_theme_fallback_mixed_labels(monkeypatch):
             out["matched_themes"] = [["AI"], []]
         return out
 
-    monkeypatch.setattr(trend_agent, "qwen_match_themes", fake_match)
+    monkeypatch.setattr(trend_agent, "gemma_match_themes", fake_match)
     monkeypatch.setattr(trend_agent, "heuristic_match_themes", fake_heuristic)
     cfg = StrategyConfig(toplist_exclusion_mode="penalty", theme_match_policy="aggressive")
     themes = [ThemeItem(name="AI", keywords=["算力"], summary="", sources=[], validation_status="confirmed")]
@@ -296,7 +297,7 @@ def test_phase2_conservative_blocks_heuristic_false_positive(monkeypatch):
         out["matched_themes"] = [["化工与周期材料"]]
         return out
 
-    monkeypatch.setattr(trend_agent, "qwen_match_themes", fake_match)
+    monkeypatch.setattr(trend_agent, "gemma_match_themes", fake_match)
     monkeypatch.setattr(trend_agent, "heuristic_match_themes", fake_heuristic)
     cfg = StrategyConfig(toplist_exclusion_mode="penalty", theme_match_policy="conservative")
     themes = [ThemeItem(name="化工与周期材料", keywords=["化工", "玻璃"], summary="", sources=[], validation_status="confirmed")]
@@ -309,7 +310,7 @@ def test_phase2_conservative_blocks_heuristic_false_positive(monkeypatch):
     assert row["filter_tier"] == "OFF_THEME_FALLBACK"
 
 
-def test_phase2_conservative_no_qwen_match_returns_off_theme(monkeypatch):
+def test_phase2_conservative_no_gemma_match_returns_off_theme(monkeypatch):
     class FakeDTL:
         def load_recent_toplist(self, days=60):
             return pd.DataFrame(columns=["ts_code"])
@@ -357,7 +358,7 @@ def test_phase2_conservative_no_qwen_match_returns_off_theme(monkeypatch):
         out["matched_themes"] = [["AI"], ["AI"]]
         return out
 
-    monkeypatch.setattr(trend_agent, "qwen_match_themes", fake_match)
+    monkeypatch.setattr(trend_agent, "gemma_match_themes", fake_match)
     monkeypatch.setattr(trend_agent, "heuristic_match_themes", fake_heuristic)
     cfg = StrategyConfig(toplist_exclusion_mode="penalty", theme_match_policy="conservative")
     themes = [ThemeItem(name="AI", keywords=["算力"], summary="", sources=[], validation_status="confirmed")]
@@ -1274,7 +1275,7 @@ def test_generate_stock_section_switches_to_python_after_duckdb_error(monkeypatc
     assert any("TOOL_NAME: python" in msg for msg in seen_tool_feedback)
 
 
-def test_qwen_match_guard_blocks_scope_only_false_positive(monkeypatch, tmp_path):
+def test_gemma_match_guard_blocks_scope_only_false_positive(monkeypatch, tmp_path):
     def fake_invoke(provider, messages, temperature=0.1):
         payload = json.loads(messages[-1]["content"])
         ts_code = payload["stocks"][0]["ts_code"]
@@ -1304,11 +1305,11 @@ def test_qwen_match_guard_blocks_scope_only_false_positive(monkeypatch, tmp_path
             sources=[],
         )
     ]
-    out = trend_agent.qwen_match_themes(themes, candidates)
+    out = trend_agent.gemma_match_themes(themes, candidates)
     assert out.iloc[0]["matched_themes"] == []
 
 
-def test_qwen_match_guard_keeps_valid_chemical_match(monkeypatch, tmp_path):
+def test_gemma_match_guard_keeps_valid_chemical_match(monkeypatch, tmp_path):
     def fake_invoke(provider, messages, temperature=0.1):
         payload = json.loads(messages[-1]["content"])
         ts_code = payload["stocks"][0]["ts_code"]
@@ -1338,7 +1339,7 @@ def test_qwen_match_guard_keeps_valid_chemical_match(monkeypatch, tmp_path):
             sources=[],
         )
     ]
-    out = trend_agent.qwen_match_themes(themes, candidates)
+    out = trend_agent.gemma_match_themes(themes, candidates)
     assert out.iloc[0]["matched_themes"] == ["化工与周期材料"]
 
 
@@ -1355,7 +1356,7 @@ class DummyRateLimitError(Exception):
         self.response = _DummyResponse(retry_after=retry_after)
 
 
-def test_qwen_match_retries_then_succeeds(monkeypatch, tmp_path):
+def test_gemma_match_retries_then_succeeds(monkeypatch, tmp_path):
     call_count = {"n": 0}
 
     def fake_sleep(_seconds):
@@ -1386,12 +1387,12 @@ def test_qwen_match_retries_then_succeeds(monkeypatch, tmp_path):
     )
     themes = [ThemeItem(name="AI应用", keywords=["AI应用"], summary="", sources=[])]
     cfg = StrategyConfig(
-        qwen_rate_limit_max_retries=6,
-        qwen_rate_limit_base_delay_sec=0.01,
-        qwen_rate_limit_max_delay_sec=0.05,
-        qwen_request_interval_sec=0.0,
+        gemma_rate_limit_max_retries=6,
+        gemma_rate_limit_base_delay_sec=0.01,
+        gemma_rate_limit_max_delay_sec=0.05,
+        gemma_request_interval_sec=0.0,
     )
-    out = trend_agent.qwen_match_themes(
+    out = trend_agent.gemma_match_themes(
         themes,
         candidates,
         config=cfg,
@@ -1400,7 +1401,7 @@ def test_qwen_match_retries_then_succeeds(monkeypatch, tmp_path):
     assert out.iloc[0]["matched_themes"] == ["AI应用"]
 
 
-def test_qwen_match_exhausted_rate_limit_degrades_to_empty(monkeypatch, tmp_path):
+def test_gemma_match_exhausted_rate_limit_degrades_to_empty(monkeypatch, tmp_path):
     call_count = {"n": 0}
 
     def fake_sleep(_seconds):
@@ -1427,12 +1428,12 @@ def test_qwen_match_exhausted_rate_limit_degrades_to_empty(monkeypatch, tmp_path
     )
     themes = [ThemeItem(name="AI应用", keywords=["AI应用"], summary="", sources=[])]
     cfg = StrategyConfig(
-        qwen_rate_limit_max_retries=1,
-        qwen_rate_limit_base_delay_sec=0.01,
-        qwen_rate_limit_max_delay_sec=0.05,
-        qwen_request_interval_sec=0.0,
+        gemma_rate_limit_max_retries=1,
+        gemma_rate_limit_base_delay_sec=0.01,
+        gemma_rate_limit_max_delay_sec=0.05,
+        gemma_request_interval_sec=0.0,
     )
-    out = trend_agent.qwen_match_themes(
+    out = trend_agent.gemma_match_themes(
         themes,
         candidates,
         config=cfg,
@@ -1441,7 +1442,7 @@ def test_qwen_match_exhausted_rate_limit_degrades_to_empty(monkeypatch, tmp_path
     assert out.iloc[0]["matched_themes"] == []
 
 
-def test_qwen_match_respects_configured_batch_size(monkeypatch, tmp_path):
+def test_gemma_match_respects_configured_batch_size(monkeypatch, tmp_path):
     call_count = {"n": 0}
 
     def fake_invoke(provider, messages, temperature=0.1):
@@ -1467,8 +1468,8 @@ def test_qwen_match_respects_configured_batch_size(monkeypatch, tmp_path):
         ]
     )
     themes = [ThemeItem(name="AI应用", keywords=["AI应用"], summary="", sources=[])]
-    cfg = StrategyConfig(qwen_batch_size=2, qwen_request_interval_sec=0.0)
-    out = trend_agent.qwen_match_themes(
+    cfg = StrategyConfig(gemma_batch_size=2, gemma_request_interval_sec=0.0)
+    out = trend_agent.gemma_match_themes(
         themes,
         candidates,
         config=cfg,
@@ -1477,7 +1478,7 @@ def test_qwen_match_respects_configured_batch_size(monkeypatch, tmp_path):
     assert out["matched_themes"].apply(lambda x: x == ["AI应用"]).all()
 
 
-def test_phase2_quant_filter_survives_qwen_rate_limit(monkeypatch):
+def test_phase2_quant_filter_survives_gemma_rate_limit(monkeypatch):
     class FakeDTL:
         def load_recent_toplist(self, days=60):
             return pd.DataFrame(columns=["ts_code"])
@@ -1537,13 +1538,201 @@ def test_phase2_quant_filter_survives_qwen_rate_limit(monkeypatch):
 
     cfg = StrategyConfig(
         theme_match_policy="aggressive",
-        qwen_batch_size=1,
-        qwen_rate_limit_max_retries=1,
-        qwen_rate_limit_base_delay_sec=0.01,
-        qwen_rate_limit_max_delay_sec=0.05,
-        qwen_request_interval_sec=0.0,
+        gemma_batch_size=1,
+        gemma_rate_limit_max_retries=1,
+        gemma_rate_limit_base_delay_sec=0.01,
+        gemma_rate_limit_max_delay_sec=0.05,
+        gemma_request_interval_sec=0.0,
     )
     themes = [ThemeItem(name="AI", keywords=["算力"], summary="", sources=[], validation_status="confirmed")]
     out = trend_agent.phase2_quant_filter(themes, config=cfg)
     assert not out.empty
     assert "matched_themes" in out.columns
+
+
+def test_compute_industry_relative_valuation_labels_extreme_outlier():
+    df = pd.DataFrame(
+        [
+            {"ts_code": "A", "industry": "半导体", "pe": 20.0, "pb": 2.0, "ps_ttm": 3.0},
+            {"ts_code": "B", "industry": "半导体", "pe": 22.0, "pb": 2.2, "ps_ttm": 3.2},
+            {"ts_code": "C", "industry": "半导体", "pe": 24.0, "pb": 2.4, "ps_ttm": 3.4},
+            {"ts_code": "D", "industry": "半导体", "pe": 26.0, "pb": 2.6, "ps_ttm": 3.6},
+            {"ts_code": "E", "industry": "半导体", "pe": 28.0, "pb": 2.8, "ps_ttm": 3.8},
+            {"ts_code": "F", "industry": "半导体", "pe": 150.0, "pb": 15.0, "ps_ttm": 20.0},
+        ]
+    )
+
+    out = screen_growth_stocks.compute_industry_relative_valuation(df, outlier_percentile=0.90, peer_min_samples=5)
+    cheap = out[out["ts_code"] == "A"].iloc[0]
+    expensive = out[out["ts_code"] == "F"].iloc[0]
+
+    assert cheap["valuation_label"] == "合理"
+    assert expensive["valuation_label"] == "显著高估"
+    assert bool(expensive["valuation_outlier"]) is True
+    assert expensive["valuation_stretch_score"] > cheap["valuation_stretch_score"]
+
+
+def test_compute_industry_relative_valuation_falls_back_to_market_for_sparse_industry():
+    df = pd.DataFrame(
+        [
+            {"ts_code": "A", "industry": "银行", "pe": 5.0, "pb": 0.8, "ps_ttm": 1.0},
+            {"ts_code": "B", "industry": "银行", "pe": 6.0, "pb": 0.9, "ps_ttm": 1.1},
+            {"ts_code": "C", "industry": "银行", "pe": 7.0, "pb": 1.0, "ps_ttm": 1.2},
+            {"ts_code": "D", "industry": "银行", "pe": 8.0, "pb": 1.1, "ps_ttm": 1.3},
+            {"ts_code": "E", "industry": "银行", "pe": 9.0, "pb": 1.2, "ps_ttm": 1.4},
+            {"ts_code": "F", "industry": "软件", "pe": 30.0, "pb": 3.0, "ps_ttm": 5.0},
+            {"ts_code": "G", "industry": "软件", "pe": -1.0, "pb": 4.0, "ps_ttm": 6.0},
+        ]
+    )
+
+    out = screen_growth_stocks.compute_industry_relative_valuation(df, peer_min_samples=5)
+    sparse = out[out["ts_code"] == "F"].iloc[0]
+
+    assert sparse["pe_baseline_source"] == "market"
+    assert sparse["pb_baseline_source"] == "market"
+    assert sparse["valuation_data_points"] >= 2
+
+
+def test_phase2_theme_ranking_penalizes_expensive_matches(monkeypatch):
+    class FakeDTL:
+        def load_recent_toplist(self, days=60):
+            return pd.DataFrame(columns=["ts_code"])
+
+    monkeypatch.setattr(trend_agent, "DragonTigerList", FakeDTL)
+    monkeypatch.setattr(
+        trend_agent,
+        "screen_all_stocks",
+        lambda: pd.DataFrame(
+            [
+                {
+                    "ts_code": "000001.SZ",
+                    "name": "便宜股",
+                    "industry": "软件",
+                    "main_business": "AI软件",
+                    "business_scope": "AI软件",
+                    "introduction": "AI软件",
+                    "consolidation_score": 72,
+                    "momentum_score": 75,
+                    "volume_quality_score": 70,
+                    "volume_boost": 1.5,
+                    "composite_score": 78.0,
+                    "valuation_quality_score": 82.0,
+                    "valuation_stretch_score": 18.0,
+                    "valuation_label": "合理",
+                },
+                {
+                    "ts_code": "000002.SZ",
+                    "name": "贵股",
+                    "industry": "软件",
+                    "main_business": "AI软件",
+                    "business_scope": "AI软件",
+                    "introduction": "AI软件",
+                    "consolidation_score": 72,
+                    "momentum_score": 75,
+                    "volume_quality_score": 70,
+                    "volume_boost": 1.5,
+                    "composite_score": 78.0,
+                    "valuation_quality_score": 20.0,
+                    "valuation_stretch_score": 92.0,
+                    "valuation_label": "显著高估",
+                },
+            ]
+        ),
+    )
+
+    def fake_match(themes, candidates, config=None, relaxed_validation=False, named_stock_codes=None):
+        out = candidates.copy()
+        out["matched_themes"] = [["AI应用"] for _ in range(len(out))]
+        return out
+
+    monkeypatch.setattr(trend_agent, "gemma_match_themes", fake_match)
+    themes = [ThemeItem(name="AI应用", keywords=["AI"], summary="", sources=[], validation_status="confirmed")]
+    out = trend_agent.phase2_quant_filter(themes, config=StrategyConfig(toplist_exclusion_mode="penalty"))
+
+    theme_rows = out[out["list_type"] == "theme_driven"].sort_values("alpha_rank_score", ascending=False)
+    assert theme_rows.iloc[0]["ts_code"] == "000001.SZ"
+    assert theme_rows.iloc[0]["valuation_label"] == "合理"
+
+
+def test_rank_candidates_for_alpha_prefers_reasonable_valuation():
+    candidates = pd.DataFrame(
+        [
+            {
+                "ts_code": "000001.SZ",
+                "name": "A",
+                "industry": "I1",
+                "matched_themes": ["AI"],
+                "list_type": "theme_driven",
+                "ma_spread": 0.10,
+                "volume_boost": 1.8,
+                "theme_strength_score": 1.0,
+                "toplist_recency_score": 0.1,
+                "valuation_quality_score": 80.0,
+                "valuation_stretch_score": 20.0,
+                "valuation_label": "合理",
+            },
+            {
+                "ts_code": "000002.SZ",
+                "name": "B",
+                "industry": "I1",
+                "matched_themes": ["AI"],
+                "list_type": "theme_driven",
+                "ma_spread": 0.10,
+                "volume_boost": 1.8,
+                "theme_strength_score": 1.0,
+                "toplist_recency_score": 0.1,
+                "valuation_quality_score": 25.0,
+                "valuation_stretch_score": 90.0,
+                "valuation_label": "显著高估",
+            },
+        ]
+    )
+    signals = {
+        "000001.SZ": {"breakout_window_ok": True, "already_breakout": False, "extended_breakout": False, "turnover_mult": 1.8},
+        "000002.SZ": {"breakout_window_ok": True, "already_breakout": False, "extended_breakout": False, "turnover_mult": 1.8},
+    }
+
+    ranked = trend_agent.rank_candidates_for_alpha(candidates, audits=[], signals=signals, config=StrategyConfig())
+    assert ranked.iloc[0]["ts_code"] == "000001.SZ"
+    assert ranked.iloc[0]["valuation_label"] == "合理"
+
+
+def test_deterministic_tables_include_valuation_column():
+    candidates = pd.DataFrame(
+        [
+            {
+                "ts_code": "000001.SZ",
+                "name": "A",
+                "industry": "I1",
+                "matched_themes": ["AI"],
+                "off_theme": False,
+                "theme_strength_score": 1.0,
+                "momentum_score": 75.0,
+                "alpha_rank_score": 88.0,
+                "consolidation_score": 70,
+                "volume_boost": 1.5,
+                "valuation_label": "适中溢价",
+                "list_type": "theme_driven",
+            },
+            {
+                "ts_code": "000002.SZ",
+                "name": "B",
+                "industry": "I2",
+                "matched_themes": [],
+                "off_theme": True,
+                "alpha_rank_score": 70.0,
+                "consolidation_score": 68,
+                "volume_boost": 1.3,
+                "valuation_label": "合理",
+                "list_type": "technical",
+            },
+        ]
+    )
+
+    theme_table = trend_agent.build_deterministic_theme_table(candidates, audits=[], top_n=1)
+    core_table = trend_agent.build_deterministic_core_table(candidates, audits=[], top_n=1)
+
+    assert "| 股票 | 匹配题材 | 题材强度 | 估值 | 动量评分 | Alpha评分 |" in theme_table
+    assert "| 股票 | 所属主线 | 估值 | 形态特征 | 置信度 | 推荐理由 |" in core_table
+    assert "适中溢价" in theme_table
+    assert "合理" in core_table

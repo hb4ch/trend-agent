@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Test Qwen theme matching against a local vLLM endpoint.
+Test Gemma theme matching against a local vLLM endpoint.
 
-Sends the exact same prompt format as qwen_match_themes() in trend_agent.py.
+Sends the exact same prompt format as gemma_match_themes() in trend_agent.py.
 Tests whether the model can correctly:
 1. Match semiconductor stocks to AI/chip themes
 2. Match chemical stocks to phosphorus/agriculture themes
@@ -20,7 +20,7 @@ os.environ["NO_PROXY"] = os.environ.get("NO_PROXY", "") + ",192.168.3.46"
 
 VLLM_BASE_URL = "http://192.168.3.46:8000/v1"
 VLLM_API_KEY = "dummy"  # vLLM doesn't need a real key
-VLLM_MODEL = "qwen3.5-35B-A3B"
+VLLM_MODEL = "gemma-4-31B-nvfp4"
 
 # --- Themes (realistic, matching recent pipeline runs) ---
 THEMES = [
@@ -151,7 +151,7 @@ def run_test(batch_size: int = 4):
         raw = response.choices[0].message.content
         print(f"Raw response:\n{raw}\n")
 
-        # Strip <think>...</think> tags if present (Qwen3 thinking mode)
+        # Strip any stray thinking tags if present
         import re
         cleaned = re.sub(r"<think>[\s\S]*?</think>", "", raw).strip()
 

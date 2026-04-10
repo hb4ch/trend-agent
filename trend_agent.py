@@ -46,6 +46,7 @@ from screen_growth_stocks import (
     compute_obv,
     compute_rsi,
     compute_ema,
+    classify_valuation_label,
 )
 from utils import (
     DragonTigerList,
@@ -102,14 +103,19 @@ class StrategyConfig:
     theme_match_policy: str = "conservative"  # conservative|balanced|aggressive
     max_names_per_theme: int = 4
     max_names_per_industry: int = 4
-    qwen_batch_size: int = 4
-    qwen_rate_limit_max_retries: int = 6
-    qwen_rate_limit_base_delay_sec: float = 1.0
-    qwen_rate_limit_max_delay_sec: float = 20.0
-    qwen_request_interval_sec: float = 0.35
+    gemma_batch_size: int = 4
+    gemma_rate_limit_max_retries: int = 6
+    gemma_rate_limit_base_delay_sec: float = 1.0
+    gemma_rate_limit_max_delay_sec: float = 20.0
+    gemma_request_interval_sec: float = 0.35
     audit_llm_timeout_max_retries: int = 5
     audit_llm_timeout_base_delay_sec: float = 5.0
     audit_llm_timeout_max_delay_sec: float = 90.0
+    valuation_mode: str = "blend"
+    valuation_outlier_percentile: float = 0.97
+    valuation_weight_screen: float = 0.12
+    valuation_weight_alpha: float = 0.10
+    valuation_allow_premium: bool = True
 
     @classmethod
     def from_env(cls) -> "StrategyConfig":
@@ -130,14 +136,19 @@ class StrategyConfig:
             theme_match_policy=theme_match_policy,
             max_names_per_theme=int(os.environ.get("MAX_NAMES_PER_THEME", "4")),
             max_names_per_industry=int(os.environ.get("MAX_NAMES_PER_INDUSTRY", "4")),
-            qwen_batch_size=max(1, int(os.environ.get("QWEN_BATCH_SIZE", "4"))),
-            qwen_rate_limit_max_retries=max(0, int(os.environ.get("QWEN_RATE_LIMIT_MAX_RETRIES", "6"))),
-            qwen_rate_limit_base_delay_sec=max(0.0, float(os.environ.get("QWEN_RATE_LIMIT_BASE_DELAY_SEC", "1.0"))),
-            qwen_rate_limit_max_delay_sec=max(0.0, float(os.environ.get("QWEN_RATE_LIMIT_MAX_DELAY_SEC", "20.0"))),
-            qwen_request_interval_sec=max(0.0, float(os.environ.get("QWEN_REQUEST_INTERVAL_SEC", "0.35"))),
+            gemma_batch_size=max(1, int(os.environ.get("GEMMA_BATCH_SIZE", "4"))),
+            gemma_rate_limit_max_retries=max(0, int(os.environ.get("GEMMA_RATE_LIMIT_MAX_RETRIES", "6"))),
+            gemma_rate_limit_base_delay_sec=max(0.0, float(os.environ.get("GEMMA_RATE_LIMIT_BASE_DELAY_SEC", "1.0"))),
+            gemma_rate_limit_max_delay_sec=max(0.0, float(os.environ.get("GEMMA_RATE_LIMIT_MAX_DELAY_SEC", "20.0"))),
+            gemma_request_interval_sec=max(0.0, float(os.environ.get("GEMMA_REQUEST_INTERVAL_SEC", "0.35"))),
             audit_llm_timeout_max_retries=max(0, int(os.environ.get("AUDIT_LLM_TIMEOUT_MAX_RETRIES", "5"))),
             audit_llm_timeout_base_delay_sec=max(0.0, float(os.environ.get("AUDIT_LLM_TIMEOUT_BASE_DELAY_SEC", "5.0"))),
             audit_llm_timeout_max_delay_sec=max(0.0, float(os.environ.get("AUDIT_LLM_TIMEOUT_MAX_DELAY_SEC", "90.0"))),
+            valuation_mode=os.environ.get("VALUATION_MODE", "blend").strip().lower() or "blend",
+            valuation_outlier_percentile=max(0.5, min(0.999, float(os.environ.get("VALUATION_OUTLIER_PERCENTILE", "0.97")))),
+            valuation_weight_screen=max(0.0, float(os.environ.get("VALUATION_WEIGHT_SCREEN", "0.12"))),
+            valuation_weight_alpha=max(0.0, float(os.environ.get("VALUATION_WEIGHT_ALPHA", "0.10"))),
+            valuation_allow_premium=os.environ.get("VALUATION_ALLOW_PREMIUM", "1").strip() in {"1", "true", "True", "YES", "yes"},
         )
 
 
@@ -322,7 +333,7 @@ def parse_search_payload(raw: Any) -> Dict[str, Any]:
     return {"summary": summary, "results": results, "urls": urls}
 
 
-def qwen_match_themes(
+def gemma_match_themes(
     themes: List[ThemeItem],
     candidates: pd.DataFrame,
     config: Optional[StrategyConfig] = None,
@@ -330,7 +341,7 @@ def qwen_match_themes(
     named_stock_codes: Optional[set] = None,
 ) -> pd.DataFrame:
     """
-    Match stocks to themes using Qwen LLM for semantic understanding.
+    Match stocks to themes using Gemma for semantic understanding.
 
     Args:
         themes: List of market themes to match against
@@ -508,10 +519,10 @@ def qwen_match_themes(
         ]
 
         content = None
-        max_attempts = config.qwen_rate_limit_max_retries + 1
+        max_attempts = config.gemma_rate_limit_max_retries + 1
         for attempt in range(1, max_attempts + 1):
             try:
-                content = invoke_llm_messages("qwen", messages, temperature=0.1)
+                content = invoke_llm_messages("gemma", messages, temperature=0.1)
                 break
             except Exception as err:
                 if not is_rate_limit_error(err):
@@ -524,7 +535,7 @@ def qwen_match_themes(
                     with _flush_lock:
                         exhausted_batches += 1
                     logger.warning(
-                        "Qwen theme matching exhausted after rate limits: batch_size=%s retries=%s",
+                        "Gemma theme matching exhausted after rate limits: batch_size=%s retries=%s",
                         len(batch_items),
                         retries_used,
                     )
@@ -533,14 +544,14 @@ def qwen_match_themes(
                             matched_map[item["ts_code"]] = []
                     return
                 backoff_cap = min(
-                    config.qwen_rate_limit_max_delay_sec,
-                    config.qwen_rate_limit_base_delay_sec * (2 ** retries_used),
+                    config.gemma_rate_limit_max_delay_sec,
+                    config.gemma_rate_limit_base_delay_sec * (2 ** retries_used),
                 )
                 jitter = random.uniform(0.0, max(0.1, 0.2 * backoff_cap))
-                computed_wait = min(config.qwen_rate_limit_max_delay_sec, backoff_cap + jitter)
+                computed_wait = min(config.gemma_rate_limit_max_delay_sec, backoff_cap + jitter)
                 wait_seconds = retry_after_seconds(err) or computed_wait
                 logger.warning(
-                    "Qwen theme matching rate-limited (attempt=%s/%s, batch_size=%s); sleeping %.2fs",
+                    "Gemma theme matching rate-limited (attempt=%s/%s, batch_size=%s); sleeping %.2fs",
                     attempt,
                     max_attempts,
                     len(batch_items),
@@ -549,8 +560,8 @@ def qwen_match_themes(
                 if wait_seconds > 0:
                     time.sleep(wait_seconds)
             finally:
-                if config.qwen_request_interval_sec > 0:
-                    time.sleep(config.qwen_request_interval_sec)
+                if config.gemma_request_interval_sec > 0:
+                    time.sleep(config.gemma_request_interval_sec)
 
         if content is None:
             return
@@ -564,7 +575,7 @@ def qwen_match_themes(
         theme_name_set = {t["name"] for t in theme_list}
         batch_codes = {item["ts_code"] for item in batch_items}
 
-        # Detect malformed response: Qwen3-8B sometimes returns
+        # Detect malformed response: some local models may return
         # {"matches": {"ts_code": ["600584.SH", ...]}} instead of
         # {"matches": {"600584.SH": ["theme1"], ...}}
         matches = {}
@@ -597,7 +608,7 @@ def qwen_match_themes(
                                     matches.setdefault(code, []).append(t_name)
 
                 if matches:
-                    logger.info(f"Recovered {len(matches)} matches from malformed Qwen response")
+                    logger.info(f"Recovered {len(matches)} matches from malformed Gemma response")
 
         for item in batch_items:
             ts_code = item.get("ts_code")
@@ -620,13 +631,13 @@ def qwen_match_themes(
 
     # Process in batches — up to 8 concurrent requests to local vLLM
     import concurrent.futures
-    chunks = [batch[i:i + config.qwen_batch_size] for i in range(0, len(batch), config.qwen_batch_size)]
+    chunks = [batch[i:i + config.gemma_batch_size] for i in range(0, len(batch), config.gemma_batch_size)]
     max_workers = min(8, len(chunks)) if chunks else 1
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
         list(executor.map(flush, chunks))
     if total_batches > 0:
         logger.info(
-            "Qwen match stats: total_batches=%s rate_limited_batches=%s exhausted_batches=%s effective_retries_used=%s",
+            "Gemma match stats: total_batches=%s rate_limited_batches=%s exhausted_batches=%s effective_retries_used=%s",
             total_batches,
             rate_limited_batches,
             exhausted_batches,
@@ -1059,13 +1070,18 @@ def run_python(code: str, context: Dict) -> str:
         with contextlib.redirect_stdout(stdout):
             exec(code, local_ctx, local_ctx)
     except Exception as exc:
-        logger.debug(f"Python execution error: {exc}")
+        logger.warning(f"Python execution error: {exc}")
         available_vars = ["stock_profile", "signal_row", "audit_rows", "chart_notes", "candidates_df", "pd", "np", "duckdb"]
         utilities = ["show", "to_df", "current_stock_df", "recent_prices", "audit_summary"]
+        extra_hint = ""
+        if isinstance(exc, KeyError):
+            sr_keys = sorted(local_ctx.get("signal_row", {}).keys())
+            sp_keys = sorted(local_ctx.get("stock_profile", {}).keys())
+            extra_hint = f" | signal_row_keys={sr_keys} | stock_profile_keys={sp_keys}"
         return (
             f"python_error[{type(exc).__name__}]: {exc} | "
             f"available_vars={', '.join(available_vars)} | "
-            f"utilities={', '.join(utilities)}"
+            f"utilities={', '.join(utilities)}{extra_hint}"
         )
 
     output = stdout.getvalue().strip()
@@ -1730,6 +1746,7 @@ def phase2_quant_filter(themes: List[ThemeItem], config: Optional[StrategyConfig
     if screen_df is None or screen_df.empty:
         logger.warning("No screening results from screen_all_stocks()")
         return pd.DataFrame()
+    screen_df = ensure_valuation_columns(screen_df)
     theme_order_col = (
         "momentum_score"
         if "momentum_score" in screen_df.columns
@@ -1811,9 +1828,9 @@ def phase2_quant_filter(themes: List[ThemeItem], config: Optional[StrategyConfig
         logger.info(f"Theme pool: {len(theme_pool)} candidates after minimal filter")
 
         if not theme_pool.empty:
-            # A3: Run qwen_match_themes with ALL themes (confirmed + web_only + capital_only)
+            # A3: Run gemma_match_themes with ALL themes (confirmed + web_only + capital_only)
             # Theme strength scoring already accounts for validation_status differences
-            theme_pool = qwen_match_themes(
+            theme_pool = gemma_match_themes(
                 expanded_themes,
                 theme_pool,
                 config=config,
@@ -1840,8 +1857,8 @@ def phase2_quant_filter(themes: List[ThemeItem], config: Optional[StrategyConfig
                 logger.info(f"Named stock merge: {ts_code} -> {merged_themes}")
 
             theme_pool = normalize_match_columns(theme_pool)
-            qwen_matches = theme_pool["matched_themes"].apply(bool).sum()
-            logger.info(f"Theme pool after Qwen + named stock merge: {qwen_matches} stocks with theme matches")
+            gemma_matches = theme_pool["matched_themes"].apply(bool).sum()
+            logger.info(f"Theme pool after Gemma + named stock merge: {gemma_matches} stocks with theme matches")
 
             # A5: Filter to only matched stocks
             matched_mask = theme_pool["matched_themes"].apply(lambda x: isinstance(x, list) and len(x) > 0)
@@ -1855,12 +1872,17 @@ def phase2_quant_filter(themes: List[ThemeItem], config: Optional[StrategyConfig
                 momentum_col = "momentum_score" if "momentum_score" in theme_matched.columns else "composite_score"
                 volume_col = "volume_quality_score" if "volume_quality_score" in theme_matched.columns else "volume_boost"
                 toplist_penalty = theme_matched.get("toplist_recency_score", pd.Series(0.0, index=theme_matched.index))
+                valuation_quality = theme_matched.get("valuation_quality_score", pd.Series(50.0, index=theme_matched.index))
+                valuation_stretch = theme_matched.get("valuation_stretch_score", pd.Series(50.0, index=theme_matched.index))
+                valuation_penalty = valuation_stretch / 100.0
                 theme_matched["alpha_rank_score"] = (
                     theme_matched[momentum_col] * 0.30
                     + theme_matched["theme_strength_score"] * 20.0
                     + theme_matched[volume_col] * 0.15
                     + theme_matched["composite_score"] * 0.10
+                    + valuation_quality * 0.20
                     - toplist_penalty * (config.toplist_penalty_weight * 10.0)
+                    - valuation_penalty * 8.0
                 )
                 theme_matched = theme_matched.sort_values("alpha_rank_score", ascending=False)
 
@@ -2040,6 +2062,29 @@ def clamp01(value: float) -> float:
     return max(0.0, min(1.0, float(value)))
 
 
+def ensure_valuation_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Backfill neutral valuation fields when upstream mocks or legacy data omit them."""
+    if df is None or df.empty:
+        return df
+    out = df.copy()
+    defaults = {
+        "valuation_quality_score": 50.0,
+        "valuation_stretch_score": 50.0,
+        "valuation_label": "估值待补充",
+        "valuation_outlier": False,
+        "pe_percentile_industry": np.nan,
+        "pb_percentile_industry": np.nan,
+        "ps_ttm_percentile_industry": np.nan,
+    }
+    for col, default in defaults.items():
+        if col not in out.columns:
+            out[col] = default
+    if "valuation_label" in out.columns:
+        missing_label = out["valuation_label"].isna() | (out["valuation_label"].astype(str).str.strip() == "")
+        out.loc[missing_label, "valuation_label"] = out.loc[missing_label, "valuation_stretch_score"].map(classify_valuation_label)
+    return out
+
+
 def apply_diversification_constraints(
     ranked: pd.DataFrame,
     max_per_theme: int,
@@ -2090,7 +2135,7 @@ def rank_candidates_for_alpha(
     if candidates is None or candidates.empty:
         return candidates
     config = config or StrategyConfig.from_env()
-    ranked = candidates.copy()
+    ranked = ensure_valuation_columns(candidates)
 
     from deep_researcher import get_source_tier_weight
 
@@ -2140,6 +2185,8 @@ def rank_candidates_for_alpha(
         ma_spread = float(row.get("ma_spread", 0.3) or 0.3)
         ma_comp = clamp01(1.0 - ma_spread / 0.30)
         theme_strength = clamp01(float(row.get("theme_strength_score", 0.0)))
+        valuation_quality = clamp01(float(row.get("valuation_quality_score", 50.0)) / 100.0)
+        valuation_stretch = clamp01(float(row.get("valuation_stretch_score", 50.0)) / 100.0)
         source_quality = clamp01(af["source_quality_score"])
         finding_score = clamp01(af["positive_finding_count"] / 4.0)
         catalyst_score = clamp01(af["catalyst_diversity"] / 3.0)
@@ -2154,11 +2201,13 @@ def rank_candidates_for_alpha(
             0.17 * volume_quality +
             0.16 * ma_comp +
             0.15 * theme_strength +
+            config.valuation_weight_alpha * valuation_quality +
             0.10 * finding_score +
             0.07 * catalyst_score +
             0.06 * source_quality +
             0.07 * audit_safe
             - 0.12 * overcrowding_penalty
+            - (0.10 if config.valuation_allow_premium else 0.18) * valuation_stretch
             - breakout_penalty
         )
         score_01 = clamp01(score_01)
@@ -2169,12 +2218,20 @@ def rank_candidates_for_alpha(
                 "positive_finding_count": af["positive_finding_count"],
                 "source_quality_score": source_quality,
                 "catalyst_diversity": af["catalyst_diversity"],
+                "valuation_quality_score": valuation_quality * 100.0,
+                "valuation_stretch_score": valuation_stretch * 100.0,
+                "valuation_label": str(row.get("valuation_label", classify_valuation_label(valuation_stretch * 100.0))),
                 "alpha_rank_score": score_01 * 100.0,
             }
         )
 
     alpha_df = pd.DataFrame(alpha_rows)
     ranked = ranked.merge(alpha_df, on="ts_code", how="left", suffixes=("", "_new"))
+    for col in ["valuation_quality_score", "valuation_stretch_score", "valuation_label"]:
+        new_col = f"{col}_new"
+        if new_col in ranked.columns:
+            ranked[col] = ranked[new_col]
+            ranked = ranked.drop(columns=[new_col])
     if "alpha_rank_score_new" in ranked.columns:
         ranked["alpha_rank_score"] = ranked["alpha_rank_score_new"]
         ranked = ranked.drop(columns=["alpha_rank_score_new"])
@@ -3105,8 +3162,8 @@ def phase5_report(
             "",
             "## 【核心金股】",
             "",
-            "| 股票 | 所属主线 | 形态特征 | 推荐理由 |",
-            "| --- | --- | --- | --- |",
+            "| 股票 | 所属主线 | 估值 | 形态特征 | 推荐理由 |",
+            "| --- | --- | --- | --- | --- |",
         ]
     )
 
@@ -3114,7 +3171,8 @@ def phase5_report(
         themes_str = ", ".join(row.get("matched_themes", [])) or "待确认"
         shape = f"横盘分{row['consolidation_score']:.0f}, 量能{row['volume_boost']:.2f}"
         reason = f"市值{row['market_cap']/1e8:.1f}亿, 换手{row['avg_turnover']:.2f}"
-        lines.append(f"| {row['name']}({row['ts_code']}) | {themes_str} | {shape} | {reason} |")
+        valuation = str(row.get("valuation_label", "估值待补充"))
+        lines.append(f"| {row['name']}({row['ts_code']}) | {themes_str} | {valuation} | {shape} | {reason} |")
 
     lines.append("")
     lines.append("## 【深度图解】")
@@ -3165,7 +3223,7 @@ def build_deterministic_theme_table(candidates: pd.DataFrame, audits: List[Audit
         return ""
     return _build_markdown_table(
         "## 【核心金股 - 题材驱动精选】",
-        ["股票", "匹配题材", "题材强度", "动量评分", "Alpha评分"],
+        ["股票", "匹配题材", "题材强度", "估值", "动量评分", "Alpha评分"],
         rows,
     )
 
@@ -3176,12 +3234,12 @@ def build_deterministic_core_table(candidates: pd.DataFrame, audits: List[AuditR
     if not rows:
         return (
             "## 【核心金股 - 技术形态精选】\n\n"
-            "| 股票 | 所属主线 | 形态特征 | 置信度 | 推荐理由 |\n"
-            "| --- | --- | --- | --- | --- |\n"
+            "| 股票 | 所属主线 | 估值 | 形态特征 | 置信度 | 推荐理由 |\n"
+            "| --- | --- | --- | --- | --- | --- |\n"
         )
     return _build_markdown_table(
         "## 【核心金股 - 技术形态精选】",
-        ["股票", "所属主线", "形态特征", "置信度", "推荐理由"],
+        ["股票", "所属主线", "估值", "形态特征", "置信度", "推荐理由"],
         rows,
     )
 
@@ -3295,6 +3353,7 @@ def build_theme_table_rows(candidates: pd.DataFrame, audits: List[AuditResult], 
                 "股票": f"{name}({ts_code})",
                 "匹配题材": ", ".join(matched[:2]) if matched else "待确认",
                 "题材强度": f"{_coerce_float(row.get('theme_strength_score', 0.0)):.2f}",
+                "估值": str(row.get("valuation_label", "估值待补充")),
                 "动量评分": f"{_coerce_float(row.get('momentum_score', row.get('composite_score', 0.0))):.1f}",
                 "Alpha评分": f"{_coerce_float(row.get('alpha_rank_score', 0.0)):.1f}",
             }
@@ -3335,6 +3394,7 @@ def build_core_table_rows(candidates: pd.DataFrame, audits: List[AuditResult], t
             {
                 "股票": f"{name}({ts_code})",
                 "所属主线": "技术形态入选" if off_theme else (", ".join(matched[:2]) if matched else "待确认"),
+                "估值": str(row.get("valuation_label", "估值待补充")),
                 "形态特征": "，".join(shape_parts) if shape_parts else "技术形态待补充",
                 "置信度": f"{(float(np.mean(conf_list)) if conf_list else 0.5):.2f}",
                 "推荐理由": "；".join(reason_parts) if reason_parts else "综合评分靠前",
@@ -3362,6 +3422,8 @@ _STOCK_SECTION_SYSTEM_PROMPT_TEMPLATE = (
     "Python工具保持开放式，不限制写法。可用变量：stock_profile(dict), signal_row(dict), audit_rows(list[dict]), chart_notes(list), candidates_df(DataFrame), pd, np, duckdb, json, math, datetime, re。\n"
     "Python中额外提供可选工具：show(obj, limit), to_df(obj), current_stock_df(), recent_prices(ts_code=None, days=60), audit_summary()。它们只是方便函数，你也可以自由写任意Python代码。\n"
     "DuckDB主要用于原始历史行检索。signal_row 和 stock_profile 都是单行当前股票上下文，不是完整股票表，不要按 name/ts_code 再过滤它们。\n"
+    "signal_row的字段：__SIGNAL_ROW_KEYS__\n"
+    "stock_profile的字段：__STOCK_PROFILE_KEYS__\n"
     "示例Python调用1：{\"tool\":\"python\",\"input\":\"summary = audit_summary(); show(summary); result = summary\"}\n"
     "示例Python调用2：{\"tool\":\"python\",\"input\":\"df = recent_prices(days=60); show(df[['date','close','volume']].head(10)); result = df[['date','close','volume']].head(10)\"}\n"
     "示例DuckDB调用：{\"tool\":\"duckdb\",\"input\":\"SELECT date, close, volume, turnover_rate FROM stock_basic_daily WHERE ts_code = '000001.SZ' ORDER BY date DESC LIMIT 20\"}\n"
@@ -3382,9 +3444,13 @@ _STOCK_SECTION_SYSTEM_PROMPT_TEMPLATE = (
 
 
 def _build_stock_section_system_prompt(tool_context: Dict[str, Any]) -> str:
-    return _STOCK_SECTION_SYSTEM_PROMPT_TEMPLATE.replace(
-        "__DUCKDB_SCHEMA__",
-        _build_duckdb_schema_prompt(tool_context),
+    signal_keys = ", ".join(sorted(tool_context.get("signal_row", {}).keys())) or "(empty)"
+    profile_keys = ", ".join(sorted(tool_context.get("stock_profile", {}).keys())) or "(empty)"
+    return (
+        _STOCK_SECTION_SYSTEM_PROMPT_TEMPLATE
+        .replace("__DUCKDB_SCHEMA__", _build_duckdb_schema_prompt(tool_context))
+        .replace("__SIGNAL_ROW_KEYS__", signal_keys)
+        .replace("__STOCK_PROFILE_KEYS__", profile_keys)
     )
 
 
@@ -3414,6 +3480,7 @@ def _build_tool_feedback_message(
     result: str,
     status: str,
     repeated_failure: bool,
+    remaining_iterations: int = 0,
 ) -> str:
     guidance: List[str] = []
     if status == "error" and tool == "python":
@@ -3432,6 +3499,8 @@ def _build_tool_feedback_message(
         guidance.append("Python已返回可用分析结果；若信息足够，请直接输出最终JSON。")
     if repeated_failure:
         guidance.append("你刚刚重复触发了相似错误，不要重复同类查询/代码；请更换工具或明显改变方案。")
+    if remaining_iterations <= 1:
+        guidance.append("剩余调用次数不多，请尽快返回最终JSON。")
     guidance.append("如果信息已经足够，请直接返回最终JSON。")
     return (
         f"TOOL_STATUS: {status}\n"
@@ -3763,8 +3832,10 @@ def _generate_stock_section(
     ]
     last_failure_signature = None
     last_failure_tool = None
+    repeated_failure_count = 0
+    max_iterations = 5
     trace_append(trace_path, "stock_section_request", {"ts_code": ts_code, "name": name})
-    for _ in range(5):
+    for iteration in range(max_iterations):
         content = deepseek_chat(messages) if deepseek_chat else None
         if not content:
             break
@@ -3777,6 +3848,10 @@ def _generate_stock_section(
             result = _execute_agent_tool(tool, tool_input, tool_context)
             duration_ms = int((time.perf_counter() - start) * 1000)
             status, error_class = _infer_tool_status(tool, result)
+            logger.info(
+                "Tool call: %s status=%s duration=%dms error=%s input=%s",
+                tool, status, duration_ms, error_class, truncate(str(tool_input), 200),
+            )
             failure_signature = None
             if status == "error":
                 failure_signature = f"{tool}|{error_class}|{truncate(result, 180)}"
@@ -3785,6 +3860,13 @@ def _generate_stock_section(
                 and last_failure_signature
                 and failure_signature == last_failure_signature
             )
+            if repeated_failure:
+                repeated_failure_count += 1
+                if repeated_failure_count >= 2:
+                    logger.warning("Breaking tool loop for %s: repeated failure limit reached", ts_code)
+                    break
+            else:
+                repeated_failure_count = 0
             trace_append(
                 trace_path,
                 "stock_tool_result",
@@ -3805,6 +3887,7 @@ def _generate_stock_section(
                 counters[status] = int(counters.get(status, 0)) + 1
                 if tool == "python" and last_failure_tool == "duckdb":
                     tool_stats["python_after_duckdb_failure"] = int(tool_stats.get("python_after_duckdb_failure", 0)) + 1
+            remaining = max_iterations - iteration - 1
             messages.append(
                 {
                     "role": "user",
@@ -3814,6 +3897,7 @@ def _generate_stock_section(
                         result=result,
                         status=status,
                         repeated_failure=repeated_failure,
+                        remaining_iterations=remaining,
                     ),
                 }
             )
@@ -3924,7 +4008,7 @@ def render_report_markdown_debug(report: ReportModel) -> str:
     lines.append(
         _build_markdown_table(
             "## 【核心金股 - 技术形态精选】",
-            ["股票", "所属主线", "形态特征", "置信度", "推荐理由"],
+            ["股票", "所属主线", "估值", "形态特征", "置信度", "推荐理由"],
             report.core_table_rows,
         )
         if report.core_table_rows
@@ -3936,7 +4020,7 @@ def render_report_markdown_debug(report: ReportModel) -> str:
                 "",
                 _build_markdown_table(
                     "## 【核心金股 - 题材驱动精选】",
-                    ["股票", "匹配题材", "题材强度", "动量评分", "Alpha评分"],
+                    ["股票", "匹配题材", "题材强度", "估值", "动量评分", "Alpha评分"],
                     report.theme_table_rows,
                 ),
             ]

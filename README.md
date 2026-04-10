@@ -19,7 +19,7 @@
 ```mermaid
 flowchart TD
     P1["Phase 1: Market Intelligence<br/>输出: 市场主线白名单<br/>- Web Search 热点/催化<br/>- Dragon Tiger List 资金流向<br/>- 多源融合验证主线"]
-    P2["Phase 2: Quantitative Mining<br/>输出: 技术面候选股票池<br/>- 市值过滤 20-300亿<br/>- 120日横盘振幅 < 35%<br/>- MA20/60/120 粘合度 < 15%<br/>- 量能 1.2-3.0x<br/>- Qwen语义题材匹配"]
+    P2["Phase 2: Quantitative Mining<br/>输出: 技术面候选股票池<br/>- 市值过滤 20-300亿<br/>- 120日横盘振幅 < 35%<br/>- MA20/60/120 粘合度 < 15%<br/>- 量能 1.2-3.0x<br/>- Gemma语义题材匹配"]
     P3["Phase 3: Deep Research (Audit)<br/>输出: 尽调结论 + 排雷<br/>- 多轮检索验证题材真实性<br/>- 一票否决: 立案/诉讼/减持/退市风险/伪概念<br/>- 监管事件近2年时效<br/>- 信源优先级: cninfo > 交易所 > 其他"]
     P4["Phase 4: Visualization<br/>输出: K线图表 + 技术信号<br/>- mplfinance K线<br/>- MA20/60/120叠加<br/>- 量能异动点标注<br/>- 箱体位置与突破距离"]
     P5["Phase 5: Report Generation<br/>输出: 自包含HTML研报 + 调试Markdown<br/>- DeepSeek V3.2 结构化JSON section<br/>- 工具调用: web_search / duckdb / python<br/>- 交互式筛选/折叠/导航<br/>- 内嵌 Plotly 图表，无需 PDF/LaTeX"]
@@ -179,7 +179,7 @@ WHERE consolidation_score >= 70      -- 横盘得分高
 ORDER BY composite_score DESC
 ```
 
-### Qwen 语义题材匹配
+### Gemma 语义题材匹配
 
 **目的**: 将筛选出的股票与Phase 1的主题进行语义匹配
 
@@ -485,7 +485,7 @@ trend-agent/
 │   └── deepseek_trace_*.jsonl    # 报告生成trace
 │
 └── .cache/                        # 缓存
-    └── qwen_theme_match.json     # 题材匹配缓存
+    └── gemma_theme_match.json    # 题材匹配缓存
 ```
 
 ### 数据Schema
@@ -543,11 +543,13 @@ pip install -U pandas numpy duckdb mplfinance matplotlib \
 ZHIPUAI_API_KEY=xxx
 ZHIPU_SEARCH_COUNT=15
 
-# SiliconFlow (DeepSeek/Qwen)
+# Local/OpenAI-compatible Gemma + SiliconFlow DeepSeek
 SILICONFLOW_BASE_URL=https://api.siliconflow.cn/v1
 SILICONFLOW_API_KEY=sk-xxx
 DEEPSEEK_MODEL=Pro/deepseek-ai/DeepSeek-V3.2
-QWEN_MODEL=Qwen/Qwen3-8B
+GEMMA_MODEL=gemma-4-31B-nvfp4
+GEMMA_BASE_URL=http://192.168.3.46:8000/v1
+GEMMA_API_KEY=dummy
 
 # Debug Flags
 DEBUG_DEEPSEEK=0
@@ -568,16 +570,16 @@ THEME_MATCH_POLICY=conservative
 MAX_NAMES_PER_THEME=4
 MAX_NAMES_PER_INDUSTRY=4
 
-# Qwen Theme Match Rate-Limit Controls (Phase 2)
-QWEN_BATCH_SIZE=4
-QWEN_RATE_LIMIT_MAX_RETRIES=6
-QWEN_RATE_LIMIT_BASE_DELAY_SEC=1.0
-QWEN_RATE_LIMIT_MAX_DELAY_SEC=20.0
-QWEN_REQUEST_INTERVAL_SEC=0.35
+# Gemma Theme Match Rate-Limit Controls (Phase 2)
+GEMMA_BATCH_SIZE=4
+GEMMA_RATE_LIMIT_MAX_RETRIES=6
+GEMMA_RATE_LIMIT_BASE_DELAY_SEC=1.0
+GEMMA_RATE_LIMIT_MAX_DELAY_SEC=20.0
+GEMMA_REQUEST_INTERVAL_SEC=0.35
 ```
 
 说明:
-- 当Qwen在批次匹配中持续返回`429`并耗尽重试后，系统会对该批次降级为空匹配（`rate_limited_exhausted`），流水线继续执行并进入既有heuristic/off-theme fallback逻辑。
+- 当Gemma在批次匹配中持续返回`429`并耗尽重试后，系统会对该批次降级为空匹配（`rate_limited_exhausted`），流水线继续执行并进入既有heuristic/off-theme fallback逻辑。
 - 默认采用“可靠性优先”策略：更小批次 + 请求节流 + 指数退避，降低TPM突发峰值导致的整体失败概率。
 
 ---

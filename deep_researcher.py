@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 import urllib.request
 import re
@@ -6,6 +7,8 @@ import time
 import dataclasses
 from typing import List, Optional
 from datetime import datetime
+
+logger = logging.getLogger(__name__)
 
 from zai import ZhipuAiClient
 from langchain_core.tools import Tool
@@ -35,7 +38,7 @@ DEEPSEEK_MODEL = os.environ.get("DEEPSEEK_MODEL", "Pro/deepseek-ai/DeepSeek-V3.2
 DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY")
 SILICONFLOW_BASE_URL = os.environ.get("SILICONFLOW_BASE_URL", DEEPSEEK_BASE_URL)
 SILICONFLOW_API_KEY = os.environ.get("SILICONFLOW_API_KEY", DEEPSEEK_API_KEY)
-QWEN_MODEL = os.environ.get("QWEN_MODEL", "Qwen/Qwen3-8B")
+GEMMA_MODEL = os.environ.get("GEMMA_MODEL", "gemma-4-31B-nvfp4")
 
 DEBUG_DEEPSEEK = os.environ.get("DEBUG_DEEPSEEK", "").strip() in {"1", "true", "True", "YES", "yes"}
 DEBUG_ZHIPU_SEARCH = os.environ.get("DEBUG_ZHIPU_SEARCH", "").strip() in {"1", "true", "True", "YES", "yes"}
@@ -301,11 +304,20 @@ def siliconflow_chat(
     )
     max_retries = 4
     retry_backoff_s = 3
+    msg_count = len(messages)
+    t0 = time.perf_counter()
     for attempt in range(max_retries + 1):
         try:
             with urllib.request.urlopen(req, timeout=timeout_s) as resp:
                 body = json.loads(resp.read().decode("utf-8"))
             content = body["choices"][0]["message"]["content"]
+            elapsed_ms = int((time.perf_counter() - t0) * 1000)
+            usage = body.get("usage", {})
+            logger.info(
+                "LLM call: model=%s msgs=%d elapsed=%dms tokens_in=%s tokens_out=%s",
+                model, msg_count, elapsed_ms,
+                usage.get("prompt_tokens", "?"), usage.get("completion_tokens", "?"),
+            )
 
             # Log output if forced logging is enabled
             if FORCE_LLM_LOGGING and format_response_for_screen:
@@ -330,29 +342,35 @@ def siliconflow_chat(
                     print(f"[{debug_prefix}] HTTP 429 rate limited, retrying in {sleep_s:.1f}s (attempt {attempt + 1}/{max_retries})")
                 time.sleep(sleep_s)
                 continue
+            elapsed_ms = int((time.perf_counter() - t0) * 1000)
+            logger.warning("LLM call failed: model=%s msgs=%d elapsed=%dms error=HTTP_%d", model, msg_count, elapsed_ms, e.code)
             if debug or DEBUG_SILICONFLOW:
                 print(f"[{debug_prefix}] HTTP error: {e.code} - {e.reason}")
             return None
         except urllib.error.URLError as e:
+            elapsed_ms = int((time.perf_counter() - t0) * 1000)
+            logger.warning("LLM call failed: model=%s msgs=%d elapsed=%dms error=URLError", model, msg_count, elapsed_ms)
             if debug or DEBUG_SILICONFLOW:
                 print(f"[{debug_prefix}] URL error: {e.reason}")
             return None
         except Exception as e:
+            elapsed_ms = int((time.perf_counter() - t0) * 1000)
+            logger.warning("LLM call failed: model=%s msgs=%d elapsed=%dms error=%s", model, msg_count, elapsed_ms, type(e).__name__)
             if debug or DEBUG_SILICONFLOW:
                 print(f"[{debug_prefix}] error: {str(e)}")
             return None
     return None
 
 
-def qwen_chat(messages: List[dict]) -> Optional[str]:
+def gemma_chat(messages: List[dict]) -> Optional[str]:
     return siliconflow_chat(
         messages=messages,
-        model=QWEN_MODEL,
+        model=GEMMA_MODEL,
         api_key=SILICONFLOW_API_KEY,
         base_url=SILICONFLOW_BASE_URL,
         temperature=0.1,
         debug=False,
-        debug_prefix="Qwen",
+        debug_prefix="Gemma",
     )
 
 

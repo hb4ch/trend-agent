@@ -49,7 +49,7 @@ export FORCE_LLM_LOGGING=1  # Print all LLM I/O to screen
 | File | Purpose |
 |------|---------|
 | `trend_agent.py` | Main pipeline orchestrator (all 5 phases) |
-| `llm_provider.py` | Unified LLM provider (DeepSeek, Zhipu, Qwen) with thinking mode |
+| `llm_provider.py` | Unified LLM provider (DeepSeek, Zhipu, Gemma) with thinking mode |
 | `screen_growth_stocks.py` | Stock screening logic & technical analysis |
 | `deep_researcher.py` | AI research engine (Zhipu search + query planning) |
 | `utils.py` | Shared utilities (Dragon Tiger List, JSON parsing, etc.) |
@@ -70,7 +70,7 @@ export FORCE_LLM_LOGGING=1  # Print all LLM I/O to screen
 from llm_provider import get_llm, invoke_llm_messages, invoke_deepseek_thinking
 
 # Get langchain LLM instance
-llm = get_llm(model="deepseek")  # or "zhipu", "qwen"
+llm = get_llm(model="deepseek")  # or "zhipu", "gemma"
 
 # Simple invoke with message dicts
 response = invoke_llm_messages("deepseek", [
@@ -149,11 +149,13 @@ VOLATILITY_THRESHOLD = 0.50 # 50% max amplitude (relaxed from 35%)
 # Zhipu AI (Web Search)
 ZHIPUAI_API_KEY=xxx
 
-# SiliconFlow (DeepSeek/Qwen)
+# Local/OpenAI-compatible Gemma + SiliconFlow DeepSeek
 SILICONFLOW_BASE_URL=https://api.siliconflow.cn/v1
 SILICONFLOW_API_KEY=sk-xxx
 DEEPSEEK_MODEL=Pro/deepseek-ai/DeepSeek-V3.2
-QWEN_MODEL=Qwen/Qwen3-8B
+GEMMA_MODEL=gemma-4-31B-nvfp4
+GEMMA_BASE_URL=http://192.168.3.46:8000/v1
+GEMMA_API_KEY=dummy
 
 # Debug Flags
 DEBUG_DEEPSEEK=0
@@ -270,7 +272,7 @@ No Pandoc / XeLaTeX dependency is required for report generation.
 |-------|----------|---------|
 | `glm-4-flash` | Zhipu AI | Web search |
 | `DeepSeek-V3.2` | SiliconFlow | Report generation, query planning, thinking mode |
-| `Qwen3-8B` | SiliconFlow | Theme matching, classification |
+| `gemma-4-31B-nvfp4` | Local vLLM | Theme matching, classification |
 
 ### DeepSeek Thinking Mode
 
