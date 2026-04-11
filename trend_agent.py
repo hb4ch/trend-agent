@@ -68,6 +68,7 @@ from llm_provider import get_llm_provider, LLMProvider, invoke_llm_messages
 logger = logging.getLogger(__name__)
 
 
+PROJECT_ROOT = Path(__file__).resolve().parent
 DATA_ROOT = Path("data")
 CHART_DIR = Path("charts")
 REPORT_DIR = Path("reports")
@@ -82,6 +83,7 @@ CHART_FONT_FALLBACKS = [
     "SimHei",
     "Arial Unicode MS",
 ]
+TUSHARE_CALL_INTERVAL_SEC = 0.5
 
 # Configuration from environment
 DEBUG_DEEPSEEK = os.environ.get("DEBUG_DEEPSEEK", "").strip() in {"1", "true", "True", "YES", "yes"}
@@ -101,6 +103,8 @@ class StrategyConfig:
     hard_fail_max_age_days: int = REGULATORY_MAX_AGE_DAYS
     hard_fail_reduce_materiality_threshold: float = 0.03
     theme_match_policy: str = "conservative"  # conservative|balanced|aggressive
+    theme_pre_audit_cap: int = 20
+    theme_post_audit_cap: int = 5
     max_names_per_theme: int = 4
     max_names_per_industry: int = 4
     gemma_batch_size: int = 4
@@ -134,6 +138,8 @@ class StrategyConfig:
             hard_fail_max_age_days=int(os.environ.get("HARD_FAIL_MAX_AGE_DAYS", str(REGULATORY_MAX_AGE_DAYS))),
             hard_fail_reduce_materiality_threshold=float(os.environ.get("HARD_FAIL_REDUCE_MATERIALITY_THRESHOLD", "0.03")),
             theme_match_policy=theme_match_policy,
+            theme_pre_audit_cap=max(1, int(os.environ.get("THEME_PRE_AUDIT_CAP", "20"))),
+            theme_post_audit_cap=max(1, int(os.environ.get("THEME_POST_AUDIT_CAP", "5"))),
             max_names_per_theme=int(os.environ.get("MAX_NAMES_PER_THEME", "4")),
             max_names_per_industry=int(os.environ.get("MAX_NAMES_PER_INDUSTRY", "4")),
             gemma_batch_size=max(1, int(os.environ.get("GEMMA_BATCH_SIZE", "4"))),
@@ -204,12 +210,20 @@ class AuditResult:
     confidence_score: float = 0.5
     research_depth: str = "standard"
     capital_signal_summary: str = ""
+    business_quality_score: float = 50.0
+    business_quality_label: str = "中性"
+    business_quality_summary: str = "财务数据不足，业务质量趋势待补充。"
+    business_quality_bullets: List[str] = None
+    quarters_analyzed: int = 0
+    financial_data_source: str = "none"
 
     def __post_init__(self):
         if self.positive_findings is None:
             self.positive_findings = []
         if self.growth_catalysts is None:
             self.growth_catalysts = []
+        if self.business_quality_bullets is None:
+            self.business_quality_bullets = []
 
 
 @dataclass
@@ -252,6 +266,11 @@ class ReportStockSection:
     capital_validation: List[str]
     trade_plan: List[str]
     risks: List[str]
+    business_quality_score: float
+    business_quality_label: str
+    business_quality_summary: str
+    business_quality_bullets: List[str]
+    quarters_analyzed: int
     source_urls: List[str]
     chart: Optional[ChartArtifact] = None
     audit_summaries: Optional[List[AuditResult]] = None
@@ -331,6 +350,125 @@ def parse_search_payload(raw: Any) -> Dict[str, Any]:
         summary = ""
 
     return {"summary": summary, "results": results, "urls": urls}
+
+
+def theme_has_usable_sources(theme: ThemeItem) -> bool:
+    """Return whether a theme carries at least one usable source URL."""
+    return bool(_normalize_source_urls(theme.sources))
+
+
+def is_actionable_theme_name(name: str) -> bool:
+    """Check if a theme name is actionable and not generic market noise."""
+    name = str(name or "").strip()
+    if not name:
+        return False
+    bad_tokens = ["股票", "辨识度", "传统经济", "蓝筹", "龙虎榜", "游资", "机构", "复盘", "涨停"]
+    if any(tok in name for tok in bad_tokens):
+        return False
+    if len(name) > 12:
+        return False
+    return True
+
+
+def needs_theme_extraction_correction(themes: List[ThemeItem]) -> bool:
+    """Return True when extracted web themes are empty or mostly weak."""
+    if not themes:
+        return True
+    weak = 0
+    for theme in themes:
+        if (
+            not is_actionable_theme_name(theme.name)
+            or not str(theme.summary or "").strip()
+            or not theme_has_usable_sources(theme)
+        ):
+            weak += 1
+    return weak > len(themes) / 2
+
+
+def needs_theme_fusion_correction(themes: List[ThemeItem]) -> bool:
+    """Return True when merged themes are valid JSON but missing required evidence fields."""
+    if not themes:
+        return True
+    valid_status = {"confirmed", "web_only", "capital_only", "weak"}
+    for theme in themes:
+        status = str(theme.validation_status or "").strip()
+        if status not in valid_status:
+            return True
+        if not str(theme.summary or "").strip():
+            return True
+        if status in {"confirmed", "web_only"} and not theme_has_usable_sources(theme):
+            return True
+        if status in {"confirmed", "capital_only"} and not str(theme.capital_signal or "").strip():
+            return True
+    return False
+
+
+def market_overview_has_weak_sources(items: List[ReportThemeOverview]) -> bool:
+    """Return True when report market overview lacks usable source URLs."""
+    if not items:
+        return True
+    for item in items:
+        if item.validation_status in {"confirmed", "web_only"} and not _normalize_source_urls(item.source_urls):
+            return True
+    return False
+
+
+def build_veto_planning_evidence(
+    local_brief: str,
+    business_snapshot: Dict[str, Any],
+    merged: Dict[str, Dict[str, Any]],
+    max_chars: int = 5000,
+) -> str:
+    """Build bounded full-history evidence for veto query replanning."""
+    lines = [
+        "[local]",
+        str(local_brief or "")[:900],
+        "[business_quality]",
+        f"quarters_analyzed={business_snapshot.get('quarters_analyzed', 0)}",
+        f"label={business_snapshot.get('business_quality_label', '中性')}",
+        f"score={business_snapshot.get('business_quality_score', 50.0)}",
+        f"summary={business_snapshot.get('business_quality_summary', '')}",
+    ]
+    bullets = business_snapshot.get("business_quality_bullets", [])
+    if isinstance(bullets, list):
+        lines.extend(f"- {str(item)[:220]}" for item in bullets[:4])
+
+    risk_terms = ("立案", "调查", "处罚", "诉讼", "仲裁", "减持", "退市", "监管函", "问询函", "风险警示")
+    hit_rows: List[str] = []
+    query_rows: List[str] = []
+    for key, item in merged.items():
+        query = str(item.get("query", "")).strip()
+        urls = [str(url) for url in item.get("urls", []) if str(url).strip()]
+        if query:
+            query_rows.append(f"- {key}: {query} | urls={', '.join(urls[:3]) if urls else 'none'}")
+        results = item.get("results", [])
+        if not isinstance(results, list):
+            continue
+        for hit in results:
+            if not isinstance(hit, dict):
+                continue
+            title = str(hit.get("title", "")).strip()
+            snippet = str(hit.get("snippet", "")).strip()
+            url = str(hit.get("url", "")).strip()
+            date = str(hit.get("date", "")).strip()
+            hay = f"{title} {snippet}"
+            if not hay.strip():
+                continue
+            priority = 1 if any(term in hay for term in risk_terms) else 0
+            hit_rows.append(f"{priority}|- {title[:120]} ({date})\n  {url[:220]}\n  {snippet[:320]}".strip())
+
+    if query_rows:
+        lines.append("[previous_queries]")
+        lines.extend(query_rows[-12:])
+    if hit_rows:
+        lines.append("[top_search_evidence]")
+        prioritized = [row[2:] for row in sorted(hit_rows, reverse=True)]
+        lines.extend(prioritized[:10])
+
+    text = "\n".join(lines)
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars] + f"\n...[truncated {len(text) - max_chars} chars]"
 
 
 def gemma_match_themes(
@@ -1437,15 +1575,17 @@ def deepseek_merge_themes(
 """
         )
 
-    prompt = ChatPromptTemplate.from_messages(
-        [
-            (
-                "system",
-                "你是资深A股策略分析师，擅长多源数据融合。请综合Web Search热点和龙虎榜资金流向，判断真正的市场主线。",
-            ),
-            (
-                "user",
-                """## 数据源1: Web Search热点（新闻情绪、政策催化）
+    def invoke_fusion(feedback: str = "") -> List[ThemeItem]:
+        feedback_block = f"\n\n## 上一次输出的问题\n{feedback}\n请修正这些问题后重新输出完整JSON。" if feedback else ""
+        prompt = ChatPromptTemplate.from_messages(
+            [
+                (
+                    "system",
+                    "你是资深A股策略分析师，擅长多源数据融合。请综合Web Search热点和龙虎榜资金流向，判断真正的市场主线。",
+                ),
+                (
+                    "user",
+                    """## 数据源1: Web Search热点（新闻情绪、政策催化）
 {web_summary}
 
 ## 数据源2: 龙虎榜资金流向（真实行为、游资偏好）
@@ -1479,50 +1619,60 @@ def deepseek_merge_themes(
 - summary要综合Web和龙虎榜双方面信息
 - capital_signal重点描述资金行为和趋势
 - 只保留最重要的3-5个主题
-""",
-            ),
-        ]
-    )
-
-    chain = prompt | llm_provider.get_llm("deepseek", temperature=0.2) | StrOutputParser()
-    result = chain.invoke({
-        "web_summary": "\n".join(web_summary),
-        "capital_summary": "\n".join(capital_summary) if capital_summary else "暂无龙虎榜数据",
-    })
-
-    logger.debug(f"DeepSeek fusion raw result: {truncate(result, 2000)}")
-
-    # Parse result
-    data = safe_json_loads(result)
-    logger.debug(f"DeepSeek fusion parsed data keys: {list(data.keys()) if isinstance(data, dict) else 'not a dict'}")
-    logger.debug(f"DeepSeek fusion themes count: {len(data.get('themes', [])) if isinstance(data, dict) else 0}")
-
-    merged_themes = []
-
-    # Map to keep sources from original web themes
-    sources_map = {t.name: t.sources for t in web_themes}
-
-    for item in data.get("themes", []):
-        name = item.get("name", "").strip()
-        if not name:
-            continue
-
-        # Use sources from original web theme if available
-        sources = item.get("sources", [])
-        if not sources and name in sources_map:
-            sources = sources_map[name]
-
-        merged_themes.append(
-            ThemeItem(
-                name=name,
-                keywords=[kw.strip() for kw in item.get("keywords", []) if kw.strip()],
-                summary=item.get("summary", "").strip(),
-                sources=sources,
-                validation_status=item.get("validation_status", "unknown"),
-                capital_signal=item.get("capital_signal", ""),
-                evidence=item.get("summary", ""),
-            )
+{feedback_block}""",
+                ),
+            ]
         )
+
+        chain = prompt | llm_provider.get_llm("deepseek", temperature=0.2) | StrOutputParser()
+        result = chain.invoke({
+            "web_summary": "\n".join(web_summary),
+            "capital_summary": "\n".join(capital_summary) if capital_summary else "暂无龙虎榜数据",
+            "feedback_block": feedback_block,
+        })
+
+        logger.debug(f"DeepSeek fusion raw result: {truncate(result, 2000)}")
+
+        data = safe_json_loads(result)
+        logger.debug(f"DeepSeek fusion parsed data keys: {list(data.keys()) if isinstance(data, dict) else 'not a dict'}")
+        logger.debug(f"DeepSeek fusion themes count: {len(data.get('themes', [])) if isinstance(data, dict) else 0}")
+
+        merged: List[ThemeItem] = []
+        sources_map = {t.name: t.sources for t in web_themes}
+
+        for item in data.get("themes", []):
+            name = item.get("name", "").strip()
+            if not name:
+                continue
+
+            sources = item.get("sources", [])
+            if not sources and name in sources_map:
+                sources = sources_map[name]
+
+            merged.append(
+                ThemeItem(
+                    name=name,
+                    keywords=[kw.strip() for kw in item.get("keywords", []) if kw.strip()],
+                    summary=item.get("summary", "").strip(),
+                    sources=sources,
+                    validation_status=item.get("validation_status", "unknown"),
+                    capital_signal=item.get("capital_signal", ""),
+                    evidence=item.get("summary", ""),
+                )
+            )
+        return merged
+
+    merged_themes = invoke_fusion()
+    if needs_theme_fusion_correction(merged_themes):
+        logger.warning("DeepSeek fusion returned weak-but-valid themes; requesting one corrective fusion pass")
+        corrected = invoke_fusion(
+            "部分主题缺少有效来源、资金信号或合法validation_status。"
+            "confirmed/web_only必须有来源URL；confirmed/capital_only必须有龙虎榜资金信号；summary不能为空。"
+        )
+        if corrected and not needs_theme_fusion_correction(corrected):
+            merged_themes = corrected
+        else:
+            logger.warning("Corrective fusion did not produce stronger themes; keeping original/fallback result")
 
     logger.info(f"Multi-source fusion complete: {len(merged_themes)} themes")
     for theme in merged_themes:
@@ -1599,40 +1749,71 @@ def phase1_market_intel(llm: BaseChatModel) -> List[ThemeItem]:
         ]
     )
 
-    chain = prompt | deepseek_llm | StrOutputParser()
-    result = chain.invoke({"results": json.dumps(raw_results, ensure_ascii=False)})
-    data = safe_json_loads(result)
-
-    themes = []
-    for item in data.get("themes", [])[:5]:
-        sources = item.get("sources", [])
-        if not isinstance(sources, list):
-            sources = []
-        sources = [s for s in sources if isinstance(s, str)]
-        sources = [s for s in sources if s in all_urls]
-        if not sources:
-            sources = all_urls[:3]
-        themes.append(
-            ThemeItem(
-                name=item.get("name", "").strip(),
-                keywords=[kw.strip() for kw in item.get("keywords", []) if kw.strip()],
-                summary=item.get("summary", "").strip(),
-                sources=sources,
+    def parse_extracted_themes(data: Any) -> List[ThemeItem]:
+        parsed_themes: List[ThemeItem] = []
+        if not isinstance(data, dict):
+            return parsed_themes
+        for item in data.get("themes", [])[:5]:
+            if not isinstance(item, dict):
+                continue
+            sources = item.get("sources", [])
+            if not isinstance(sources, list):
+                sources = []
+            sources = [s for s in sources if isinstance(s, str)]
+            sources = [s for s in sources if s in all_urls]
+            if not sources:
+                sources = all_urls[:3]
+            parsed_themes.append(
+                ThemeItem(
+                    name=item.get("name", "").strip(),
+                    keywords=[kw.strip() for kw in item.get("keywords", []) if kw.strip()],
+                    summary=item.get("summary", "").strip(),
+                    sources=sources,
+                )
             )
+        return parsed_themes
+
+    def invoke_theme_extraction(feedback: str = "") -> List[ThemeItem]:
+        extraction_prompt = prompt
+        payload = json.dumps(raw_results, ensure_ascii=False)
+        if feedback:
+            correction_prompt = ChatPromptTemplate.from_messages(
+                [
+                    (
+                        "system",
+                        "你是A股游资策略师，遵循\"重势重质\"原则。你需要修正上一次题材抽取中的证据质量问题。",
+                    ),
+                    (
+                        "user",
+                        "上一次输出存在问题：{feedback}\n"
+                        "请只基于同一批搜索结果重新输出JSON，要求题材名称可交易、summary非空、sources必须来自搜索结果URL列表。\n"
+                        '{{"themes":[{{"name":"","keywords":["",""],"summary":"","sources":["url1"]}}],'
+                        '"market_summary":""}}\n\n搜索结果:\n{results}',
+                    ),
+                ]
+            )
+            extraction_prompt = correction_prompt
+        chain = extraction_prompt | deepseek_llm | StrOutputParser()
+        result = chain.invoke({"results": payload, "feedback": feedback})
+        logger.debug(f"DeepSeek theme extraction raw result: {truncate(result, 2000)}")
+        return parse_extracted_themes(safe_json_loads(result))
+
+    themes = invoke_theme_extraction()
+    if needs_theme_extraction_correction(themes):
+        logger.warning(
+            "DeepSeek Phase 1 extraction returned weak themes; requesting one corrective extraction pass"
         )
+        corrected_themes = invoke_theme_extraction(
+            "题材为空、名称过泛、summary为空或缺少可验证来源URL。"
+            "请避免“股票/龙虎榜/涨停复盘”等泛化名称，保留3-5个可交易主线。"
+        )
+        if corrected_themes and not needs_theme_extraction_correction(corrected_themes):
+            themes = corrected_themes
+            logger.info("Corrective Phase 1 extraction produced stronger themes")
+        else:
+            logger.warning("Corrective Phase 1 extraction failed quality check; using original extracted/fallback themes")
 
-    def is_actionable_theme(theme: ThemeItem) -> bool:
-        """Check if theme is actionable (not generic noise)."""
-        if not theme.name:
-            return False
-        bad_tokens = ["股票", "辨识度", "传统经济", "蓝筹", "龙虎榜", "游资", "机构", "复盘", "涨停"]
-        if any(tok in theme.name for tok in bad_tokens):
-            return False
-        if len(theme.name) > 12:
-            return False
-        return True
-
-    filtered = [t for t in themes if is_actionable_theme(t)]
+    filtered = [t for t in themes if is_actionable_theme_name(t.name)]
     web_themes = filtered or themes
     logger.info(f"Web search extracted {len(web_themes)} market themes")
 
@@ -1709,7 +1890,7 @@ def phase2_quant_filter(themes: List[ThemeItem], config: Optional[StrategyConfig
     logger.info("Starting Phase 2: Dual-List Stock Selection")
     config = config or StrategyConfig.from_env()
     TOTAL_CAP = 10
-    THEME_CAP = 5
+    THEME_PRE_AUDIT_CAP = config.theme_pre_audit_cap
 
     def normalize_match_columns(df: pd.DataFrame) -> pd.DataFrame:
         out = df.copy()
@@ -1782,7 +1963,7 @@ def phase2_quant_filter(themes: List[ThemeItem], config: Optional[StrategyConfig
             base = min(1.1, base + 0.05)
         theme_strength_map[theme.name] = base
 
-    # ============ Step A: Build Theme-Driven List (max 5) ============
+    # ============ Step A: Build Theme-Driven List (pre-audit pool) ============
     theme_list: pd.DataFrame = pd.DataFrame()
     if themes:
         logger.info("Step A: Building theme-driven list...")
@@ -1886,19 +2067,19 @@ def phase2_quant_filter(themes: List[ThemeItem], config: Optional[StrategyConfig
                 )
                 theme_matched = theme_matched.sort_values("alpha_rank_score", ascending=False)
 
-                # A7: Take top 5, tag as theme_driven
-                theme_list = theme_matched.head(THEME_CAP).copy()
+                # A7: Take pre-audit theme pool and let deep audit decide the final top 5
+                theme_list = theme_matched.head(THEME_PRE_AUDIT_CAP).copy()
                 theme_list["list_type"] = "theme_driven"
                 theme_list["filter_tier"] = "theme_driven"
-                logger.info(f"Theme-driven list: {len(theme_list)} stocks selected")
+                logger.info(f"Theme-driven pre-audit list: {len(theme_list)} stocks selected")
             else:
                 logger.info("No theme matches found in broader pool")
     else:
         logger.info("No themes available, skipping theme-driven list")
 
-    # ============ Step B: Build Technical Alpha List (fills to 10) ============
-    tech_budget = TOTAL_CAP - len(theme_list)
-    logger.info(f"Step B: Building technical alpha list (budget={tech_budget})...")
+    # ============ Step B: Build Technical Alpha List (kept complementary pre-audit) ============
+    tech_budget = TOTAL_CAP
+    logger.info(f"Step B: Building technical alpha list (pre-audit budget={tech_budget})...")
 
     con_b = duckdb.connect()
     con_b.register("screen", screen_df)
@@ -2062,6 +2243,404 @@ def clamp01(value: float) -> float:
     return max(0.0, min(1.0, float(value)))
 
 
+def business_quality_label(score: float) -> str:
+    """Convert business quality score into a compact label."""
+    score = float(score)
+    if score >= 65.0:
+        return "强"
+    if score < 40.0:
+        return "偏弱"
+    return "中性"
+
+
+def _financial_parquet_files() -> List[Path]:
+    """Return all local financial parquet files under data/financial."""
+    root = DATA_ROOT / "financial"
+    if not root.exists():
+        return []
+    return sorted(p for p in root.rglob("*.parquet") if p.is_file())
+
+
+def _select_metric(series_df: pd.DataFrame, aliases: List[str]) -> pd.Series:
+    """Pick the first available numeric column among aliases."""
+    for col in aliases:
+        if col in series_df.columns:
+            return pd.to_numeric(series_df[col], errors="coerce")
+    return pd.Series(np.nan, index=series_df.index, dtype=float)
+
+
+def _empty_business_quality_snapshot(summary: str, bullets: Optional[List[str]] = None) -> Dict[str, Any]:
+    """Return a neutral business-quality snapshot with consistent shape."""
+    return {
+        "quarters_analyzed": 0,
+        "business_quality_score": 50.0,
+        "business_quality_label": "中性",
+        "business_quality_summary": summary,
+        "business_quality_bullets": bullets or ["财务数据不足，暂无法完成12季度经营趋势分析。"],
+        "financial_data_source": "none",
+    }
+
+
+def load_financial_quarters(ts_code: str, max_quarters: int = 12) -> pd.DataFrame:
+    """Load up to `max_quarters` financial rows for a stock from local financial parquet files."""
+    files = _financial_parquet_files()
+    if not files:
+        return pd.DataFrame()
+    quoted = ", ".join("'{}'".format(path.as_posix().replace("'", "''")) for path in files)
+    sql = (
+        "SELECT * FROM parquet_scan(["
+        + quoted
+        + "]) WHERE ts_code = ?"
+    )
+    con = duckdb.connect()
+    try:
+        df = con.execute(sql, [ts_code]).df()
+    except Exception as exc:
+        logger.warning("Failed to load financial quarters for %s: %s", ts_code, exc)
+        return pd.DataFrame()
+    finally:
+        con.close()
+    if df.empty:
+        return df
+    date_col = None
+    for candidate in ("end_date", "report_date", "ann_date", "f_ann_date", "trade_date"):
+        if candidate in df.columns:
+            date_col = candidate
+            break
+    if date_col is None:
+        return pd.DataFrame()
+    df = df.copy()
+    df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
+    df = df[df[date_col].notna()].sort_values(date_col).drop_duplicates(subset=[date_col], keep="last")
+    return df.tail(max_quarters).reset_index(drop=True)
+
+
+def _read_tushare_token() -> Optional[str]:
+    """Read Tushare API token from this project's env vars or local token file."""
+    for env_name in ("TUSHARE_API_TOKEN", "TUSHARE_TOKEN"):
+        token = os.environ.get(env_name, "").strip()
+        if token:
+            return token
+    token_path = Path(os.environ.get("TUSHARE_TOKEN_FILE", str(PROJECT_ROOT / "tokens.txt"))).expanduser()
+    try:
+        token = token_path.read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        logger.info("Tushare token file unavailable at %s: %s", token_path, exc)
+        return None
+    return token or None
+
+
+def _get_tushare_pro_client() -> Optional[Any]:
+    """Lazily initialize a Tushare Pro client for Phase 3 enrichment."""
+    token = _read_tushare_token()
+    if not token:
+        return None
+    try:
+        import tushare as ts  # type: ignore
+    except Exception as exc:
+        logger.info("Tushare import unavailable: %s", exc)
+        return None
+    try:
+        ts.set_token(token)
+        return ts.pro_api()
+    except Exception as exc:
+        logger.warning("Failed to initialize Tushare client: %s", exc)
+        return None
+
+
+def load_financial_quarters_from_tushare(ts_code: str, max_quarters: int = 12) -> pd.DataFrame:
+    """Load recent quarter financial rows from Tushare when local data is insufficient."""
+    pro = _get_tushare_pro_client()
+    if pro is None:
+        return pd.DataFrame()
+
+    endpoint_specs = [
+        (
+            "income",
+            {
+                "fields": "ts_code,end_date,total_revenue,revenue,n_income_attr_p,n_income,netprofit,gross_margin,grossprofit_margin",
+            },
+        ),
+        (
+            "cashflow",
+            {
+                "fields": "ts_code,end_date,n_cashflow_act,net_cash_flows_oper_act",
+            },
+        ),
+        (
+            "fina_indicator",
+            {
+                "fields": "ts_code,end_date,grossprofit_margin",
+            },
+        ),
+    ]
+
+    merged: Optional[pd.DataFrame] = None
+    for idx, (endpoint_name, kwargs) in enumerate(endpoint_specs):
+        if idx > 0 and TUSHARE_CALL_INTERVAL_SEC > 0:
+            time.sleep(TUSHARE_CALL_INTERVAL_SEC)
+        fetcher = getattr(pro, endpoint_name, None)
+        if fetcher is None:
+            continue
+        try:
+            frame = fetcher(ts_code=ts_code, limit=max_quarters, **kwargs)
+        except Exception as exc:
+            logger.info("Tushare %s fetch failed for %s: %s", endpoint_name, ts_code, exc)
+            continue
+        if frame is None or frame.empty:
+            continue
+        frame = frame.copy()
+        if "end_date" not in frame.columns:
+            continue
+        frame["end_date"] = pd.to_datetime(frame["end_date"], errors="coerce")
+        frame = frame[frame["end_date"].notna()]
+        if frame.empty:
+            continue
+        frame = frame.sort_values("end_date").drop_duplicates(subset=["end_date"], keep="last")
+        keep_cols = ["ts_code", "end_date"] + [col for col in frame.columns if col not in {"ts_code", "end_date"}]
+        frame = frame[keep_cols]
+        if merged is None:
+            merged = frame
+        else:
+            merged = merged.merge(frame, on=["ts_code", "end_date"], how="outer")
+
+    if merged is None or merged.empty:
+        return pd.DataFrame()
+    merged = merged.sort_values("end_date").drop_duplicates(subset=["end_date"], keep="last")
+    return merged.tail(max_quarters).reset_index(drop=True)
+
+
+def _extract_first_metric_value(text: str, label_patterns: List[str]) -> Optional[float]:
+    """Extract the first numeric value following any metric label pattern."""
+    if not text:
+        return None
+    normalized = str(text).replace(",", "").replace("，", "")
+    for pattern in label_patterns:
+        regex = re.compile(pattern + r"[^0-9\-]{0,12}(-?\d+(?:\.\d+)?)", flags=re.IGNORECASE)
+        match = regex.search(normalized)
+        if match:
+            try:
+                return float(match.group(1))
+            except ValueError:
+                continue
+    return None
+
+
+def load_financial_quarters_from_web(ts_code: str, name: str, max_quarters: int = 12) -> pd.DataFrame:
+    """Fallback quarter loader using official cninfo web search snippets."""
+    current_year = datetime.now().year
+    symbol = stock_symbol(ts_code)
+    queries = [
+        f"site:cninfo.com.cn {symbol} {name} {current_year} 年第一季度报告 营业收入 归属于上市公司股东的净利润 经营活动产生的现金流量净额",
+        f"site:cninfo.com.cn {symbol} {name} {current_year - 1} 年年度报告摘要 分季度主要会计数据 营业收入 归属于上市公司股东的净利润 经营活动产生的现金流量净额",
+        f"site:cninfo.com.cn {symbol} {name} {current_year - 2} 年年度报告摘要 分季度主要会计数据 营业收入 归属于上市公司股东的净利润 经营活动产生的现金流量净额",
+        f"site:cninfo.com.cn {symbol} {name} {current_year - 3} 年年度报告摘要 分季度主要会计数据 营业收入 归属于上市公司股东的净利润 经营活动产生的现金流量净额",
+    ]
+    rows: List[Dict[str, Any]] = []
+    seen_urls = set()
+    for idx, query in enumerate(queries):
+        parsed = parse_search_payload(run_search(query))
+        for item in parsed.get("results", [])[:5]:
+            if not isinstance(item, dict):
+                continue
+            url = str(item.get("url", "")).strip()
+            if url and url in seen_urls:
+                continue
+            if url:
+                seen_urls.add(url)
+            text = " ".join(
+                str(item.get(key, ""))
+                for key in ("title", "snippet", "content", "raw")
+            )
+            report_date = parse_result_date(item.get("date"))
+            if report_date is None:
+                report_date = datetime(current_year - idx, 3, 31)
+            revenue = _extract_first_metric_value(text, [r"营业收入", r"营收"])
+            net_income = _extract_first_metric_value(text, [r"归属于[^\s]{0,12}净利润", r"归母净利润", r"净利润"])
+            op_cashflow = _extract_first_metric_value(text, [r"经营活动产生的现金流量净额", r"经营现金流量净额"])
+            if revenue is None and net_income is None and op_cashflow is None:
+                continue
+            rows.append(
+                {
+                    "ts_code": ts_code,
+                    "end_date": pd.to_datetime(report_date),
+                    "revenue": revenue,
+                    "net_income": net_income,
+                    "n_cashflow_act": op_cashflow,
+                    "web_source_url": url,
+                    "web_source_text": text[:800],
+                }
+            )
+    if not rows:
+        return pd.DataFrame()
+    df = pd.DataFrame(rows).sort_values("end_date").drop_duplicates(subset=["end_date"], keep="last")
+    return df.tail(max_quarters).reset_index(drop=True)
+
+
+def analyze_business_quality(ts_code: str, max_quarters: int = 12) -> Dict[str, Any]:
+    """Analyze up to 12 quarters of local financial history and return a deterministic quality snapshot."""
+    df = load_financial_quarters(ts_code, max_quarters=max_quarters)
+    if df.empty:
+        return _empty_business_quality_snapshot("未找到本地季度财报数据，业务质量分析保持中性。")
+    return analyze_business_quality_from_df(df, max_quarters=max_quarters, source_note=None, financial_data_source="local")
+
+
+def analyze_business_quality_from_df(
+    df: pd.DataFrame,
+    max_quarters: int = 12,
+    source_note: Optional[str] = None,
+    financial_data_source: str = "local",
+) -> Dict[str, Any]:
+    """Analyze quarter financial data from a prepared DataFrame."""
+    if df is None or df.empty:
+        return _empty_business_quality_snapshot("未找到本地季度财报数据，业务质量分析保持中性。")
+
+    revenue = _select_metric(df, ["revenue", "total_revenue", "total_operat_income", "operating_revenue", "operate_income"])
+    gross_profit = _select_metric(df, ["gross_profit", "grossprofit", "gross_profit_total"])
+    gross_margin = _select_metric(df, ["gross_margin", "grossprofit_margin", "gross_margin_rate", "gp_margin"])
+    net_income = _select_metric(df, ["net_income", "n_income", "n_income_attr_p", "profit_to_gr", "netprofit"])
+    op_cashflow = _select_metric(df, ["operate_cashflow", "n_cashflow_act", "net_cash_flows_oper_act", "oper_cash_flow"])
+
+    if gross_margin.isna().all() and not gross_profit.isna().all() and not revenue.isna().all():
+        gross_margin = (gross_profit / revenue.replace(0, np.nan)) * 100.0
+
+    quarter_count = int(len(df))
+    recent_n = max(2, min(4, quarter_count // 2 if quarter_count > 2 else quarter_count))
+
+    def trend_delta(series: pd.Series) -> Optional[float]:
+        valid = pd.to_numeric(series, errors="coerce").dropna()
+        if len(valid) < 2:
+            return None
+        recent = float(valid.tail(recent_n).mean())
+        prior = float(valid.head(recent_n).mean())
+        scale = max(abs(prior), abs(recent), 1.0)
+        return (recent - prior) / scale
+
+    rev_delta = trend_delta(revenue)
+    margin_delta = trend_delta(gross_margin)
+    cash_delta = trend_delta(op_cashflow)
+    income_delta = trend_delta(net_income)
+
+    score = 50.0
+    bullets: List[str] = []
+    availability_notes: List[str] = []
+
+    if revenue.dropna().shape[0] >= 2 and rev_delta is not None:
+        score += max(-18.0, min(18.0, rev_delta * 35.0))
+        rev_label = "改善" if rev_delta > 0.05 else "走弱" if rev_delta < -0.05 else "平稳"
+        bullets.append(f"营收趋势{rev_label}，最近{recent_n}个季度相较早期样本变化{rev_delta * 100:.1f}%。")
+    else:
+        availability_notes.append("营收数据不足")
+
+    if gross_margin.dropna().shape[0] >= 2 and margin_delta is not None:
+        score += max(-10.0, min(10.0, margin_delta * 25.0))
+        margin_label = "改善" if margin_delta > 0.03 else "承压" if margin_delta < -0.03 else "平稳"
+        bullets.append(f"盈利质量{margin_label}，毛利率/毛利水平呈现{margin_label}趋势。")
+    else:
+        availability_notes.append("毛利质量指标有限")
+
+    if op_cashflow.dropna().shape[0] >= 2 and cash_delta is not None:
+        score += max(-12.0, min(12.0, cash_delta * 25.0))
+        cash_label = "改善" if cash_delta > 0.05 else "承压" if cash_delta < -0.05 else "平稳"
+        bullets.append(f"经营现金流{cash_label}，现金转化趋势可跟踪。")
+    else:
+        availability_notes.append("经营现金流数据不足")
+
+    if net_income.dropna().shape[0] >= 2 and income_delta is not None:
+        score += max(-10.0, min(10.0, income_delta * 22.0))
+        latest_income = float(net_income.dropna().iloc[-1])
+        early_income = float(net_income.dropna().iloc[0])
+        if latest_income < 0:
+            if latest_income > early_income:
+                bullets.append("公司仍可能处于亏损阶段，但亏损收窄或经营杠杆改善，不因未盈利直接否定。")
+                score += 6.0
+            else:
+                bullets.append("公司仍处亏损阶段，且亏损改善幅度有限，需要继续观察兑现路径。")
+                score -= 4.0
+        elif income_delta > 0.03:
+            bullets.append("净利润/归母利润呈改善趋势，利润兑现能力增强。")
+    else:
+        availability_notes.append("净利润趋势样本有限")
+
+    if rev_delta is not None and rev_delta < -0.08 and (margin_delta is not None and margin_delta < -0.04) and (cash_delta is not None and cash_delta < -0.08):
+        score -= 12.0
+        bullets.append("营收、盈利质量与经营现金流同步走弱，基本面趋势偏弱。")
+
+    score = max(0.0, min(100.0, score))
+    label = business_quality_label(score)
+    if quarter_count < max_quarters:
+        bullets.append(f"本次仅基于最近{quarter_count}个季度进行分析，可比历史不足12个季度。")
+    if source_note:
+        bullets.append(source_note)
+    if availability_notes:
+        bullets.append("部分指标缺失：" + "、".join(dict.fromkeys(availability_notes)) + "。")
+    bullets = bullets[:4] if bullets else ["季度财报可用字段有限，业务质量判断保持中性。"]
+
+    summary_bits = []
+    if rev_delta is not None:
+        summary_bits.append("营收改善" if rev_delta > 0.05 else "营收走弱" if rev_delta < -0.05 else "营收平稳")
+    if margin_delta is not None:
+        summary_bits.append("盈利质量改善" if margin_delta > 0.03 else "盈利质量承压" if margin_delta < -0.03 else "盈利质量平稳")
+    if cash_delta is not None:
+        summary_bits.append("现金流改善" if cash_delta > 0.05 else "现金流承压" if cash_delta < -0.05 else "现金流平稳")
+    summary = "；".join(summary_bits[:3]) if summary_bits else "财务字段有限，业务质量维持中性判断。"
+
+    return {
+        "quarters_analyzed": quarter_count,
+        "business_quality_score": round(score, 1),
+        "business_quality_label": label,
+        "business_quality_summary": summary,
+        "business_quality_bullets": bullets,
+        "financial_data_source": financial_data_source,
+    }
+
+
+def analyze_business_quality_with_fallbacks(ts_code: str, name: str, max_quarters: int = 12) -> Dict[str, Any]:
+    """Analyze business quality using local data first, then Tushare, then web-search fallback."""
+    local_df = load_financial_quarters(ts_code, max_quarters=max_quarters)
+    if not local_df.empty:
+        return analyze_business_quality_from_df(local_df, max_quarters=max_quarters, financial_data_source="local")
+    tushare_df = load_financial_quarters_from_tushare(ts_code, max_quarters=max_quarters)
+    if not tushare_df.empty:
+        return analyze_business_quality_from_df(tushare_df, max_quarters=max_quarters, financial_data_source="tushare")
+    web_df = load_financial_quarters_from_web(ts_code, name, max_quarters=max_quarters)
+    if not web_df.empty:
+        return analyze_business_quality_from_df(
+            web_df,
+            max_quarters=max_quarters,
+            source_note="季度数据来自巨潮资讯搜索结果抽取，精度低于本地结构化财报表。",
+            financial_data_source="web",
+        )
+    return _empty_business_quality_snapshot("本地、Tushare 与Web检索均未获得可用季度财报数据，业务质量分析保持中性。")
+
+
+def aggregate_business_quality(stock_audits: List[AuditResult]) -> Dict[str, Any]:
+    """Aggregate business quality fields across stock audits."""
+    if not stock_audits:
+        return {
+            "business_quality_score": 50.0,
+            "business_quality_label": "中性",
+            "business_quality_summary": "财务数据不足，业务质量趋势待补充。",
+            "business_quality_bullets": ["财务数据不足，暂无法完成12季度经营趋势分析。"],
+            "quarters_analyzed": 0,
+            "financial_data_source": "none",
+        }
+    best = max(stock_audits, key=lambda a: (a.quarters_analyzed, a.business_quality_score))
+    bullets: List[str] = []
+    for audit in stock_audits:
+        for bullet in audit.business_quality_bullets or []:
+            if bullet and bullet not in bullets:
+                bullets.append(bullet)
+    return {
+        "business_quality_score": float(best.business_quality_score),
+        "business_quality_label": str(best.business_quality_label),
+        "business_quality_summary": str(best.business_quality_summary),
+        "business_quality_bullets": bullets[:4] or ["财务数据不足，暂无法完成12季度经营趋势分析。"],
+        "quarters_analyzed": int(best.quarters_analyzed),
+        "financial_data_source": str(best.financial_data_source or "none"),
+    }
+
+
 def ensure_valuation_columns(df: pd.DataFrame) -> pd.DataFrame:
     """Backfill neutral valuation fields when upstream mocks or legacy data omit them."""
     if df is None or df.empty:
@@ -2123,6 +2702,25 @@ def apply_diversification_constraints(
     return pd.DataFrame(selected_rows) if selected_rows else ranked.head(target_n)
 
 
+def trim_post_audit_theme_candidates(
+    ranked: pd.DataFrame,
+    *,
+    theme_post_audit_cap: int,
+    total_cap: int,
+) -> pd.DataFrame:
+    """Trim theme-driven names after audit/rerank, then backfill with technical names."""
+    if ranked is None or ranked.empty or "list_type" not in ranked.columns:
+        return ranked.head(total_cap) if ranked is not None else ranked
+    theme_mask = ranked["list_type"].isin(["theme_driven", "both"])
+    theme_part = ranked[theme_mask].head(theme_post_audit_cap)
+    selected_codes = set(theme_part["ts_code"].astype(str)) if not theme_part.empty else set()
+    technical_part = ranked[(ranked["list_type"] == "technical") & (~ranked["ts_code"].astype(str).isin(selected_codes))]
+    overflow_theme = ranked[theme_mask & (~ranked["ts_code"].astype(str).isin(selected_codes))]
+    combined = pd.concat([theme_part, technical_part, overflow_theme], ignore_index=True)
+    combined = combined.drop_duplicates(subset="ts_code", keep="first")
+    return combined.head(total_cap).reset_index(drop=True)
+
+
 def rank_candidates_for_alpha(
     candidates: pd.DataFrame,
     audits: List[AuditResult],
@@ -2153,23 +2751,27 @@ def rank_candidates_for_alpha(
                 "positive_finding_count": 0.0,
                 "source_quality_score": 0.0,
                 "catalyst_diversity": 0.0,
+                "business_quality_score": 50.0,
             }
         worst = max(verdict_risk.get(item.verdict, 0.45) for item in items)
         findings = []
         catalyst_types = set()
         source_scores = []
+        business_scores = []
         for item in items:
             findings.extend(item.positive_findings or [])
             for c in (item.growth_catalysts or []):
                 catalyst_types.add(c.catalyst_type)
             for src in (item.sources or []):
                 source_scores.append(get_source_tier_weight(src))
+            business_scores.append(float(item.business_quality_score or 50.0))
         source_quality = float(np.mean(source_scores)) if source_scores else 0.0
         return {
             "audit_risk_score": worst,
             "positive_finding_count": float(len(findings)),
             "source_quality_score": source_quality,
             "catalyst_diversity": float(len(catalyst_types)),
+            "business_quality_score": float(np.mean(business_scores)) if business_scores else 50.0,
         }
 
     alpha_rows = []
@@ -2187,6 +2789,7 @@ def rank_candidates_for_alpha(
         theme_strength = clamp01(float(row.get("theme_strength_score", 0.0)))
         valuation_quality = clamp01(float(row.get("valuation_quality_score", 50.0)) / 100.0)
         valuation_stretch = clamp01(float(row.get("valuation_stretch_score", 50.0)) / 100.0)
+        business_quality = clamp01(float(af.get("business_quality_score", 50.0)) / 100.0)
         source_quality = clamp01(af["source_quality_score"])
         finding_score = clamp01(af["positive_finding_count"] / 4.0)
         catalyst_score = clamp01(af["catalyst_diversity"] / 3.0)
@@ -2202,6 +2805,7 @@ def rank_candidates_for_alpha(
             0.16 * ma_comp +
             0.15 * theme_strength +
             config.valuation_weight_alpha * valuation_quality +
+            0.08 * business_quality +
             0.10 * finding_score +
             0.07 * catalyst_score +
             0.06 * source_quality +
@@ -2218,6 +2822,7 @@ def rank_candidates_for_alpha(
                 "positive_finding_count": af["positive_finding_count"],
                 "source_quality_score": source_quality,
                 "catalyst_diversity": af["catalyst_diversity"],
+                "business_quality_score": business_quality * 100.0,
                 "valuation_quality_score": valuation_quality * 100.0,
                 "valuation_stretch_score": valuation_stretch * 100.0,
                 "valuation_label": str(row.get("valuation_label", classify_valuation_label(valuation_stretch * 100.0))),
@@ -2227,7 +2832,7 @@ def rank_candidates_for_alpha(
 
     alpha_df = pd.DataFrame(alpha_rows)
     ranked = ranked.merge(alpha_df, on="ts_code", how="left", suffixes=("", "_new"))
-    for col in ["valuation_quality_score", "valuation_stretch_score", "valuation_label"]:
+    for col in ["business_quality_score", "valuation_quality_score", "valuation_stretch_score", "valuation_label"]:
         new_col = f"{col}_new"
         if new_col in ranked.columns:
             ranked[col] = ranked[new_col]
@@ -2247,6 +2852,11 @@ def rank_candidates_for_alpha(
     else:
         ranked = ranked.sort_values("alpha_rank_score", ascending=False)
 
+    ranked = trim_post_audit_theme_candidates(
+        ranked.reset_index(drop=True),
+        theme_post_audit_cap=config.theme_post_audit_cap,
+        total_cap=max(10, config.theme_post_audit_cap),
+    )
     ranked = apply_diversification_constraints(
         ranked,
         max_per_theme=config.max_names_per_theme,
@@ -2284,6 +2894,7 @@ def phase3_deep_audit(
         extract_positive_findings,
         get_source_tier_weight,
         deepseek_plan_opportunity_queries,
+        deepseek_synthesize_opportunity_results,
         OPPORTUNITY_QUERY_TEMPLATES,
     )
 
@@ -2337,6 +2948,7 @@ def phase3_deep_audit(
 
             # Get capital signal for this theme
             capital_signal = theme_capital_map.get(theme, "")
+            business_snapshot = analyze_business_quality_with_fallbacks(str(row["ts_code"]), name)
 
             # ============ PASS 1: Opportunity Discovery ============
             logger.debug(f"Opportunity discovery pass: stock={name}")
@@ -2451,11 +3063,30 @@ def phase3_deep_audit(
                         "queries": followup_queries,
                         "focus_areas": followup_plan.get("focus_areas", []),
                     })
+                    followup_result_payloads: List[Dict[str, Any]] = []
 
                     for fq in followup_queries:
                         raw = run_search(fq)
                         parsed = parse_search_payload(raw)
                         search_results = parsed.get("results", [])
+                        compact_results = []
+                        for item in search_results[:5]:
+                            if not isinstance(item, dict):
+                                continue
+                            compact_results.append(
+                                {
+                                    "title": str(item.get("title", ""))[:200],
+                                    "snippet": str(item.get("snippet", ""))[:500],
+                                    "url": str(item.get("url", ""))[:300],
+                                    "date": str(item.get("date", ""))[:40],
+                                }
+                            )
+                        followup_result_payloads.append(
+                            {
+                                "query": fq,
+                                "results": compact_results,
+                            }
+                        )
 
                         for cat in evidence_gaps:
                             findings = extract_positive_findings(search_results, name, cat)
@@ -2477,6 +3108,80 @@ def phase3_deep_audit(
                                 if snippet and name in snippet:
                                     opportunity_evidence.append(f"[followup] {snippet[:200]}")
 
+                    synthesized = deepseek_synthesize_opportunity_results(
+                        name=name,
+                        theme=theme,
+                        current_findings=current_findings_summary,
+                        followup_results=followup_result_payloads,
+                    )
+                    llm_findings_added = 0
+                    llm_catalysts_added = 0
+                    finding_keys = {
+                        (str(item.description).strip(), str(item.source_url).strip())
+                        for item in positive_findings
+                    }
+                    catalyst_keys = {
+                        (str(item.description).strip(), str(item.timeframe).strip())
+                        for item in growth_catalysts
+                    }
+                    if synthesized:
+                        for item in synthesized.get("positive_findings", []):
+                            if not isinstance(item, dict):
+                                continue
+                            description = str(item.get("description", "")).strip()
+                            source_url = str(item.get("source_url", "")).strip()
+                            if not description or not source_url:
+                                continue
+                            key = (description, source_url)
+                            if key in finding_keys:
+                                continue
+                            finding = PositiveFinding(
+                                category=str(item.get("category", "market_expansion")).strip() or "market_expansion",
+                                description=description,
+                                evidence=str(item.get("evidence", "")).strip()[:300],
+                                confidence=max(0.0, min(1.0, float(item.get("confidence", 0.5) or 0.5))),
+                                source_url=source_url,
+                                date=str(item.get("date", "")).strip() or None,
+                            )
+                            positive_findings.append(finding)
+                            finding_keys.add(key)
+                            if source_url not in opportunity_urls:
+                                opportunity_urls.append(source_url)
+                            llm_findings_added += 1
+                        for item in synthesized.get("growth_catalysts", []):
+                            if not isinstance(item, dict):
+                                continue
+                            description = str(item.get("description", "")).strip()
+                            timeframe = str(item.get("timeframe", "medium_term")).strip() or "medium_term"
+                            if not description:
+                                continue
+                            key = (description, timeframe)
+                            if key in catalyst_keys:
+                                continue
+                            growth_catalysts.append(
+                                GrowthCatalyst(
+                                    catalyst_type=str(item.get("catalyst_type", "market_expansion")).strip() or "market_expansion",
+                                    description=description,
+                                    timeframe=timeframe,
+                                    confidence=max(0.0, min(1.0, float(item.get("confidence", 0.5) or 0.5))),
+                                )
+                            )
+                            catalyst_keys.add(key)
+                            llm_catalysts_added += 1
+                    trace_append(
+                        trace_path,
+                        "opportunity_llm",
+                        {
+                            "ts_code": row["ts_code"],
+                            "name": name,
+                            "theme": theme,
+                            "usable": bool(synthesized),
+                            "finding_count": llm_findings_added,
+                            "catalyst_count": llm_catalysts_added,
+                            "reason": str((synthesized or {}).get("reason", ""))[:300],
+                        },
+                    )
+
             logger.info(f"Opportunity discovery: {len(positive_findings)} findings, {len(growth_catalysts)} catalysts for {name}")
             trace_append(trace_path, "opportunity_pass_done", {
                 "ts_code": row["ts_code"],
@@ -2491,7 +3196,16 @@ def phase3_deep_audit(
             trace_append(trace_path, "veto_pass_start", {"ts_code": row["ts_code"], "name": name, "theme": theme})
 
             merged = {}
-            evidence_snippets = [f"[local]\n{local_brief_for_audit(row)}"]
+            local_brief = local_brief_for_audit(row)
+            evidence_snippets = [
+                f"[local]\n{local_brief}",
+                "[financial]\n"
+                f"quarters_analyzed={business_snapshot['quarters_analyzed']}\n"
+                f"business_quality_label={business_snapshot['business_quality_label']}\n"
+                f"business_quality_score={business_snapshot['business_quality_score']}\n"
+                f"summary={business_snapshot['business_quality_summary']}\n"
+                + "\n".join(f"- {item}" for item in business_snapshot["business_quality_bullets"]),
+            ]
             used_queries = set()
             verdict = "warn"
             rationale = ""
@@ -2521,15 +3235,32 @@ def phase3_deep_audit(
                         f"site:cninfo.com.cn {symbol} {name} 退市 风险警示",
                     ]
                 else:
+                    planning_evidence = build_veto_planning_evidence(
+                        local_brief=local_brief,
+                        business_snapshot=business_snapshot,
+                        merged=merged,
+                    )
                     plan = deepseek_plan_queries(
                         name=name,
                         theme=theme,
-                        evidence="\n".join(evidence_snippets[-4:])[-2000:],
+                        evidence=planning_evidence,
                         pass_id=pass_id,
                     )
                     if plan is not None:
                         logger.debug(f"Veto plan pass={pass_id}: {truncate(pretty_print(plan), 1200)}")
-                        trace_append(trace_path, "veto_plan", {"ts_code": row["ts_code"], "name": name, "theme": theme, "pass_id": pass_id, "plan": plan})
+                        trace_append(
+                            trace_path,
+                            "veto_plan",
+                            {
+                                "ts_code": row["ts_code"],
+                                "name": name,
+                                "theme": theme,
+                                "pass_id": pass_id,
+                                "plan": plan,
+                                "evidence_chars": len(planning_evidence),
+                                "query_count": len(used_queries),
+                            },
+                        )
                     if plan and plan.get("stop"):
                         logger.debug(f"Veto plan stop pass={pass_id} reason={plan.get('reason','')}")
                         executed_passes = pass_id
@@ -2745,6 +3476,9 @@ def phase3_deep_audit(
             if verdict != "fail" and positive_findings:
                 finding_summary = "；".join([f"{f.category}:{f.description[:30]}" for f in positive_findings[:3]])
                 rationale = f"发现正面催化：{finding_summary}。{rationale}"
+            rationale = f"12季度经营趋势：{business_snapshot['business_quality_summary']}。{rationale}".strip("。")
+
+            confidence = max(0.0, min(1.0, confidence + (float(business_snapshot["business_quality_score"]) - 50.0) / 250.0))
 
             audit_results.append(
                 AuditResult(
@@ -2759,6 +3493,12 @@ def phase3_deep_audit(
                     confidence_score=round(confidence, 2),
                     research_depth="deep" if len(positive_findings) >= 3 else "standard",
                     capital_signal_summary=capital_signal,
+                    business_quality_score=float(business_snapshot["business_quality_score"]),
+                    business_quality_label=str(business_snapshot["business_quality_label"]),
+                    business_quality_summary=str(business_snapshot["business_quality_summary"]),
+                    business_quality_bullets=list(business_snapshot["business_quality_bullets"]),
+                    quarters_analyzed=int(business_snapshot["quarters_analyzed"]),
+                    financial_data_source=str(business_snapshot.get("financial_data_source", "none")),
                 )
             )
             logger.debug(f"Research done: stock={name} theme={theme} verdict={verdict} findings={len(positive_findings)}")
@@ -3327,6 +4067,44 @@ def _normalize_source_urls(*values: Any) -> List[str]:
     return urls
 
 
+def _payload_has_weak_sources(payload: dict) -> bool:
+    """Return True when the payload lacks enough usable source URLs."""
+    if not isinstance(payload, dict):
+        return True
+    normalized_urls = _normalize_source_urls(
+        payload.get("source_urls"),
+        payload.get("positive_findings"),
+        payload.get("summary"),
+    )
+    if len(normalized_urls) >= 2:
+        return False
+    findings = payload.get("positive_findings")
+    if not isinstance(findings, list) or not findings:
+        return True
+    valid_finding_urls = 0
+    for item in findings:
+        if not isinstance(item, dict):
+            continue
+        if _normalize_source_urls(item.get("source_url"), item.get("url")):
+            valid_finding_urls += 1
+    return valid_finding_urls < min(2, len(findings))
+
+
+def _build_missing_sources_feedback(row: dict, stock_audits: List[AuditResult]) -> str:
+    """Tell the report LLM to fetch stronger external sources before finalizing."""
+    name = str(row.get("name", row.get("ts_code", "")))
+    matched = row.get("matched_themes", [])
+    theme = matched[0] if isinstance(matched, list) and matched else (
+        stock_audits[0].theme if stock_audits else "主营业务"
+    )
+    return (
+        "当前返回的来源过弱：source_urls 为空或不足，或 positive_findings 缺少可核验URL。\n"
+        "不要直接定稿。请先调用 web_search 补充近期、可点击、可核验的外部来源。\n"
+        f"优先搜索：{name} {theme} 最新进展 / 公告 / 客户 / 订单 / 政策 / 监管。\n"
+        "要求：至少补到 2 个有效 http/https URL；若财务信息已足够，不要重复搜索财务数值，优先补业务和外部证据。"
+    )
+
+
 def _build_markdown_table(title: str, headers: List[str], rows: List[Dict[str, str]]) -> str:
     lines = [title, "", "| " + " | ".join(headers) + " |", "| " + " | ".join(["---"] * len(headers)) + " |"]
     for row in rows:
@@ -3419,6 +4197,9 @@ _STOCK_SECTION_SYSTEM_PROMPT_TEMPLATE = (
     "如需补充信息，可先返回工具调用："
     "{\"tool\":\"web_search|duckdb|python\",\"input\":\"...\"}\n"
     "优先顺序：1) 直接使用上下文；2) 用python做检查、衍生指标、证据汇总、数据变换；3) 缺少原始历史行时再用duckdb；4) 缺少外部信息时用web_search。\n"
+    "结构化财务事实优先直接使用上下文中的本地/内部财务数据，不要为了重复验证财务数值而额外发起web_search。\n"
+    "当你缺少近期外部证据时，必须优先通过web_search补证，而不是凭常识推断。尤其是以下场景：最新进展、政策催化、监管动态、客户/订单验证、诉讼调查、产业链合作、市场传闻核验。\n"
+    "如果财务信息已经足够，请把web_search集中用于非财务外部证据，例如公告、新闻、政策、客户、订单、监管和公司事件。\n"
     "Python工具保持开放式，不限制写法。可用变量：stock_profile(dict), signal_row(dict), audit_rows(list[dict]), chart_notes(list), candidates_df(DataFrame), pd, np, duckdb, json, math, datetime, re。\n"
     "Python中额外提供可选工具：show(obj, limit), to_df(obj), current_stock_df(), recent_prices(ts_code=None, days=60), audit_summary()。它们只是方便函数，你也可以自由写任意Python代码。\n"
     "DuckDB主要用于原始历史行检索。signal_row 和 stock_profile 都是单行当前股票上下文，不是完整股票表，不要按 name/ts_code 再过滤它们。\n"
@@ -3436,6 +4217,9 @@ _STOCK_SECTION_SYSTEM_PROMPT_TEMPLATE = (
     "\"confidence\":0.7,\"source_url\":\"https://...\",\"date\":\"2026-01-01\"}],"
     "\"growth_catalysts\":[{\"catalyst_type\":\"policy\",\"description\":\"...\","
     "\"timeframe\":\"near_term|medium_term|long_term\",\"confidence\":0.7}],"
+    "\"business_quality_score\":65.0,\"business_quality_label\":\"强|中性|偏弱\","
+    "\"business_quality_summary\":\"12季度经营趋势一句话总结\","
+    "\"business_quality_bullets\":[\"要点1\",\"要点2\"],\"quarters_analyzed\":12,"
     "\"technical_analysis\":[\"技术分析\"],\"capital_validation\":[\"资金验证\"],"
     "\"trade_plan\":[\"交易建议\"],\"risks\":[\"风险提示\"],"
     "\"source_urls\":[\"https://...\"],\"research_depth\":\"standard|deep\"}}\n"
@@ -3497,8 +4281,14 @@ def _build_tool_feedback_message(
         guidance.append("DuckDB已返回原始数据；如需汇总、筛选、打分，请优先改用Python完成。")
     elif status == "success" and tool == "python":
         guidance.append("Python已返回可用分析结果；若信息足够，请直接输出最终JSON。")
+        guidance.append("若结构化财务数据已足够，不要再为财务数值重复调用web_search。")
+    elif status == "success" and tool == "web_search":
+        guidance.append("web_search已返回外部证据；请优先引用其中可核验的近期事实，不要再泛化推断。")
+    elif status == "error" and tool == "web_search":
+        guidance.append("web_search失败。不要把缺失的外部事实当成已验证结论；可换更具体的查询词，或先用已有证据完成保守判断。")
     if repeated_failure:
         guidance.append("你刚刚重复触发了相似错误，不要重复同类查询/代码；请更换工具或明显改变方案。")
+        guidance.append("如果当前缺的是外部事实，请直接改用更具体的web_search查询，而不是继续重复同类推断。")
     if remaining_iterations <= 1:
         guidance.append("剩余调用次数不多，请尽快返回最终JSON。")
     guidance.append("如果信息已经足够，请直接返回最终JSON。")
@@ -3651,6 +4441,12 @@ def _build_stock_context(
                 "sources": a.sources,
                 "confidence_score": a.confidence_score,
                 "capital_signal_summary": a.capital_signal_summary,
+                "business_quality_score": a.business_quality_score,
+                "business_quality_label": a.business_quality_label,
+                "business_quality_summary": a.business_quality_summary,
+                "business_quality_bullets": list(a.business_quality_bullets or []),
+                "quarters_analyzed": a.quarters_analyzed,
+                "financial_data_source": a.financial_data_source,
                 "positive_findings": [
                     {
                         "category": f.category,
@@ -3692,16 +4488,70 @@ def _generate_market_overview(theme_summary: list, trace_path: Path, themes: Lis
     if not content:
         return _fallback_market_overview(themes)
     trace_append(trace_path, "overview_response", {"content": truncate(content, 8000)})
-    parsed = safe_json_loads(content)
-    raw_items = parsed.get("themes") if isinstance(parsed, dict) else None
-    if not isinstance(raw_items, list):
+    def parse_overview(payload: str) -> Optional[tuple[List[ReportThemeOverview], bool]]:
+        parsed = safe_json_loads(payload)
+        raw_items = parsed.get("themes") if isinstance(parsed, dict) else None
+        if not isinstance(raw_items, list):
+            return None
+        by_name = {
+            str(item.get("name")).strip(): item
+            for item in raw_items
+            if isinstance(item, dict) and str(item.get("name", "")).strip()
+        }
+        weak_raw_sources = False
+        for theme in themes:
+            raw = by_name.get(theme.name) or {}
+            status = _normalize_validation_status(raw.get("validation_status", theme.validation_status))
+            if status in {"confirmed", "web_only"} and not _normalize_source_urls(
+                raw.get("source_urls"),
+                raw.get("logic"),
+            ):
+                weak_raw_sources = True
+        return (
+            [_normalize_market_overview_item(by_name.get(theme.name), theme) for theme in themes],
+            weak_raw_sources,
+        )
+
+    overview_parsed = parse_overview(content)
+    if overview_parsed is None:
         return _fallback_market_overview(themes)
-    by_name = {
-        str(item.get("name")).strip(): item
-        for item in raw_items
-        if isinstance(item, dict) and str(item.get("name", "")).strip()
-    }
-    return [_normalize_market_overview_item(by_name.get(theme.name), theme) for theme in themes]
+    overview_items, weak_raw_sources = overview_parsed
+    weak_sources = weak_raw_sources or market_overview_has_weak_sources(overview_items)
+    trace_append(
+        trace_path,
+        "overview_source_check",
+        {"weak_sources": weak_sources, "theme_count": len(overview_items)},
+    )
+    if not weak_sources:
+        return overview_items
+
+    correction_messages = messages + [
+        {
+            "role": "assistant",
+            "content": content,
+        },
+        {
+            "role": "user",
+            "content": (
+                "上一次市场概览JSON可解析，但source_urls薄弱或缺失。"
+                "不要新增web搜索；只使用已给定theme上下文中的sources，"
+                "为confirmed/web_only主题补齐可验证source_urls，并返回同一JSON结构。"
+            ),
+        },
+    ]
+    trace_append(trace_path, "overview_correction_request", {"reason": "weak_source_urls"})
+    corrected_content = deepseek_chat(correction_messages) if deepseek_chat else None
+    trace_append(
+        trace_path,
+        "overview_correction_response",
+        {"content": truncate(corrected_content or "", 8000), "has_content": bool(corrected_content)},
+    )
+    corrected_parsed = parse_overview(corrected_content or "") if corrected_content else None
+    if corrected_parsed is not None:
+        corrected_items, corrected_raw_weak = corrected_parsed
+        if not corrected_raw_weak and not market_overview_has_weak_sources(corrected_items):
+            return corrected_items
+    return _fallback_market_overview(themes)
 
 
 def _fallback_stock_section(
@@ -3742,6 +4592,7 @@ def _fallback_stock_section(
     for audit in stock_audits:
         positive_findings.extend(audit.positive_findings or [])
         growth_catalysts.extend(audit.growth_catalysts or [])
+    business_quality = aggregate_business_quality(stock_audits)
     return ReportStockSection(
         ts_code=ts_code,
         name=name,
@@ -3763,6 +4614,11 @@ def _fallback_stock_section(
             "若放量失败或主线转弱，优先降低仓位。",
         ],
         risks=risks,
+        business_quality_score=float(business_quality["business_quality_score"]),
+        business_quality_label=str(business_quality["business_quality_label"]),
+        business_quality_summary=str(business_quality["business_quality_summary"]),
+        business_quality_bullets=list(business_quality["business_quality_bullets"]),
+        quarters_analyzed=int(business_quality["quarters_analyzed"]),
         source_urls=_normalize_source_urls([a.sources for a in stock_audits]),
         chart=chart,
         audit_summaries=list(stock_audits),
@@ -3777,6 +4633,7 @@ def _normalize_stock_section_payload(
     signal: Optional[Dict[str, object]],
 ) -> ReportStockSection:
     fallback = _fallback_stock_section(row, stock_audits, chart, signal)
+    business_quality = aggregate_business_quality(stock_audits)
     recommendation, label = _normalize_recommendation(payload.get("recommendation"))
     positive_findings = _normalize_positive_findings(payload.get("positive_findings"), fallback.positive_findings)
     growth_catalysts = _normalize_growth_catalysts(payload.get("growth_catalysts"), fallback.growth_catalysts)
@@ -3801,6 +4658,11 @@ def _normalize_stock_section_payload(
         capital_validation=_coerce_lines(payload.get("capital_validation")) or fallback.capital_validation,
         trade_plan=_coerce_lines(payload.get("trade_plan")) or fallback.trade_plan,
         risks=_coerce_lines(payload.get("risks")) or fallback.risks,
+        business_quality_score=float(payload.get("business_quality_score", business_quality["business_quality_score"])),
+        business_quality_label=str(payload.get("business_quality_label", business_quality["business_quality_label"])),
+        business_quality_summary=_clean_bullet_text(str(payload.get("business_quality_summary", business_quality["business_quality_summary"])).strip()) or str(business_quality["business_quality_summary"]),
+        business_quality_bullets=_coerce_lines(payload.get("business_quality_bullets")) or list(business_quality["business_quality_bullets"]),
+        quarters_analyzed=int(payload.get("quarters_analyzed", business_quality["quarters_analyzed"]) or 0),
         source_urls=source_urls,
         chart=chart,
         audit_summaries=list(stock_audits),
@@ -3834,6 +4696,7 @@ def _generate_stock_section(
     last_failure_tool = None
     repeated_failure_count = 0
     max_iterations = 5
+    missing_sources_feedback_sent = False
     trace_append(trace_path, "stock_section_request", {"ts_code": ts_code, "name": name})
     for iteration in range(max_iterations):
         content = deepseek_chat(messages) if deepseek_chat else None
@@ -3914,6 +4777,14 @@ def _generate_stock_section(
             if isinstance(candidate_payload, dict):
                 payload = candidate_payload
         if payload is not None:
+            if (
+                not missing_sources_feedback_sent
+                and _payload_has_weak_sources(payload)
+                and iteration < max_iterations - 1
+            ):
+                missing_sources_feedback_sent = True
+                messages.append({"role": "user", "content": _build_missing_sources_feedback(row, stock_audits)})
+                continue
             return _normalize_stock_section_payload(payload, row, stock_audits, chart, ctx.get("signals"))
         messages.append({"role": "user", "content": "仅返回JSON对象 {\"stock\": {...}}，不要Markdown，不要代码块。"})
     return _fallback_stock_section(row, stock_audits, chart, ctx.get("signals"))
@@ -4032,6 +4903,10 @@ def render_report_markdown_debug(report: ReportModel) -> str:
         lines.append(f"- 摘要：{section.summary}")
         for bullet in section.investment_logic:
             lines.append(f"- 投资逻辑：{bullet}")
+        lines.append(f"- 12季度经营趋势与业务质量：已分析季度数 {section.quarters_analyzed}，评级 {section.business_quality_label}，评分 {section.business_quality_score:.1f}")
+        lines.append(f"- 经营趋势总结：{section.business_quality_summary}")
+        for bullet in section.business_quality_bullets:
+            lines.append(f"- 经营质量要点：{bullet}")
         for finding in section.positive_findings:
             lines.append(f"- 正面催化：[{finding.category}] {finding.description} (置信度 {finding.confidence:.2f})")
         for catalyst in section.growth_catalysts:
@@ -4121,6 +4996,7 @@ def render_report_html(report: ReportModel) -> str:
             "</summary>"
             "<div class=\"details-grid\">"
             f"<section><h4>投资逻辑</h4>{_render_html_list(section.investment_logic)}</section>"
+            f"<section><h4>12季度经营趋势与业务质量</h4><p><strong>已分析季度数:</strong> {section.quarters_analyzed}<br /><strong>业务质量评级:</strong> {html_escape(section.business_quality_label)}<br /><strong>业务质量评分:</strong> {section.business_quality_score:.1f}</p><p>{html_escape(section.business_quality_summary)}</p>{_render_html_list(section.business_quality_bullets)}</section>"
             f"<section><h4>技术分析</h4>{_render_html_list(section.technical_analysis)}</section>"
             f"<section><h4>资金验证</h4>{_render_html_list(section.capital_validation)}</section>"
             f"<section><h4>交易建议</h4>{_render_html_list(section.trade_plan)}</section>"

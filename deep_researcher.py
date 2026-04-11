@@ -618,6 +618,87 @@ def deepseek_plan_opportunity_queries(
     return None
 
 
+def deepseek_synthesize_opportunity_results(
+    name: str,
+    theme: str,
+    current_findings: str,
+    followup_results: List[dict],
+) -> Optional[dict]:
+    """
+    Use DeepSeek to synthesize structured opportunity findings from follow-up search results.
+
+    Args:
+        name: Stock name
+        theme: Theme context
+        current_findings: Summary of current positive findings
+        followup_results: Compact search result payloads with title/snippet/url/date
+
+    Returns:
+        Dict with structured positive_findings / growth_catalysts or None on failure.
+    """
+    messages = [
+        {
+            "role": "system",
+            "content": """你是A股机会挖掘专家，负责从搜索结果中提炼可核验的投资机会证据。
+只保留有明确外部来源支撑的结论，禁止臆测。
+
+输出严格JSON：
+{
+  "positive_findings":[
+    {
+      "category":"policy_driver|tech_breakthrough|market_expansion|competitive_moat|contract_evidence",
+      "description":"简短描述",
+      "evidence":"基于搜索结果的证据摘要",
+      "confidence":0.0,
+      "source_url":"https://...",
+      "date":"2026-01-01"
+    }
+  ],
+  "growth_catalysts":[
+    {
+      "catalyst_type":"policy|tech_breakthrough|market_expansion|competitive_moat|contract_evidence",
+      "description":"简短描述",
+      "timeframe":"near_term|medium_term|long_term",
+      "confidence":0.0
+    }
+  ],
+  "queries_exhausted":false,
+  "reason":"可选说明"
+}
+
+要求：
+1. positive_findings 只保留有有效 source_url 的项目
+2. description/evidence 必须紧扣搜索结果
+3. 如果证据不足，可返回空列表，但仍返回合法JSON"""
+        },
+        {
+            "role": "user",
+            "content": json.dumps(
+                {
+                    "name": name,
+                    "theme": theme,
+                    "current_findings": current_findings,
+                    "followup_results": followup_results,
+                },
+                ensure_ascii=False,
+            ),
+        },
+    ]
+
+    content = deepseek_chat(messages)
+    if not content:
+        return None
+
+    parsed = _safe_json_from_text(content)
+    if not isinstance(parsed, dict):
+        return None
+    if not isinstance(parsed.get("positive_findings", []), list):
+        parsed["positive_findings"] = []
+    if not isinstance(parsed.get("growth_catalysts", []), list):
+        parsed["growth_catalysts"] = []
+    return parsed
+
+
 def extract_positive_findings(
     search_results: List[dict],
     name: str,
