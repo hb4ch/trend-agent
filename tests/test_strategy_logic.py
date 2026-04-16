@@ -171,7 +171,7 @@ def test_hard_fail_requires_relevance_and_material_reduce():
     unrelated = {
         "title": "其他公司公告减持5%",
         "snippet": "与目标股票无关",
-        "url": "https://example.com",
+        "url": "https://www.cninfo.com.cn",
         "date": "2026-01-10",
     }
     assert trend_agent.detect_hard_fail_reason(
@@ -186,7 +186,7 @@ def test_hard_fail_requires_relevance_and_material_reduce():
     small_reduce = {
         "title": "目标公司拟减持不超过1%",
         "snippet": "000001.SZ 股东减持计划",
-        "url": "https://example.com/1",
+        "url": "https://www.cninfo.com.cn/1",
         "date": "2026-01-10",
     }
     assert trend_agent.detect_hard_fail_reason(
@@ -201,13 +201,65 @@ def test_hard_fail_requires_relevance_and_material_reduce():
     large_reduce = {
         "title": "目标公司拟减持不超过5%",
         "snippet": "000001.SZ 股东大比例减持计划",
-        "url": "https://example.com/2",
+        "url": "https://www.cninfo.com.cn/2",
         "date": "2026-01-10",
     }
     assert trend_agent.detect_hard_fail_reason(
         large_reduce,
         name="目标公司",
         symbol="000001",
+        require_recency=True,
+        max_age_days=365,
+        reduce_threshold=0.03,
+    ) == "material_reduction"
+
+
+def test_hard_fail_rejects_structured_stock_code_mismatch():
+    hit = {
+        "title": "骆驼股份拟减持不超过5%",
+        "snippet": "601311 股东大比例减持计划",
+        "url": "http://www.cninfo.com.cn/new/disclosure/detail?stockCode=002356&announcementId=1",
+        "date": "2026-04-10",
+    }
+    assert trend_agent.extract_structured_stock_code_from_url(hit["url"]) == "002356"
+    assert trend_agent.detect_hard_fail_reason(
+        hit,
+        name="骆驼股份",
+        symbol="601311",
+        require_recency=True,
+        max_age_days=365,
+        reduce_threshold=0.03,
+    ) is None
+
+
+def test_hard_fail_rejects_generic_target_page_with_unrelated_reduce_text():
+    hit = {
+        "title": "骆驼股份股票行情 601311",
+        "snippet": "其他公司股东拟减持不超过5%，与目标公司无关。",
+        "url": "https://data.eastmoney.com/stockdata/601311.html",
+        "date": "2026-04-10",
+    }
+    assert trend_agent.detect_hard_fail_reason(
+        hit,
+        name="骆驼股份",
+        symbol="601311",
+        require_recency=True,
+        max_age_days=365,
+        reduce_threshold=0.03,
+    ) is None
+
+
+def test_hard_fail_accepts_valid_target_stock_material_reduce():
+    hit = {
+        "title": "骆驼股份股东拟减持不超过5%",
+        "snippet": "601311 骆驼股份公告披露股东大比例减持计划。",
+        "url": "http://www.cninfo.com.cn/new/disclosure/detail?stockCode=601311&announcementId=1",
+        "date": "2026-04-10",
+    }
+    assert trend_agent.detect_hard_fail_reason(
+        hit,
+        name="骆驼股份",
+        symbol="601311",
         require_recency=True,
         max_age_days=365,
         reduce_threshold=0.03,
@@ -467,6 +519,23 @@ def test_end_to_end_fixture_ranking_and_audit_distribution():
     assert "alpha_rank_score" in ranked.columns
 
 
+def test_apply_audit_filter_excludes_stock_if_any_audit_fails():
+    candidates = pd.DataFrame(
+        [
+            {"ts_code": "000001.SZ", "name": "A"},
+            {"ts_code": "000002.SZ", "name": "B"},
+        ]
+    )
+    audits = [
+        AuditResult(ts_code="000001.SZ", name="A", theme="AI", verdict="warn", rationale="warn", sources=[]),
+        AuditResult(ts_code="000001.SZ", name="A", theme="机器人", verdict="fail", rationale="fail", sources=[]),
+        AuditResult(ts_code="000002.SZ", name="B", theme="AI", verdict="pass", rationale="pass", sources=[]),
+    ]
+    filtered, filtered_audits = trend_agent.apply_audit_filter(candidates, audits)
+    assert filtered["ts_code"].tolist() == ["000002.SZ"]
+    assert [audit.ts_code for audit in filtered_audits] == ["000002.SZ"]
+
+
 def test_heuristic_match_themes_recovers_non_empty_matches():
     themes = [
         ThemeItem(name="商业航天与卫星互联网", keywords=["卫星", "航天"], summary="", sources=[]),
@@ -515,17 +584,29 @@ def test_normalize_stock_section_payload_strips_placeholder_urls():
     payload = {
         "summary": "公司逻辑 url1",
         "investment_logic": ["- 箱体突破 url2"],
-        "source_urls": ["https://example.com/report"],
+        "source_urls": ["https://www.cninfo.com.cn/report"],
     }
     section = trend_agent._normalize_stock_section_payload(payload, row, [], None, {})
     assert "url1" not in section.summary.lower()
     assert all("url" not in item.lower() for item in section.investment_logic)
-    assert section.source_urls == ["https://example.com/report"]
+    assert section.source_urls == ["https://www.cninfo.com.cn/report"]
+
+
+def test_normalize_source_urls_rejects_placeholder_domains():
+    urls = trend_agent._normalize_source_urls(
+        [
+            "https://example.com/web-hotspot-ai",
+            "https://example.org/source",
+            "https://example.net/source",
+            "https://www.cninfo.com.cn/new/disclosure/detail",
+        ]
+    )
+    assert urls == ["https://www.cninfo.com.cn/new/disclosure/detail"]
 
 
 def test_generate_market_overview_falls_back_from_markdown(monkeypatch, tmp_path):
     monkeypatch.setattr(trend_agent, "deepseek_chat", lambda messages: "## 【市场风向标】\n- markdown response")
-    themes = [ThemeItem(name="AI应用", keywords=["AI"], summary="主题逻辑", sources=["https://example.com/theme"], validation_status="confirmed")]
+    themes = [ThemeItem(name="AI应用", keywords=["AI"], summary="主题逻辑", sources=["https://www.cninfo.com.cn/theme"], validation_status="confirmed")]
     items = trend_agent._generate_market_overview(
         [{"name": "AI应用", "summary": "主题逻辑"}],
         tmp_path / "trace.jsonl",
@@ -567,7 +648,7 @@ def test_market_overview_weak_sources_triggers_correction(monkeypatch, tmp_path)
                         "logic": ["AI应用景气度提升"],
                         "capital_validation": ["资金活跃"],
                         "watch_items": ["跟踪订单"],
-                        "source_urls": ["https://example.com/theme"],
+                        "source_urls": ["https://www.cninfo.com.cn/theme"],
                     }
                 ]
             },
@@ -576,15 +657,15 @@ def test_market_overview_weak_sources_triggers_correction(monkeypatch, tmp_path)
 
     monkeypatch.setattr(trend_agent, "deepseek_chat", fake_chat)
     trace_path = tmp_path / "trace.jsonl"
-    themes = [ThemeItem(name="AI应用", keywords=["AI"], summary="主题逻辑", sources=[], validation_status="confirmed")]
+    themes = [ThemeItem(name="AI应用", keywords=["AI"], summary="主题逻辑", sources=["https://www.cninfo.com.cn/theme"], validation_status="confirmed")]
     items = trend_agent._generate_market_overview(
-        [{"name": "AI应用", "summary": "主题逻辑", "sources": ["https://example.com/theme"]}],
+        [{"name": "AI应用", "summary": "主题逻辑", "sources": ["https://www.cninfo.com.cn/theme"]}],
         trace_path,
         themes,
     )
 
     assert len(calls) == 2
-    assert items[0].source_urls == ["https://example.com/theme"]
+    assert items[0].source_urls == ["https://www.cninfo.com.cn/theme"]
     trace_text = trace_path.read_text(encoding="utf-8")
     assert '"event": "overview_source_check"' in trace_text
     assert '"event": "overview_correction_request"' in trace_text
@@ -605,7 +686,7 @@ def test_market_overview_strong_sources_skips_correction(monkeypatch, tmp_path):
                         "logic": ["政策催化"],
                         "capital_validation": ["资金待验证"],
                         "watch_items": ["跟踪成交额"],
-                        "source_urls": ["https://example.com/robot"],
+                        "source_urls": ["https://www.cninfo.com.cn/robot"],
                     }
                 ]
             },
@@ -613,14 +694,57 @@ def test_market_overview_strong_sources_skips_correction(monkeypatch, tmp_path):
         )
 
     monkeypatch.setattr(trend_agent, "deepseek_chat", fake_chat)
-    themes = [ThemeItem(name="机器人", keywords=["机器人"], summary="主题逻辑", sources=[], validation_status="web_only")]
+    themes = [ThemeItem(name="机器人", keywords=["机器人"], summary="主题逻辑", sources=["https://www.cninfo.com.cn/robot"], validation_status="web_only")]
     items = trend_agent._generate_market_overview(
         [{"name": "机器人", "summary": "主题逻辑"}],
         tmp_path / "trace.jsonl",
         themes,
     )
     assert len(calls) == 1
-    assert items[0].source_urls == ["https://example.com/robot"]
+    assert items[0].source_urls == ["https://www.cninfo.com.cn/robot"]
+
+
+def test_market_overview_drops_plausible_unproven_url_and_falls_back(monkeypatch, tmp_path):
+    responses = iter(
+        [
+            json.dumps(
+                {
+                    "themes": [
+                        {
+                            "name": "AI应用",
+                            "validation_status": "confirmed",
+                            "logic": ["AI应用景气度提升"],
+                            "capital_validation": ["资金活跃"],
+                            "watch_items": ["跟踪订单"],
+                            "source_urls": ["https://www.cninfo.com.cn/fake-overview-url"],
+                        }
+                    ]
+                },
+                ensure_ascii=False,
+            ),
+            "not json",
+        ]
+    )
+    monkeypatch.setattr(trend_agent, "deepseek_chat", lambda messages: next(responses))
+    trace_path = tmp_path / "trace.jsonl"
+    themes = [
+        ThemeItem(
+            name="AI应用",
+            keywords=["AI"],
+            summary="AI主题逻辑",
+            sources=["https://www.cninfo.com.cn/real-theme-source"],
+            validation_status="confirmed",
+        )
+    ]
+    items = trend_agent._generate_market_overview(
+        [{"name": "AI应用", "summary": "AI主题逻辑", "sources": ["https://www.cninfo.com.cn/real-theme-source"]}],
+        trace_path,
+        themes,
+    )
+    assert items[0].source_urls == ["https://www.cninfo.com.cn/real-theme-source"]
+    assert "fake-overview-url" not in ",".join(items[0].source_urls)
+    trace_text = trace_path.read_text(encoding="utf-8")
+    assert '"dropped_unproven_url_count": 1' in trace_text
 
 
 def test_market_overview_failed_correction_falls_back(monkeypatch, tmp_path):
@@ -650,7 +774,7 @@ def test_market_overview_failed_correction_falls_back(monkeypatch, tmp_path):
             name="低空经济",
             keywords=["低空"],
             summary="低空经济政策持续。",
-            sources=["https://example.com/low-altitude"],
+            sources=["https://www.cninfo.com.cn/low-altitude"],
             validation_status="confirmed",
         )
     ]
@@ -659,7 +783,7 @@ def test_market_overview_failed_correction_falls_back(monkeypatch, tmp_path):
         tmp_path / "trace.jsonl",
         themes,
     )
-    assert items[0].source_urls == ["https://example.com/low-altitude"]
+    assert items[0].source_urls == ["https://www.cninfo.com.cn/low-altitude"]
     assert items[0].logic == ["低空经济政策持续。"]
 
 
@@ -683,7 +807,7 @@ def test_phase1_weak_extraction_triggers_corrective_pass(monkeypatch):
                                 "name": "AI应用",
                                 "keywords": ["AI"],
                                 "summary": "AI应用订单与政策共振。",
-                                "sources": ["https://example.com/ai"],
+                                "sources": ["https://www.cninfo.com.cn/ai"],
                             }
                         ]
                     },
@@ -706,8 +830,8 @@ def test_phase1_weak_extraction_triggers_corrective_pass(monkeypatch):
         lambda query: json.dumps(
             {
                 "summary": "AI应用活跃",
-                "urls": ["https://example.com/ai"],
-                "results": [{"title": "AI应用", "snippet": "AI应用订单与政策共振", "url": "https://example.com/ai"}],
+                "urls": ["https://www.cninfo.com.cn/ai"],
+                "results": [{"title": "AI应用", "snippet": "AI应用订单与政策共振", "url": "https://www.cninfo.com.cn/ai"}],
             },
             ensure_ascii=False,
         ),
@@ -716,7 +840,7 @@ def test_phase1_weak_extraction_triggers_corrective_pass(monkeypatch):
     themes = trend_agent.phase1_market_intel(RunnableLambda(lambda _: ""))
     assert provider.calls == 2
     assert themes[0].name == "AI应用"
-    assert themes[0].sources == ["https://example.com/ai"]
+    assert themes[0].sources == ["https://www.cninfo.com.cn/ai"]
 
 
 def test_deepseek_merge_themes_weak_fusion_triggers_corrective_pass():
@@ -752,7 +876,7 @@ def test_deepseek_merge_themes_weak_fusion_triggers_corrective_pass():
                                 "keywords": ["AI"],
                                 "summary": "Web热度与资金共同确认。",
                                 "capital_signal": "龙虎榜净买入活跃。",
-                                "sources": ["https://example.com/ai"],
+                                "sources": ["https://www.cninfo.com.cn/ai"],
                             }
                         ]
                     },
@@ -766,7 +890,7 @@ def test_deepseek_merge_themes_weak_fusion_triggers_corrective_pass():
             name="AI应用",
             keywords=["AI"],
             summary="AI应用活跃",
-            sources=["https://example.com/ai"],
+            sources=["https://www.cninfo.com.cn/ai"],
         )
     ]
     capital_themes = {
@@ -802,7 +926,7 @@ def test_deepseek_merge_themes_valid_fusion_stays_single_pass():
                                 "keywords": ["机器人"],
                                 "summary": "Web热度确认。",
                                 "capital_signal": "",
-                                "sources": ["https://example.com/robot"],
+                                "sources": ["https://www.cninfo.com.cn/robot"],
                             }
                         ]
                     },
@@ -813,7 +937,7 @@ def test_deepseek_merge_themes_valid_fusion_stays_single_pass():
 
     provider = FakeProvider()
     merged = trend_agent.deepseek_merge_themes(
-        [ThemeItem(name="机器人", keywords=["机器人"], summary="机器人活跃", sources=["https://example.com/robot"])],
+        [ThemeItem(name="机器人", keywords=["机器人"], summary="机器人活跃", sources=["https://www.cninfo.com.cn/robot"])],
         {},
         provider,
     )
@@ -832,7 +956,7 @@ def test_render_report_html_is_self_contained():
                 logic=["逻辑A"],
                 capital_validation=["资金A"],
                 watch_items=["观察A"],
-                source_urls=["https://example.com/theme"],
+                source_urls=["https://www.cninfo.com.cn/theme"],
             )
         ],
         core_table_rows=[
@@ -860,7 +984,7 @@ def test_render_report_html_is_self_contained():
                 business_quality_summary="最近12季度经营质量改善。",
                 business_quality_bullets=["营收改善", "现金流改善"],
                 quarters_analyzed=12,
-                source_urls=["https://example.com/stock"],
+                source_urls=["https://www.cninfo.com.cn/stock"],
                 chart=trend_agent.ChartArtifact(
                     ts_code="000001.SZ",
                     spike_dates=["2026-03-20"],
@@ -880,6 +1004,38 @@ def test_render_report_html_is_self_contained():
     assert 'id="theme-filter"' in html
     assert "12季度经营趋势与业务质量" in html
     assert "已分析季度数:" in html
+
+
+def test_phase4_plot_charts_generates_artifacts_for_all_final_candidates(monkeypatch, tmp_path):
+    n = 80
+    dates = pd.date_range("2026-01-01", periods=80, freq="B")
+
+    def fake_price_data(ts_code):
+        return pd.DataFrame(
+            {
+                "open": [10.0] * n,
+                "high": [10.5] * n,
+                "low": [9.5] * n,
+                "close": [10.1] * n,
+                "volume": [1000] * n,
+                "turnover_rate": [1.0] * n,
+            },
+            index=dates[:n],
+        )
+
+    monkeypatch.setattr(trend_agent, "CHART_DIR", tmp_path / "charts")
+    monkeypatch.setattr(trend_agent, "load_price_data", fake_price_data)
+    monkeypatch.setattr(trend_agent.go.Figure, "write_image", lambda self, *args, **kwargs: None)
+
+    candidates = pd.DataFrame(
+        [
+            {"ts_code": f"00000{i}.SZ", "name": f"S{i}"}
+            for i in range(10)
+        ]
+    )
+    artifacts = trend_agent.phase4_plot_charts(candidates)
+    assert len(artifacts) == 10
+    assert "000009.SZ" in artifacts
 
 
 def test_phase5_report_with_deepseek_writes_html_and_md(monkeypatch, tmp_path):
@@ -1066,7 +1222,7 @@ def test_run_python_exposes_open_runtime_utilities(monkeypatch, tmp_path):
     context = {
         "stock_profile": {"ts_code": "000001.SZ", "name": "测试股"},
         "signal_row": {"ready_to_break": True, "turnover_mult": 1.8},
-        "audit_rows": [{"theme": "AI", "verdict": "warn", "rationale": "题材验证不足", "sources": ["https://example.com"]}],
+        "audit_rows": [{"theme": "AI", "verdict": "warn", "rationale": "题材验证不足", "sources": ["https://www.cninfo.com.cn"]}],
         "chart_notes": ["2026-02-28"],
         "candidates_df": pd.DataFrame([{"ts_code": "000001.SZ", "name": "测试股"}]),
     }
@@ -1181,6 +1337,17 @@ def test_execute_agent_tool_reports_unknown_tool():
     assert result == "tool_error: unknown_tool 'shell'"
 
 
+def _audit_with_sources(*sources):
+    return AuditResult(
+        ts_code="000001.SZ",
+        name="测试股",
+        theme="AI应用",
+        verdict="warn",
+        rationale="测试审计",
+        sources=list(sources),
+    )
+
+
 def test_generate_stock_section_retries_after_duckdb_error(monkeypatch, tmp_path):
     calls = {"n": 0}
     seen_tool_feedback = {"value": ""}
@@ -1202,7 +1369,7 @@ def test_generate_stock_section_retries_after_duckdb_error(monkeypatch, tmp_path
                     "capital_validation": ["资金A"],
                     "trade_plan": ["计划A"],
                     "risks": ["风险A"],
-                    "source_urls": ["https://example.com/report", "https://example.com/report-2"],
+                    "source_urls": ["https://www.cninfo.com.cn/report", "https://www.cninfo.com.cn/report-2"],
                     "research_depth": "standard",
                 }
             },
@@ -1225,12 +1392,13 @@ def test_generate_stock_section_retries_after_duckdb_error(monkeypatch, tmp_path
         "chart_notes": [],
     }
     row = {"ts_code": "000001.SZ", "name": "测试股", "matched_themes": ["AI应用"]}
+    stock_audits = [_audit_with_sources("https://www.cninfo.com.cn/report", "https://www.cninfo.com.cn/report-2")]
     section = trend_agent._generate_stock_section(
         ctx,
         tmp_path / "trace.jsonl",
         pd.DataFrame([{"ts_code": "000001.SZ", "name": "测试股"}]),
         row,
-        [],
+        stock_audits,
         None,
     )
     assert section.summary == "修正查询后完成分析"
@@ -1268,7 +1436,7 @@ def test_generate_stock_section_retries_after_web_search_result(monkeypatch, tmp
                     "capital_validation": ["资金A"],
                     "trade_plan": ["计划A"],
                     "risks": ["风险A"],
-                    "source_urls": ["https://example.com/report", "https://example.com/report-2"],
+                    "source_urls": ["https://www.cninfo.com.cn/report", "https://www.cninfo.com.cn/report-2"],
                     "research_depth": "standard",
                 }
             },
@@ -1276,7 +1444,17 @@ def test_generate_stock_section_retries_after_web_search_result(monkeypatch, tmp
         )
 
     monkeypatch.setattr(trend_agent, "deepseek_chat", fake_deepseek_chat)
-    monkeypatch.setattr(trend_agent, "run_search", lambda query: f"search_result: {query}")
+    monkeypatch.setattr(
+        trend_agent,
+        "run_search",
+        lambda query: json.dumps(
+            {
+                "summary": f"search_result: {query}",
+                "urls": ["https://www.cninfo.com.cn/report", "https://www.cninfo.com.cn/report-2"],
+            },
+            ensure_ascii=False,
+        ),
+    )
 
     ctx = {
         "ts_code": "000001.SZ",
@@ -1321,7 +1499,7 @@ def test_generate_stock_section_retries_after_python_result(monkeypatch, tmp_pat
                     "capital_validation": ["资金B"],
                     "trade_plan": ["计划B"],
                     "risks": ["风险B"],
-                    "source_urls": ["https://example.com/python-result", "https://example.com/python-result-2"],
+                    "source_urls": ["https://www.cninfo.com.cn/python-result", "https://www.cninfo.com.cn/python-result-2"],
                     "research_depth": "standard",
                 }
             },
@@ -1340,12 +1518,13 @@ def test_generate_stock_section_retries_after_python_result(monkeypatch, tmp_pat
         "chart_notes": [],
     }
     row = {"ts_code": "000001.SZ", "name": "测试股", "matched_themes": []}
+    stock_audits = [_audit_with_sources("https://www.cninfo.com.cn/python-result", "https://www.cninfo.com.cn/python-result-2")]
     section = trend_agent._generate_stock_section(
         ctx,
         tmp_path / "trace.jsonl",
         pd.DataFrame([{"ts_code": "000001.SZ", "name": "测试股"}]),
         row,
-        [],
+        stock_audits,
         None,
     )
     assert section.summary == "结合Python结果完成分析"
@@ -1375,7 +1554,7 @@ def test_generate_stock_section_retries_after_web_search_exception(monkeypatch, 
                     "capital_validation": ["资金C"],
                     "trade_plan": ["计划C"],
                     "risks": ["风险C"],
-                    "source_urls": ["https://example.com/search-error", "https://example.com/search-error-2"],
+                    "source_urls": ["https://www.cninfo.com.cn/search-error", "https://www.cninfo.com.cn/search-error-2"],
                     "research_depth": "standard",
                 }
             },
@@ -1398,12 +1577,13 @@ def test_generate_stock_section_retries_after_web_search_exception(monkeypatch, 
         "chart_notes": [],
     }
     row = {"ts_code": "000001.SZ", "name": "测试股", "matched_themes": []}
+    stock_audits = [_audit_with_sources("https://www.cninfo.com.cn/search-error", "https://www.cninfo.com.cn/search-error-2")]
     section = trend_agent._generate_stock_section(
         ctx,
         tmp_path / "trace.jsonl",
         pd.DataFrame([{"ts_code": "000001.SZ", "name": "测试股"}]),
         row,
-        [],
+        stock_audits,
         None,
     )
     assert section.summary == "搜索异常后仍完成分析"
@@ -1432,7 +1612,7 @@ def test_generate_stock_section_retries_after_python_exception(monkeypatch, tmp_
                     "capital_validation": ["资金D"],
                     "trade_plan": ["计划D"],
                     "risks": ["风险D"],
-                    "source_urls": ["https://example.com/python-error", "https://example.com/python-error-2"],
+                    "source_urls": ["https://www.cninfo.com.cn/python-error", "https://www.cninfo.com.cn/python-error-2"],
                     "research_depth": "standard",
                 }
             },
@@ -1455,12 +1635,13 @@ def test_generate_stock_section_retries_after_python_exception(monkeypatch, tmp_
         "chart_notes": [],
     }
     row = {"ts_code": "000001.SZ", "name": "测试股", "matched_themes": []}
+    stock_audits = [_audit_with_sources("https://www.cninfo.com.cn/python-error", "https://www.cninfo.com.cn/python-error-2")]
     section = trend_agent._generate_stock_section(
         ctx,
         tmp_path / "trace.jsonl",
         pd.DataFrame([{"ts_code": "000001.SZ", "name": "测试股"}]),
         row,
-        [],
+        stock_audits,
         None,
     )
     assert section.summary == "Python异常后仍完成分析"
@@ -1489,7 +1670,7 @@ def test_generate_stock_section_does_not_crash_on_tool_exception(monkeypatch, tm
                     "capital_validation": ["资金B"],
                     "trade_plan": ["计划B"],
                     "risks": ["风险B"],
-                    "source_urls": ["https://example.com/tool-fallback", "https://example.com/tool-fallback-2"],
+                    "source_urls": ["https://www.cninfo.com.cn/tool-fallback", "https://www.cninfo.com.cn/tool-fallback-2"],
                     "research_depth": "standard",
                 }
             },
@@ -1512,12 +1693,13 @@ def test_generate_stock_section_does_not_crash_on_tool_exception(monkeypatch, tm
         "chart_notes": [],
     }
     row = {"ts_code": "000001.SZ", "name": "测试股", "matched_themes": []}
+    stock_audits = [_audit_with_sources("https://www.cninfo.com.cn/tool-fallback", "https://www.cninfo.com.cn/tool-fallback-2")]
     section = trend_agent._generate_stock_section(
         ctx,
         tmp_path / "trace.jsonl",
         pd.DataFrame([{"ts_code": "000001.SZ", "name": "测试股"}]),
         row,
-        [],
+        stock_audits,
         None,
     )
     assert section.summary == "工具异常后仍成功回退"
@@ -1548,7 +1730,7 @@ def test_generate_stock_section_switches_to_python_after_duckdb_error(monkeypatc
                     "capital_validation": ["资金E"],
                     "trade_plan": ["计划E"],
                     "risks": ["风险E"],
-                    "source_urls": ["https://example.com/python-after-duckdb", "https://example.com/python-after-duckdb-2"],
+                    "source_urls": ["https://www.cninfo.com.cn/python-after-duckdb", "https://www.cninfo.com.cn/python-after-duckdb-2"],
                     "research_depth": "standard",
                 }
             },
@@ -1575,12 +1757,13 @@ def test_generate_stock_section_switches_to_python_after_duckdb_error(monkeypatc
     }
     row = {"ts_code": "000001.SZ", "name": "测试股", "matched_themes": []}
     tool_stats = {"total_calls": 0, "per_tool": {}, "python_after_duckdb_failure": 0}
+    stock_audits = [_audit_with_sources("https://www.cninfo.com.cn/python-after-duckdb", "https://www.cninfo.com.cn/python-after-duckdb-2")]
     section = trend_agent._generate_stock_section(
         ctx,
         tmp_path / "trace.jsonl",
         pd.DataFrame([{"ts_code": "000001.SZ", "name": "测试股"}]),
         row,
-        [],
+        stock_audits,
         None,
         tool_stats=tool_stats,
     )
@@ -1634,7 +1817,7 @@ def test_generate_stock_section_requests_web_search_when_sources_are_weak(monkey
                     "capital_validation": ["资金A"],
                     "trade_plan": ["计划A"],
                     "risks": ["风险A"],
-                    "source_urls": ["https://example.com/a", "https://example.com/b"],
+                    "source_urls": ["https://www.cninfo.com.cn/a", "https://www.cninfo.com.cn/b"],
                     "research_depth": "standard",
                 }
             },
@@ -1642,7 +1825,17 @@ def test_generate_stock_section_requests_web_search_when_sources_are_weak(monkey
         )
 
     monkeypatch.setattr(trend_agent, "deepseek_chat", fake_deepseek_chat)
-    monkeypatch.setattr(trend_agent, "_execute_agent_tool", lambda tool, tool_input, tool_context: "search_result: ok")
+    monkeypatch.setattr(
+        trend_agent,
+        "_execute_agent_tool",
+        lambda tool, tool_input, tool_context: json.dumps(
+            {
+                "summary": "search_result: ok",
+                "urls": ["https://www.cninfo.com.cn/a", "https://www.cninfo.com.cn/b"],
+            },
+            ensure_ascii=False,
+        ),
+    )
 
     ctx = {
         "ts_code": "000001.SZ",
@@ -1662,7 +1855,7 @@ def test_generate_stock_section_requests_web_search_when_sources_are_weak(monkey
         None,
     )
     assert section.summary == "补完来源后的结论"
-    assert section.source_urls == ["https://example.com/a", "https://example.com/b"]
+    assert section.source_urls == ["https://www.cninfo.com.cn/a", "https://www.cninfo.com.cn/b"]
     assert any("请先调用 web_search 补充近期、可点击、可核验的外部来源" in msg for msg in user_messages)
 
 
@@ -1680,13 +1873,13 @@ def test_generate_stock_section_accepts_payload_with_strong_sources(monkeypatch,
                     "summary": "来源充足",
                     "investment_logic": ["逻辑A"],
                     "positive_findings": [
-                        {"category": "policy", "description": "发现催化", "evidence": "e", "confidence": 0.6, "source_url": "https://example.com/a"}
+                        {"category": "policy", "description": "发现催化", "evidence": "e", "confidence": 0.6, "source_url": "https://www.cninfo.com.cn/a"}
                     ],
                     "technical_analysis": ["技术A"],
                     "capital_validation": ["资金A"],
                     "trade_plan": ["计划A"],
                     "risks": ["风险A"],
-                    "source_urls": ["https://example.com/a", "https://example.com/b"],
+                    "source_urls": ["https://www.cninfo.com.cn/a", "https://www.cninfo.com.cn/b"],
                     "research_depth": "standard",
                 }
             },
@@ -1704,16 +1897,60 @@ def test_generate_stock_section_accepts_payload_with_strong_sources(monkeypatch,
         "chart_notes": [],
     }
     row = {"ts_code": "000001.SZ", "name": "测试股", "matched_themes": ["AI应用"]}
+    stock_audits = [_audit_with_sources("https://www.cninfo.com.cn/a", "https://www.cninfo.com.cn/b")]
     section = trend_agent._generate_stock_section(
         ctx,
         tmp_path / "trace.jsonl",
         pd.DataFrame([{"ts_code": "000001.SZ", "name": "测试股"}]),
         row,
-        [],
+        stock_audits,
         None,
     )
     assert section.summary == "来源充足"
     assert calls["n"] == 1
+
+
+def test_normalize_stock_section_filters_unproven_urls_and_finding_sources():
+    row = {"ts_code": "000001.SZ", "name": "测试股", "matched_themes": ["AI应用"]}
+    stock_audits = [_audit_with_sources("https://www.cninfo.com.cn/real-source")]
+    payload = {
+        "ts_code": "000001.SZ",
+        "name": "测试股",
+        "recommendation": "watch",
+        "summary": "摘要",
+        "investment_logic": ["逻辑"],
+        "positive_findings": [
+            {
+                "category": "policy",
+                "description": "伪来源发现",
+                "evidence": "e",
+                "confidence": 0.5,
+                "source_url": "https://www.cninfo.com.cn/fake-stock-source",
+            },
+            {
+                "category": "policy",
+                "description": "真实来源发现",
+                "evidence": "e",
+                "confidence": 0.7,
+                "source_url": "https://www.cninfo.com.cn/real-source",
+            },
+        ],
+        "source_urls": [
+            "https://www.cninfo.com.cn/fake-stock-source",
+            "https://www.cninfo.com.cn/real-source",
+        ],
+    }
+    section = trend_agent._normalize_stock_section_payload(
+        payload,
+        row,
+        stock_audits,
+        None,
+        {},
+        allowed_source_urls=["https://www.cninfo.com.cn/real-source"],
+    )
+    assert section.source_urls == ["https://www.cninfo.com.cn/real-source"]
+    assert section.positive_findings[0].source_url == ""
+    assert section.positive_findings[1].source_url == "https://www.cninfo.com.cn/real-source"
 
 
 def test_gemma_match_guard_blocks_scope_only_false_positive(monkeypatch, tmp_path):
@@ -2219,7 +2456,7 @@ def test_phase3_deep_audit_feeds_opportunity_followup_results_back_to_llm(monkey
                         "description": "中标订单落地",
                         "evidence": "公司公告披露中标。",
                         "confidence": 0.8,
-                        "source_url": "https://example.com/order",
+                        "source_url": "https://www.cninfo.com.cn/order",
                         "date": "2026-04-10",
                     }
                 ],
@@ -2244,11 +2481,11 @@ def test_phase3_deep_audit_feeds_opportunity_followup_results_back_to_llm(monkey
                     {
                         "title": "公司中标公告",
                         "snippet": "测试股公告披露中标大单",
-                        "url": "https://example.com/order",
+                        "url": "https://www.cninfo.com.cn/order",
                         "date": "2026-04-10",
                     }
                 ],
-                "urls": ["https://example.com/order"],
+                "urls": ["https://www.cninfo.com.cn/order"],
             },
             ensure_ascii=False,
         ),
@@ -2260,7 +2497,7 @@ def test_phase3_deep_audit_feeds_opportunity_followup_results_back_to_llm(monkey
             {
                 "verdict": "pass",
                 "rationale": "无明显风险",
-                "sources": ["https://example.com/order"],
+                "sources": ["https://www.cninfo.com.cn/order"],
             },
             ensure_ascii=False,
         )
@@ -2276,7 +2513,7 @@ def test_phase3_deep_audit_feeds_opportunity_followup_results_back_to_llm(monkey
 
     assert len(audits) == 1
     assert synthesis_calls
-    assert synthesis_calls[0]["followup_results"][0]["results"][0]["url"] == "https://example.com/order"
+    assert synthesis_calls[0]["followup_results"][0]["results"][0]["url"] == "https://www.cninfo.com.cn/order"
     assert any(f.description == "中标订单落地" for f in audits[0].positive_findings)
     assert any(c.description == "订单进入兑现期" for c in audits[0].growth_catalysts)
     trace_text = trace_path.read_text(encoding="utf-8")
@@ -2309,11 +2546,11 @@ def test_phase3_deep_audit_opportunity_llm_failure_falls_back_to_local_extractio
                     {
                         "title": "测试股中标公告",
                         "snippet": "测试股 中标 框架协议",
-                        "url": "https://example.com/local-order",
+                        "url": "https://www.cninfo.com.cn/local-order",
                         "date": "2026-04-10",
                     }
                 ],
-                "urls": ["https://example.com/local-order"],
+                "urls": ["https://www.cninfo.com.cn/local-order"],
             },
             ensure_ascii=False,
         ),
@@ -2325,7 +2562,7 @@ def test_phase3_deep_audit_opportunity_llm_failure_falls_back_to_local_extractio
             {
                 "verdict": "pass",
                 "rationale": "无明显风险",
-                "sources": ["https://example.com/local-order"],
+                "sources": ["https://www.cninfo.com.cn/local-order"],
             },
             ensure_ascii=False,
         )
@@ -2340,21 +2577,189 @@ def test_phase3_deep_audit_opportunity_llm_failure_falls_back_to_local_extractio
     )
 
     assert len(audits) == 1
-    assert any(f.source_url == "https://example.com/local-order" for f in audits[0].positive_findings)
+    assert any(f.source_url == "https://www.cninfo.com.cn/local-order" for f in audits[0].positive_findings)
     trace_text = trace_path.read_text(encoding="utf-8")
     assert '"event": "opportunity_llm"' in trace_text
+
+
+def test_phase3_rule_hard_veto_stays_fail_and_traces_trigger_only(monkeypatch, tmp_path):
+    monkeypatch.setattr(trend_agent, "analyze_business_quality_with_fallbacks", lambda ts_code, name, max_quarters=12: {
+        "quarters_analyzed": 4,
+        "business_quality_score": 58.0,
+        "business_quality_label": "中性",
+        "business_quality_summary": "经营平稳",
+        "business_quality_bullets": ["营收平稳"],
+        "financial_data_source": "local",
+    })
+    monkeypatch.setattr(
+        deep_researcher,
+        "generate_opportunity_queries",
+        lambda name, theme: [{"category": "contract_evidence", "query": f"{name} 中标 订单"}],
+    )
+    monkeypatch.setattr(
+        deep_researcher,
+        "extract_positive_findings",
+        lambda results, name, category: [
+            {
+                "category": category,
+                "description": "正面订单证据",
+                "evidence": "测试股披露订单。",
+                "confidence": 0.8,
+                "source_url": "https://www.cninfo.com.cn/order",
+                "date": "2026-04-10",
+            }
+        ] if category == "contract_evidence" else [],
+    )
+    monkeypatch.setattr(deep_researcher, "deepseek_plan_opportunity_queries", lambda *args, **kwargs: None)
+    monkeypatch.setattr(deep_researcher, "deepseek_synthesize_opportunity_results", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        trend_agent,
+        "deepseek_plan_queries",
+        lambda name, theme, evidence, pass_id: {"stop": False, "reason": "check reduction", "queries": [f"{name} 减持计划"]},
+    )
+    monkeypatch.setattr(trend_agent, "invoke_with_timeout_retries", lambda fn, **kwargs: fn())
+
+    trigger_url = "http://www.cninfo.com.cn/new/disclosure/detail?stockCode=000001&announcementId=1"
+    unrelated_url = "http://www.cninfo.com.cn/new/disclosure/detail?stockCode=002356&announcementId=2"
+
+    def fake_search(query):
+        if "订单" in query:
+            return json.dumps(
+                {
+                    "results": [
+                        {
+                            "title": "测试股中标订单",
+                            "snippet": "测试股 000001 签订订单。",
+                            "url": "https://www.cninfo.com.cn/order",
+                            "date": "2026-04-10",
+                        }
+                    ],
+                },
+                ensure_ascii=False,
+            )
+        if "减持计划" in query:
+            return json.dumps(
+                {
+                    "results": [
+                        {
+                            "title": "测试股股东拟减持不超过5%",
+                            "snippet": "000001 测试股公告披露股东大比例减持计划。",
+                            "url": trigger_url,
+                            "date": "2026-04-10",
+                        },
+                        {
+                            "title": "其他公司拟减持不超过5%",
+                            "snippet": "002356 其他公司股东减持计划。",
+                            "url": unrelated_url,
+                            "date": "2026-04-10",
+                        },
+                    ],
+                },
+                ensure_ascii=False,
+            )
+        return json.dumps({"results": []}, ensure_ascii=False)
+
+    monkeypatch.setattr(trend_agent, "run_search", fake_search)
+    llm = RunnableLambda(
+        lambda _: json.dumps(
+            {
+                "verdict": "warn",
+                "rationale": "需要继续查证",
+                "sources": [],
+            },
+            ensure_ascii=False,
+        )
+    )
+    candidates = pd.DataFrame([{"ts_code": "000001.SZ", "name": "测试股", "matched_themes": ["AI应用"]}])
+    trace_path = tmp_path / "audit_trace.jsonl"
+    audits = trend_agent.phase3_deep_audit(
+        llm,
+        candidates,
+        trace_path=trace_path,
+        themes=[ThemeItem(name="AI应用", keywords=["AI"], summary="", sources=[])],
+    )
+
+    assert len(audits) == 1
+    assert audits[0].verdict == "fail"
+    assert audits[0].sources == [trigger_url]
+
+    events = [json.loads(line) for line in trace_path.read_text(encoding="utf-8").splitlines()]
+    hard_fail = [event for event in events if event["event"] == "veto_hard_fail"][0]
+    assert hard_fail["payload"]["trigger_url"] == trigger_url
+    assert hard_fail["payload"]["sources"] == [trigger_url]
+    assert unrelated_url not in json.dumps(hard_fail["payload"], ensure_ascii=False)
+    research_done = [event for event in events if event["event"] == "research_done"][0]
+    assert research_done["payload"]["verdict"] == "fail"
+
+
+def test_phase3_unrelated_hard_veto_hit_remains_warn(monkeypatch, tmp_path):
+    monkeypatch.setattr(trend_agent, "analyze_business_quality_with_fallbacks", lambda ts_code, name, max_quarters=12: {
+        "quarters_analyzed": 4,
+        "business_quality_score": 50.0,
+        "business_quality_label": "中性",
+        "business_quality_summary": "经营平稳",
+        "business_quality_bullets": ["营收平稳"],
+        "financial_data_source": "local",
+    })
+    monkeypatch.setattr(deep_researcher, "generate_opportunity_queries", lambda name, theme: [])
+    monkeypatch.setattr(deep_researcher, "deepseek_plan_opportunity_queries", lambda *args, **kwargs: None)
+    monkeypatch.setattr(deep_researcher, "deepseek_synthesize_opportunity_results", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        trend_agent,
+        "deepseek_plan_queries",
+        lambda name, theme, evidence, pass_id: {"stop": False, "reason": "check reduction", "queries": [f"{name} 减持计划"]},
+    )
+    monkeypatch.setattr(trend_agent, "invoke_with_timeout_retries", lambda fn, **kwargs: fn())
+    monkeypatch.setattr(
+        trend_agent,
+        "run_search",
+        lambda query: json.dumps(
+            {
+                "results": [
+                    {
+                        "title": "其他公司拟减持不超过5%",
+                        "snippet": "002356 其他公司股东减持计划。",
+                        "url": "http://www.cninfo.com.cn/new/disclosure/detail?stockCode=002356&announcementId=2",
+                        "date": "2026-04-10",
+                    }
+                ]
+            },
+            ensure_ascii=False,
+        ) if "减持计划" in query else json.dumps({"results": []}, ensure_ascii=False),
+    )
+    llm = RunnableLambda(
+        lambda _: json.dumps(
+            {
+                "verdict": "warn",
+                "rationale": "无目标股硬风险证据",
+                "sources": [],
+            },
+            ensure_ascii=False,
+        )
+    )
+    trace_path = tmp_path / "audit_trace.jsonl"
+    audits = trend_agent.phase3_deep_audit(
+        llm,
+        pd.DataFrame([{"ts_code": "000001.SZ", "name": "测试股", "matched_themes": ["AI应用"]}]),
+        trace_path=trace_path,
+        themes=[ThemeItem(name="AI应用", keywords=["AI"], summary="", sources=[])],
+    )
+    assert audits[0].verdict == "warn"
+    trace_text = trace_path.read_text(encoding="utf-8")
+    assert '"event": "veto_hit_rejected"' in trace_text
+    assert '"event": "veto_hard_fail"' not in trace_text
 
 
 def test_build_veto_planning_evidence_uses_full_accumulated_state():
     merged = {
         f"pass1_{i}": {
             "query": f"查询{i}",
-            "urls": [f"https://example.com/{i}"],
+            "urls": [f"https://www.cninfo.com.cn/{i}"],
             "results": [
                 {
                     "title": f"普通结果{i}",
                     "snippet": f"普通摘要{i}",
-                    "url": f"https://example.com/{i}",
+                    "url": f"https://www.cninfo.com.cn/{i}",
                     "date": "2026-04-10",
                 }
             ],
@@ -2375,6 +2780,139 @@ def test_build_veto_planning_evidence_uses_full_accumulated_state():
     assert "早期监管函线索" in evidence
     assert "查询0" in evidence
     assert "营收平稳" in evidence
+
+
+def test_veto_evidence_items_compact_large_search_payloads():
+    merged = {
+        "pass1_1": {
+            "query": "测试股 风险",
+            "results": [
+                {
+                    "title": "测试股风险核查",
+                    "content": "长正文" * 2000,
+                    "raw": "RAW_SHOULD_NOT_PASS" * 1000,
+                    "url": "https://www.cninfo.com.cn/risk",
+                    "date": "2026-04-10",
+                }
+            ],
+        }
+    }
+    items = trend_agent.build_veto_evidence_items(merged, name="测试股", symbol="000001", snippet_chars=300)
+    assert len(items) == 1
+    assert set(items[0]).issuperset({"query", "title", "snippet", "url", "date", "relevant"})
+    assert "raw" not in items[0]
+    assert len(items[0]["snippet"]) <= 300
+    assert "RAW_SHOULD_NOT_PASS" not in json.dumps(items, ensure_ascii=False)
+
+
+def test_chunk_veto_evidence_respects_token_budget():
+    items = [
+        {"query": f"q{i}", "title": f"title{i}", "snippet": "证据" * 120, "url": f"https://www.cninfo.com.cn/{i}", "date": "2026-04-10"}
+        for i in range(8)
+    ]
+    chunks = trend_agent.chunk_veto_evidence(items, target_tokens=250)
+    assert len(chunks) > 1
+    for chunk in chunks:
+        assert trend_agent.estimate_prompt_tokens(json.dumps(chunk, ensure_ascii=False)) <= 250
+
+
+def test_synthesize_veto_small_context_uses_single_call(tmp_path):
+    captured = {}
+
+    class FakeAuditChain:
+        def invoke(self, payload):
+            captured["payload"] = payload
+            return json.dumps({"verdict": "pass", "rationale": "无明显风险", "sources": ["https://www.cninfo.com.cn/a"]}, ensure_ascii=False)
+
+    merged = {
+        "pass1_1": {
+            "query": "测试股 风险",
+            "results": [{"title": "测试股无重大风险", "snippet": "测试股 000001 经营正常", "url": "https://www.cninfo.com.cn/a", "date": "2026-04-10"}],
+        }
+    }
+    config = StrategyConfig(veto_context_target_tokens=10000, veto_result_snippet_chars=300)
+    result = trend_agent.synthesize_veto_with_context_budget(
+        llm=RunnableLambda(lambda _: "{}"),
+        audit_chain=FakeAuditChain(),
+        name="测试股",
+        theme="AI应用",
+        local_brief="本地简报",
+        business_snapshot={"business_quality_summary": "平稳", "business_quality_bullets": []},
+        merged=merged,
+        positive_findings=[],
+        trace_path=tmp_path / "trace.jsonl",
+        row=pd.Series({"ts_code": "000001.SZ", "name": "测试股"}),
+        config=config,
+    )
+    assert result["verdict"] == "pass"
+    assert "evidence_items" in captured["payload"]["results"]
+    assert len(captured["payload"]["results"]) < 10000
+    trace_text = (tmp_path / "trace.jsonl").read_text(encoding="utf-8")
+    assert '"event": "veto_context_budget"' in trace_text
+    assert '"chunked": false' in trace_text
+
+
+def test_synthesize_veto_large_context_chunks_and_combines(monkeypatch, tmp_path):
+    class FakeAuditChain:
+        def invoke(self, payload):
+            raise AssertionError("single-shot audit should not run for oversized evidence")
+
+    summaries_seen = []
+
+    def fake_summary(llm, name, theme, chunk, chunk_index, total_chunks, config):
+        assert chunk
+        return {
+            "chunk_verdict": "warn",
+            "risk_findings": [f"risk-{chunk_index}"],
+            "positive_findings": [],
+            "source_urls": [chunk[0]["url"]],
+            "hard_fail_candidates": [],
+            "missing_evidence": [],
+        }
+
+    def fake_combine(llm, name, theme, local_brief, business_snapshot, summaries, opportunity_findings, config):
+        summaries_seen.extend(summaries)
+        assert all("长正文" not in json.dumps(item, ensure_ascii=False) for item in summaries)
+        return {"verdict": "warn", "rationale": "分块合成完成", "sources": ["https://www.cninfo.com.cn/0"]}
+
+    monkeypatch.setattr(trend_agent, "summarize_veto_evidence_chunk", fake_summary)
+    monkeypatch.setattr(trend_agent, "combine_veto_chunk_summaries", fake_combine)
+    merged = {
+        f"pass1_{i}": {
+            "query": f"查询{i}",
+            "results": [
+                {
+                    "title": f"测试股证据{i}",
+                    "snippet": "长正文" * 600,
+                    "url": f"https://www.cninfo.com.cn/{i}",
+                    "date": "2026-04-10",
+                }
+            ],
+        }
+        for i in range(8)
+    }
+    config = StrategyConfig(veto_context_target_tokens=900, veto_chunk_target_tokens=350, veto_result_snippet_chars=500)
+    result = trend_agent.synthesize_veto_with_context_budget(
+        llm=RunnableLambda(lambda _: "{}"),
+        audit_chain=FakeAuditChain(),
+        name="测试股",
+        theme="AI应用",
+        local_brief="本地简报",
+        business_snapshot={"business_quality_summary": "平稳", "business_quality_bullets": []},
+        merged=merged,
+        positive_findings=[],
+        trace_path=tmp_path / "trace.jsonl",
+        row=pd.Series({"ts_code": "000001.SZ", "name": "测试股"}),
+        config=config,
+    )
+    assert result["verdict"] == "warn"
+    assert len(summaries_seen) > 1
+    trace_text = (tmp_path / "trace.jsonl").read_text(encoding="utf-8")
+    assert '"event": "veto_context_budget"' in trace_text
+    assert '"chunked": true' in trace_text
+    assert '"event": "veto_chunk_request"' in trace_text
+    assert '"event": "veto_chunk_response"' in trace_text
+    assert '"event": "veto_combine_response"' in trace_text
 
 
 def test_phase3_veto_plan_trace_includes_compact_evidence_metadata(monkeypatch, tmp_path):
@@ -2408,11 +2946,11 @@ def test_phase3_veto_plan_trace_includes_compact_evidence_metadata(monkeypatch, 
                     {
                         "title": "早期监管函线索",
                         "snippet": "测试股收到监管函并已回复，需纳入后续规划上下文。",
-                        "url": "https://example.com/reg-letter",
+                        "url": "https://www.cninfo.com.cn/reg-letter",
                         "date": "2026-04-10",
                     }
                 ],
-                "urls": ["https://example.com/reg-letter"],
+                "urls": ["https://www.cninfo.com.cn/reg-letter"],
             },
             ensure_ascii=False,
         ),
@@ -2423,7 +2961,7 @@ def test_phase3_veto_plan_trace_includes_compact_evidence_metadata(monkeypatch, 
             {
                 "verdict": "warn",
                 "rationale": "需要继续查证",
-                "sources": ["https://example.com/reg-letter"],
+                "sources": ["https://www.cninfo.com.cn/reg-letter"],
             },
             ensure_ascii=False,
         )

@@ -88,6 +88,11 @@ TUSHARE_CALL_INTERVAL_SEC = 0.5
 # Configuration from environment
 DEBUG_DEEPSEEK = os.environ.get("DEBUG_DEEPSEEK", "").strip() in {"1", "true", "True", "YES", "yes"}
 REGULATORY_MAX_AGE_DAYS = int(os.environ.get("REGULATORY_MAX_AGE_DAYS", "730"))
+DEEPSEEK_MAX_PROMPT_TOKENS = int(os.environ.get("DEEPSEEK_MAX_PROMPT_TOKENS", "163840"))
+VETO_CONTEXT_TARGET_TOKENS = int(os.environ.get("VETO_CONTEXT_TARGET_TOKENS", "120000"))
+VETO_CHUNK_TARGET_TOKENS = int(os.environ.get("VETO_CHUNK_TARGET_TOKENS", "30000"))
+VETO_COMBINE_TARGET_TOKENS = int(os.environ.get("VETO_COMBINE_TARGET_TOKENS", "60000"))
+VETO_RESULT_SNIPPET_CHARS = int(os.environ.get("VETO_RESULT_SNIPPET_CHARS", "1200"))
 
 
 @dataclass
@@ -120,6 +125,11 @@ class StrategyConfig:
     valuation_weight_screen: float = 0.12
     valuation_weight_alpha: float = 0.10
     valuation_allow_premium: bool = True
+    deepseek_max_prompt_tokens: int = DEEPSEEK_MAX_PROMPT_TOKENS
+    veto_context_target_tokens: int = VETO_CONTEXT_TARGET_TOKENS
+    veto_chunk_target_tokens: int = VETO_CHUNK_TARGET_TOKENS
+    veto_combine_target_tokens: int = VETO_COMBINE_TARGET_TOKENS
+    veto_result_snippet_chars: int = VETO_RESULT_SNIPPET_CHARS
 
     @classmethod
     def from_env(cls) -> "StrategyConfig":
@@ -155,6 +165,11 @@ class StrategyConfig:
             valuation_weight_screen=max(0.0, float(os.environ.get("VALUATION_WEIGHT_SCREEN", "0.12"))),
             valuation_weight_alpha=max(0.0, float(os.environ.get("VALUATION_WEIGHT_ALPHA", "0.10"))),
             valuation_allow_premium=os.environ.get("VALUATION_ALLOW_PREMIUM", "1").strip() in {"1", "true", "True", "YES", "yes"},
+            deepseek_max_prompt_tokens=max(1000, int(os.environ.get("DEEPSEEK_MAX_PROMPT_TOKENS", str(DEEPSEEK_MAX_PROMPT_TOKENS)))),
+            veto_context_target_tokens=max(1000, int(os.environ.get("VETO_CONTEXT_TARGET_TOKENS", str(VETO_CONTEXT_TARGET_TOKENS)))),
+            veto_chunk_target_tokens=max(1000, int(os.environ.get("VETO_CHUNK_TARGET_TOKENS", str(VETO_CHUNK_TARGET_TOKENS)))),
+            veto_combine_target_tokens=max(1000, int(os.environ.get("VETO_COMBINE_TARGET_TOKENS", str(VETO_COMBINE_TARGET_TOKENS)))),
+            veto_result_snippet_chars=max(120, int(os.environ.get("VETO_RESULT_SNIPPET_CHARS", str(VETO_RESULT_SNIPPET_CHARS)))),
         )
 
 
@@ -469,6 +484,385 @@ def build_veto_planning_evidence(
     if len(text) <= max_chars:
         return text
     return text[:max_chars] + f"\n...[truncated {len(text) - max_chars} chars]"
+
+
+def estimate_prompt_tokens(text: str) -> int:
+    """Conservative prompt-token estimate for Chinese-heavy mixed text."""
+    return max(1, math.ceil(len(str(text or "")) / 2.0))
+
+
+def compact_veto_search_hit(hit: dict, query: str = "", key: str = "", snippet_chars: int = VETO_RESULT_SNIPPET_CHARS) -> Dict[str, Any]:
+    """Keep only fields needed for audit synthesis and deterministic hard-veto checks."""
+    title = str(hit.get("title", "") or "")[:240] if isinstance(hit, dict) else ""
+    snippet_source = ""
+    if isinstance(hit, dict):
+        for field in ("snippet", "content", "raw"):
+            value = str(hit.get(field, "") or "").strip()
+            if value:
+                snippet_source = value
+                break
+    url = str(hit.get("url", "") or "")[:500] if isinstance(hit, dict) else ""
+    date = str(hit.get("date", "") or "")[:80] if isinstance(hit, dict) else ""
+    return {
+        "key": str(key or "")[:80],
+        "query": str(query or "")[:240],
+        "title": title,
+        "snippet": snippet_source[: max(120, snippet_chars)],
+        "url": url,
+        "date": date,
+    }
+
+
+def build_veto_evidence_items(
+    merged: Dict[str, Dict[str, Any]],
+    name: str = "",
+    symbol: str = "",
+    snippet_chars: int = VETO_RESULT_SNIPPET_CHARS,
+) -> List[Dict[str, Any]]:
+    """Flatten accumulated veto searches into compact evidence items."""
+    items: List[Dict[str, Any]] = []
+    for key, entry in merged.items():
+        query = str(entry.get("query", "") or "")
+        results = entry.get("results", [])
+        if isinstance(results, list):
+            for hit in results:
+                if not isinstance(hit, dict):
+                    continue
+                compact = compact_veto_search_hit(hit, query=query, key=key, snippet_chars=snippet_chars)
+                text = " ".join([compact["title"], compact["snippet"], compact["url"]])
+                compact["relevant"] = bool((name and name in text) or (symbol and symbol in text))
+                compact["stock_code_mismatch"] = bool(
+                    symbol and (extract_structured_stock_code_from_url(compact["url"]) or symbol) != symbol
+                )
+                items.append(compact)
+        if not results:
+            urls = [str(url) for url in entry.get("urls", []) if str(url).strip()]
+            if not urls:
+                raw = str(entry.get("raw", "") or "")
+                if raw:
+                    items.append(
+                        {
+                            "key": str(key)[:80],
+                            "query": query[:240],
+                            "title": "search_summary",
+                            "snippet": raw[: max(120, snippet_chars)],
+                            "url": "",
+                            "date": "",
+                            "relevant": bool(name and name in raw),
+                            "stock_code_mismatch": False,
+                        }
+                    )
+    return items
+
+
+def _render_veto_context(local_brief: str, business_snapshot: Dict[str, Any], opportunity_findings: List[PositiveFinding]) -> Dict[str, Any]:
+    return {
+        "local_brief": str(local_brief or "")[:1200],
+        "business_quality": {
+            "quarters_analyzed": business_snapshot.get("quarters_analyzed", 0),
+            "label": business_snapshot.get("business_quality_label", "中性"),
+            "score": business_snapshot.get("business_quality_score", 50.0),
+            "summary": str(business_snapshot.get("business_quality_summary", ""))[:500],
+            "bullets": [str(item)[:220] for item in business_snapshot.get("business_quality_bullets", [])[:4]]
+            if isinstance(business_snapshot.get("business_quality_bullets", []), list)
+            else [],
+        },
+        "opportunity_findings": [
+            {
+                "category": item.category,
+                "description": item.description[:220],
+                "source_url": item.source_url[:500],
+                "confidence": item.confidence,
+            }
+            for item in (opportunity_findings or [])[:8]
+        ],
+    }
+
+
+def render_veto_llm_evidence(
+    local_brief: str,
+    business_snapshot: Dict[str, Any],
+    evidence_items: List[Dict[str, Any]],
+    opportunity_findings: List[PositiveFinding],
+    max_tokens: Optional[int] = None,
+) -> str:
+    payload = {
+        "context": _render_veto_context(local_brief, business_snapshot, opportunity_findings),
+        "evidence_items": evidence_items,
+    }
+    text = json.dumps(payload, ensure_ascii=False)
+    if max_tokens is not None and estimate_prompt_tokens(text) > max_tokens:
+        max_chars = max(1000, int(max_tokens * 2))
+        return text[:max_chars] + f"\n...[truncated {len(text) - max_chars} chars]"
+    return text
+
+
+def chunk_veto_evidence(items: List[Dict[str, Any]], target_tokens: int) -> List[List[Dict[str, Any]]]:
+    """Split compact evidence items into deterministic chunks under a target token budget."""
+    chunks: List[List[Dict[str, Any]]] = []
+    current: List[Dict[str, Any]] = []
+    current_tokens = 0
+    budget = max(50, int(target_tokens))
+    for item in items:
+        item_tokens = estimate_prompt_tokens(json.dumps(item, ensure_ascii=False))
+        if current and current_tokens + item_tokens > budget:
+            chunks.append(current)
+            current = []
+            current_tokens = 0
+        if item_tokens > budget:
+            truncated = dict(item)
+            max_snippet_chars = max(120, budget * 2 - 1000)
+            truncated["snippet"] = str(truncated.get("snippet", ""))[:max_snippet_chars]
+            chunks.append([truncated])
+            continue
+        current.append(item)
+        current_tokens += item_tokens
+    if current:
+        chunks.append(current)
+    return chunks or [[]]
+
+
+def _invoke_json_chain(llm: BaseChatModel, system_prompt: str, user_payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    prompt = ChatPromptTemplate.from_messages(
+        [
+            ("system", system_prompt),
+            ("user", "{payload}"),
+        ]
+    )
+    chain = prompt | llm | StrOutputParser()
+    output = chain.invoke({"payload": json.dumps(user_payload, ensure_ascii=False)})
+    data = safe_json_loads(output)
+    return data if isinstance(data, dict) else None
+
+
+def summarize_veto_evidence_chunk(
+    llm: BaseChatModel,
+    name: str,
+    theme: str,
+    chunk: List[Dict[str, Any]],
+    chunk_index: int,
+    total_chunks: int,
+    config: StrategyConfig,
+) -> Dict[str, Any]:
+    system_prompt = (
+        "你是A股尽调证据压缩员。只基于给定证据块输出JSON，不要编造。"
+        "输出字段：risk_findings, positive_findings, source_urls, hard_fail_candidates, "
+        "missing_evidence, chunk_verdict。chunk_verdict只能是pass/warn/fail。"
+    )
+    payload = {
+        "stock": name,
+        "theme": theme,
+        "chunk_index": chunk_index,
+        "total_chunks": total_chunks,
+        "evidence_items": chunk,
+    }
+    try:
+        data = _invoke_json_chain(llm, system_prompt, payload)
+    except Exception as exc:
+        return {
+            "chunk_verdict": "warn",
+            "risk_findings": [],
+            "positive_findings": [],
+            "source_urls": [],
+            "hard_fail_candidates": [],
+            "missing_evidence": [f"chunk_summary_failed:{type(exc).__name__}"],
+            "unavailable": True,
+        }
+    return data or {
+        "chunk_verdict": "warn",
+        "risk_findings": [],
+        "positive_findings": [],
+        "source_urls": [],
+        "hard_fail_candidates": [],
+        "missing_evidence": ["chunk_summary_invalid_json"],
+        "unavailable": True,
+    }
+
+
+def combine_veto_chunk_summaries(
+    llm: BaseChatModel,
+    name: str,
+    theme: str,
+    local_brief: str,
+    business_snapshot: Dict[str, Any],
+    summaries: List[Dict[str, Any]],
+    opportunity_findings: List[PositiveFinding],
+    config: StrategyConfig,
+) -> Dict[str, Any]:
+    system_prompt = (
+        "你是A股尽调员。基于分块证据摘要合成最终审计结论。"
+        "缺少证据不等于fail；只有明确、来源支撑的一票否决证据才fail。"
+        "输出JSON：{\"verdict\":\"pass|warn|fail\",\"rationale\":\"\",\"sources\":[\"url\"]}。"
+    )
+    payload = {
+        "stock": name,
+        "theme": theme,
+        "context": _render_veto_context(local_brief, business_snapshot, opportunity_findings),
+        "chunk_summaries": summaries,
+    }
+    text = json.dumps(payload, ensure_ascii=False)
+    if estimate_prompt_tokens(text) > config.veto_combine_target_tokens:
+        payload["chunk_summaries"] = [
+            {
+                "chunk_verdict": str(summary.get("chunk_verdict", "warn"))[:20],
+                "risk_findings": [str(item)[:300] for item in summary.get("risk_findings", [])[:3]]
+                if isinstance(summary.get("risk_findings", []), list)
+                else [],
+                "positive_findings": [str(item)[:300] for item in summary.get("positive_findings", [])[:3]]
+                if isinstance(summary.get("positive_findings", []), list)
+                else [],
+                "source_urls": [str(url)[:500] for url in summary.get("source_urls", [])[:5]]
+                if isinstance(summary.get("source_urls", []), list)
+                else [],
+                "missing_evidence": [str(item)[:200] for item in summary.get("missing_evidence", [])[:2]]
+                if isinstance(summary.get("missing_evidence", []), list)
+                else [],
+            }
+            for summary in summaries[:20]
+            if isinstance(summary, dict)
+        ]
+    try:
+        data = _invoke_json_chain(llm, system_prompt, payload)
+    except Exception as exc:
+        urls: List[str] = []
+        for summary in summaries:
+            for url in summary.get("source_urls", []) if isinstance(summary, dict) else []:
+                if isinstance(url, str) and url and url not in urls:
+                    urls.append(url)
+        return {
+            "verdict": "warn",
+            "rationale": f"分块证据已收集，但最终合成失败（{type(exc).__name__}），按存疑处理。",
+            "sources": urls[:5],
+            "combine_unavailable": True,
+        }
+    return data or {
+        "verdict": "warn",
+        "rationale": "分块证据合成返回无效JSON，按存疑处理。",
+        "sources": [],
+        "combine_unavailable": True,
+    }
+
+
+def synthesize_veto_with_context_budget(
+    llm: BaseChatModel,
+    audit_chain: Any,
+    name: str,
+    theme: str,
+    local_brief: str,
+    business_snapshot: Dict[str, Any],
+    merged: Dict[str, Dict[str, Any]],
+    positive_findings: List[PositiveFinding],
+    trace_path: Optional[Path],
+    row: pd.Series,
+    config: StrategyConfig,
+) -> Dict[str, Any]:
+    """Run veto synthesis with explicit context budgeting and chunked fallback."""
+    symbol = stock_symbol(str(row.get("ts_code", "")))
+    evidence_items = build_veto_evidence_items(
+        merged,
+        name=name,
+        symbol=symbol,
+        snippet_chars=config.veto_result_snippet_chars,
+    )
+    compact_evidence = render_veto_llm_evidence(
+        local_brief,
+        business_snapshot,
+        evidence_items,
+        positive_findings,
+    )
+    estimated_tokens = estimate_prompt_tokens(compact_evidence)
+    trace_append(
+        trace_path,
+        "veto_context_budget",
+        {
+            "ts_code": row["ts_code"],
+            "name": name,
+            "theme": theme,
+            "estimated_tokens": estimated_tokens,
+            "target_tokens": config.veto_context_target_tokens,
+            "evidence_item_count": len(evidence_items),
+            "chunked": estimated_tokens > config.veto_context_target_tokens,
+        },
+    )
+    if estimated_tokens <= config.veto_context_target_tokens:
+        output = invoke_with_timeout_retries(
+            lambda: audit_chain.invoke({"name": name, "theme": theme, "results": compact_evidence}),
+            description=f"Phase 3 audit LLM call for {name}/{theme}",
+            max_retries=config.audit_llm_timeout_max_retries,
+            base_delay_sec=config.audit_llm_timeout_base_delay_sec,
+            max_delay_sec=config.audit_llm_timeout_max_delay_sec,
+        )
+        data = safe_json_loads(output)
+        return data if isinstance(data, dict) else {"verdict": "warn", "rationale": "审计LLM返回无效JSON，按存疑处理。", "sources": []}
+
+    chunks = chunk_veto_evidence(evidence_items, config.veto_chunk_target_tokens)
+    summaries: List[Dict[str, Any]] = []
+    for idx, chunk in enumerate(chunks, start=1):
+        chunk_text = json.dumps(chunk, ensure_ascii=False)
+        chunk_tokens = estimate_prompt_tokens(chunk_text)
+        trace_append(
+            trace_path,
+            "veto_chunk_request",
+            {
+                "ts_code": row["ts_code"],
+                "name": name,
+                "theme": theme,
+                "chunk_index": idx,
+                "chunk_count": len(chunks),
+                "estimated_tokens": chunk_tokens,
+                "evidence_item_count": len(chunk),
+            },
+        )
+        if chunk_tokens > config.veto_chunk_target_tokens and len(chunk) > 1:
+            trace_append(
+                trace_path,
+                "veto_chunk_retry",
+                {"ts_code": row["ts_code"], "name": name, "theme": theme, "chunk_index": idx, "reason": "split_oversized_chunk"},
+            )
+            subchunks = chunk_veto_evidence(chunk, max(500, config.veto_chunk_target_tokens // 2))
+            for sub_idx, subchunk in enumerate(subchunks, start=1):
+                summary = summarize_veto_evidence_chunk(llm, name, theme, subchunk, sub_idx, len(subchunks), config)
+                summaries.append(summary)
+        else:
+            summary = summarize_veto_evidence_chunk(llm, name, theme, chunk, idx, len(chunks), config)
+            summaries.append(summary)
+        trace_append(
+            trace_path,
+            "veto_chunk_response",
+            {
+                "ts_code": row["ts_code"],
+                "name": name,
+                "theme": theme,
+                "chunk_index": idx,
+                "chunk_verdict": str((summaries[-1] or {}).get("chunk_verdict", "warn")),
+                "usable": not bool((summaries[-1] or {}).get("unavailable")),
+            },
+        )
+
+    combined = combine_veto_chunk_summaries(
+        llm,
+        name,
+        theme,
+        local_brief,
+        business_snapshot,
+        summaries,
+        positive_findings,
+        config,
+    )
+    trace_append(
+        trace_path,
+        "veto_combine_response",
+        {
+            "ts_code": row["ts_code"],
+            "name": name,
+            "theme": theme,
+            "summary_count": len(summaries),
+            "verdict": combined.get("verdict", "warn"),
+            "source_count": len(combined.get("sources", []) if isinstance(combined.get("sources"), list) else []),
+            "combine_unavailable": bool(combined.get("combine_unavailable")),
+        },
+    )
+    return combined
 
 
 def gemma_match_themes(
@@ -902,6 +1296,59 @@ def is_relevant_search_hit(name: str, symbol: str, hit: dict) -> bool:
     return False
 
 
+def extract_structured_stock_code_from_url(url: str) -> Optional[str]:
+    """Extract explicit stockCode-style symbols from structured disclosure URLs."""
+    if not url:
+        return None
+    match = re.search(r"(?:[?&]|%[23]f|%26)stockCode=([0-9]{6})", str(url), flags=re.IGNORECASE)
+    if match:
+        return match.group(1)
+    return None
+
+
+def hard_veto_rejection_reason(name: str, symbol: str, hit: dict) -> Optional[str]:
+    """Return why a hit cannot be used for deterministic hard-veto evidence."""
+    if not isinstance(hit, dict):
+        return "invalid_hit"
+    url = hit.get("url") if isinstance(hit.get("url"), str) else ""
+    url_symbol = extract_structured_stock_code_from_url(url)
+    if url_symbol and symbol and url_symbol != symbol:
+        return "stock_code_mismatch"
+    identity_text = " ".join(
+        str(hit.get(key, ""))
+        for key in ("title", "snippet", "content", "raw")
+        if hit.get(key)
+    )
+    if not ((name and name in identity_text) or (symbol and symbol in identity_text)):
+        return "missing_target_identity"
+    return None
+
+
+def _hard_veto_evidence_chunks(hit: dict) -> List[str]:
+    chunks: List[str] = []
+    for key in ("title", "snippet", "content", "raw"):
+        value = str(hit.get(key, "") or "")
+        for chunk in re.split(r"[\n。；;！!？?]", value):
+            chunk = chunk.strip()
+            if chunk:
+                chunks.append(chunk)
+    return chunks
+
+
+def _chunk_has_target_identity(chunk: str, name: str, symbol: str) -> bool:
+    return bool((name and name in chunk) or (symbol and symbol in chunk))
+
+
+def hard_veto_hit_has_targeted_pattern(hit: dict, name: str, symbol: str, patterns: List[re.Pattern]) -> bool:
+    """Return True only when target identity and risk pattern appear in the same chunk."""
+    if hard_veto_rejection_reason(name, symbol, hit):
+        return False
+    for chunk in _hard_veto_evidence_chunks(hit):
+        if _chunk_has_target_identity(chunk, name.strip(), symbol.strip()) and any(p.search(chunk) for p in patterns):
+            return True
+    return False
+
+
 def parse_reduce_ratio(text: str) -> Optional[float]:
     """Parse reduce percentage from text (e.g. 3.5%)."""
     if not text:
@@ -940,7 +1387,7 @@ def detect_hard_fail_reason(
     """Classify a search hit into a hard-fail reason, if any."""
     if not isinstance(hit, dict):
         return None
-    if not is_relevant_search_hit(name, symbol, hit):
+    if hard_veto_rejection_reason(name, symbol, hit):
         return None
 
     if require_recency:
@@ -948,22 +1395,21 @@ def detect_hard_fail_reason(
         if not is_recent(dt, max_age_days):
             return None
 
-    title = str(hit.get("title", ""))
-    snippet = str(hit.get("snippet", ""))
-    text = f"{title} {snippet}"
-
-    if re.search(r"(被|遭|因|涉嫌).{0,12}(立案|立案调查)", text):
-        return "recent_investigation"
-    if re.search(r"(重大诉讼|未决诉讼|仲裁|诉讼事项)", text):
-        # Skip if resolved or favorable outcome
-        if not re.search(r"(胜诉|判决获支持|已结案|已和解|已撤诉|已了结|调解结案)", text):
-            # Require directional context — company is defendant/subject
-            if re.search(r"(被诉|被告|被仲裁|遭.{0,6}诉讼|因.{0,6}诉讼|涉诉|涉及.{0,6}诉讼|面临.{0,6}诉讼)", text):
-                return "major_litigation"
-    if re.search(r"(终止上市|退市风险警示|暂停上市|强制退市)", text):
-        return "delisting_risk"
-    if re.search(r"(拟|计划).{0,12}减持|减持计划", text) and is_material_reduce_event(text, reduce_threshold):
-        return "material_reduction"
+    for chunk in _hard_veto_evidence_chunks(hit):
+        if not _chunk_has_target_identity(chunk, name.strip(), symbol.strip()):
+            continue
+        if re.search(r"(被|遭|因|涉嫌).{0,12}(立案|立案调查)", chunk):
+            return "recent_investigation"
+        if re.search(r"(重大诉讼|未决诉讼|仲裁|诉讼事项)", chunk):
+            # Skip if resolved or favorable outcome
+            if not re.search(r"(胜诉|判决获支持|已结案|已和解|已撤诉|已了结|调解结案)", chunk):
+                # Require directional context — company is defendant/subject
+                if re.search(r"(被诉|被告|被仲裁|遭.{0,6}诉讼|因.{0,6}诉讼|涉诉|涉及.{0,6}诉讼|面临.{0,6}诉讼)", chunk):
+                    return "major_litigation"
+        if re.search(r"(终止上市|退市风险警示|暂停上市|强制退市)", chunk):
+            return "delisting_risk"
+        if re.search(r"(拟|计划).{0,12}减持|减持计划", chunk) and is_material_reduce_event(chunk, reduce_threshold):
+            return "material_reduction"
     return None
 
 
@@ -3210,6 +3656,7 @@ def phase3_deep_audit(
             verdict = "warn"
             rationale = ""
             sources = []
+            deterministic_hard_veto = False
 
             severe_regulatory_patterns = [
                 re.compile(r"(行政处罚|处罚决定书|纪律处分|公开谴责|市场禁入)"),
@@ -3293,16 +3740,25 @@ def phase3_deep_audit(
                             search_results = relevant_hits
                         else:
                             search_results = [hit for hit in search_results if isinstance(hit, dict)]
+                        compact_results = []
                         parts = []
                         for item in search_results[:5]:
                             if not isinstance(item, dict):
                                 continue
-                            title = item.get("title") if isinstance(item.get("title"), str) else ""
-                            url = item.get("url") if isinstance(item.get("url"), str) else ""
-                            snippet = item.get("snippet") if isinstance(item.get("snippet"), str) else ""
-                            date = item.get("date") if isinstance(item.get("date"), str) else ""
+                            compact = compact_veto_search_hit(
+                                item,
+                                query=query,
+                                key=f"pass{pass_id}_{len(merged)+1}",
+                                snippet_chars=config.veto_result_snippet_chars,
+                            )
+                            compact_results.append(compact)
+                            title = compact["title"]
+                            url = compact["url"]
+                            snippet = compact["snippet"]
+                            date = compact["date"]
                             date_part = f" ({date})" if date else ""
                             parts.append(f"- {title}{date_part}\n  {url}\n  {snippet}".strip())
+                        search_results = compact_results
                         items_text = "\n".join(parts)
                     raw_clean = "\n".join([str(summary or "").strip(), items_text]).strip()
                     if not raw_clean:
@@ -3310,7 +3766,7 @@ def phase3_deep_audit(
                         raw_clean = f"未找到可用摘要/结果。query={query} urls={url_preview}"
                     merged[f"pass{pass_id}_{len(merged)+1}"] = {
                         "query": query,
-                        "raw": raw_clean,
+                        "raw": raw_clean[: max(1000, config.veto_result_snippet_chars * 5)],
                         "urls": urls,
                         "results": search_results if isinstance(search_results, list) else [],
                     }
@@ -3325,6 +3781,8 @@ def phase3_deep_audit(
                             flat_urls.append(url)
 
                 recent_severe_reg = False
+                recent_severe_hit: Dict[str, Any] = {}
+                recent_severe_query = ""
                 recent_minor_reg = False
                 for item in merged.values():
                     hits = item.get("results", [])
@@ -3336,20 +3794,38 @@ def phase3_deep_audit(
                         dt = parse_result_date(hit.get("date"))
                         if not is_recent(dt, config.hard_fail_max_age_days):
                             continue
-                        hay = " ".join([str(hit.get("title", "")), str(hit.get("snippet", ""))])
-                        if any(p.search(hay) for p in severe_regulatory_patterns):
+                        if hard_veto_hit_has_targeted_pattern(hit, name, symbol, severe_regulatory_patterns):
                             recent_severe_reg = True
-                        if any(p.search(hay) for p in minor_regulatory_patterns):
+                            recent_severe_hit = hit
+                            recent_severe_query = str(item.get("query", ""))
+                        if hard_veto_hit_has_targeted_pattern(hit, name, symbol, minor_regulatory_patterns):
                             recent_minor_reg = True
 
                 # Hard veto checks - only with relevant and (optionally) recent evidence
                 hard_fail_reason = None
-                hard_fail_sources: List[str] = []
+                hard_fail_hit: Dict[str, Any] = {}
+                hard_fail_query = ""
                 for item in merged.values():
                     hits = item.get("results", [])
                     if not isinstance(hits, list):
                         continue
                     for hit in hits:
+                        rejection = hard_veto_rejection_reason(name, symbol, hit)
+                        if rejection == "stock_code_mismatch":
+                            trace_append(
+                                trace_path,
+                                "veto_hit_rejected",
+                                {
+                                    "ts_code": row["ts_code"],
+                                    "name": name,
+                                    "theme": theme,
+                                    "query": item.get("query", ""),
+                                    "reason": rejection,
+                                    "url": str(hit.get("url", ""))[:500],
+                                    "detected_stock_code": extract_structured_stock_code_from_url(str(hit.get("url", ""))),
+                                    "symbol": symbol,
+                                },
+                            )
                         reason = detect_hard_fail_reason(
                             hit=hit,
                             name=name,
@@ -3360,14 +3836,15 @@ def phase3_deep_audit(
                         )
                         if reason:
                             hard_fail_reason = reason
-                            url = str(hit.get("url", "")).strip()
-                            if url:
-                                hard_fail_sources.append(url)
+                            hard_fail_hit = hit
+                            hard_fail_query = str(item.get("query", ""))
+                            break
                     if hard_fail_reason:
                         break
 
                 if hard_fail_reason:
                     verdict = "fail"
+                    deterministic_hard_veto = True
                     reason_map = {
                         "recent_investigation": "近期开启立案调查，按审计口径直接剔除。",
                         "major_litigation": "近期重大诉讼/仲裁风险明确，按审计口径直接剔除。",
@@ -3375,34 +3852,66 @@ def phase3_deep_audit(
                         "material_reduction": "近期大比例减持计划明确，按审计口径直接剔除。",
                     }
                     rationale = reason_map.get(hard_fail_reason, "触发一票否决条件，直接剔除。")
-                    dedup_urls = []
-                    for u in hard_fail_sources + flat_urls:
-                        if u and u not in dedup_urls:
-                            dedup_urls.append(u)
-                    sources = dedup_urls[:5]
+                    trigger_url = str(hard_fail_hit.get("url", "")).strip()
+                    sources = [trigger_url] if trigger_url else []
                     logger.debug(f"Veto hard fail: reason={hard_fail_reason}")
-                    trace_append(trace_path, "veto_hard_fail", {"ts_code": row["ts_code"], "name": name, "theme": theme, "reason": hard_fail_reason, "sources": sources})
+                    trace_append(
+                        trace_path,
+                        "veto_hard_fail",
+                        {
+                            "ts_code": row["ts_code"],
+                            "name": name,
+                            "theme": theme,
+                            "reason": hard_fail_reason,
+                            "sources": sources,
+                            "trigger_query": hard_fail_query,
+                            "trigger_title": str(hard_fail_hit.get("title", ""))[:500],
+                            "trigger_snippet": str(hard_fail_hit.get("snippet", ""))[:1000],
+                            "trigger_url": trigger_url,
+                            "trigger_date": str(hard_fail_hit.get("date", ""))[:80],
+                            "matched_symbol": symbol,
+                        },
+                    )
                     break
 
                 if recent_severe_reg:
                     verdict = "fail"
+                    deterministic_hard_veto = True
                     rationale = f"检索到近{config.hard_fail_max_age_days}天内的行政处罚/纪律处分等严重监管事件，按审计口径剔除。"
-                    sources = flat_urls[:5]
-                    trace_append(trace_path, "veto_hard_fail", {"ts_code": row["ts_code"], "name": name, "theme": theme, "sources": sources})
+                    trigger_url = str(recent_severe_hit.get("url", "")).strip()
+                    sources = [trigger_url] if trigger_url else []
+                    trace_append(
+                        trace_path,
+                        "veto_hard_fail",
+                        {
+                            "ts_code": row["ts_code"],
+                            "name": name,
+                            "theme": theme,
+                            "reason": "severe_regulatory",
+                            "sources": sources,
+                            "trigger_query": recent_severe_query,
+                            "trigger_title": str(recent_severe_hit.get("title", ""))[:500],
+                            "trigger_snippet": str(recent_severe_hit.get("snippet", ""))[:1000],
+                            "trigger_url": trigger_url,
+                            "trigger_date": str(recent_severe_hit.get("date", ""))[:80],
+                            "matched_symbol": symbol,
+                        },
+                    )
                     break
 
-                output = invoke_with_timeout_retries(
-                    lambda: audit_chain.invoke({
-                        "name": name,
-                        "theme": theme,
-                        "results": json.dumps(merged, ensure_ascii=False),
-                    }),
-                    description=f"Phase 3 audit LLM call for {name}/{theme}",
-                    max_retries=config.audit_llm_timeout_max_retries,
-                    base_delay_sec=config.audit_llm_timeout_base_delay_sec,
-                    max_delay_sec=config.audit_llm_timeout_max_delay_sec,
+                data = synthesize_veto_with_context_budget(
+                    llm=llm,
+                    audit_chain=audit_chain,
+                    name=name,
+                    theme=theme,
+                    local_brief=local_brief,
+                    business_snapshot=business_snapshot,
+                    merged=merged,
+                    positive_findings=positive_findings,
+                    trace_path=trace_path,
+                    row=row,
+                    config=config,
                 )
-                data = safe_json_loads(output)
                 verdict = normalize_verdict(data.get("verdict", verdict))
                 rationale = str(data.get("rationale", rationale) or "").strip()
                 sources = data.get("sources", sources)
@@ -3431,7 +3940,7 @@ def phase3_deep_audit(
             has_positive = any(term in final_text for term in positive_terms) or has_positive_from_opportunity
 
             # Override LLM verdict if we have opportunity findings (LLM may be too harsh)
-            if verdict == "fail" and has_positive_from_opportunity:
+            if verdict == "fail" and has_positive_from_opportunity and not deterministic_hard_veto:
                 verdict = "warn"
                 rationale = (rationale + "；LLM判定失败但发现正面催化信息，降级为存疑。").strip("；")
 
@@ -3457,10 +3966,13 @@ def phase3_deep_audit(
                 verdict = "warn"
                 rationale = (rationale + "；缺少交易所/巨潮等一手来源链接，按审计口径降级。").strip("；")
 
-            # Combine sources from both passes
-            all_sources = list(set((primary_urls or flat_urls)[:3] + opportunity_urls[:2]))
-            if not all_sources or any(str(src).strip().lower() == "url1" for src in all_sources):
-                all_sources = (primary_urls or flat_urls or opportunity_urls)[:5]
+            # Combine sources from both passes. Deterministic hard vetoes keep only trigger evidence.
+            if deterministic_hard_veto and sources:
+                all_sources = sources
+            else:
+                all_sources = list(set((primary_urls or flat_urls)[:3] + opportunity_urls[:2]))
+                if not all_sources or any(str(src).strip().lower() == "url1" for src in all_sources):
+                    all_sources = (primary_urls or flat_urls or opportunity_urls)[:5]
 
             # Calculate confidence score based on findings
             confidence = 0.5  # Base
@@ -3568,7 +4080,7 @@ def phase4_plot_charts(candidates: pd.DataFrame) -> Dict[str, ChartArtifact]:
     CHART_DIR.mkdir(parents=True, exist_ok=True)
     chart_artifacts: Dict[str, ChartArtifact] = {}
 
-    for _, row in candidates.head(8).iterrows():
+    for _, row in candidates.iterrows():
         ts_code = row["ts_code"]
         df = load_price_data(ts_code)
         if df is None or df.empty:
@@ -3916,7 +4428,7 @@ def phase5_report(
 
     lines.append("")
     lines.append("## 【深度图解】")
-    for _, row in candidates.head(8).iterrows():
+    for _, row in candidates.head(10).iterrows():
         ts_code = row["ts_code"]
         name = row["name"]
         spikes = chart_notes.get(ts_code, [])
@@ -4062,12 +4574,67 @@ def _normalize_source_urls(*values: Any) -> List[str]:
             if isinstance(candidate, dict):
                 candidate = candidate.get("source_url") or candidate.get("url") or candidate.get("source")
             for url in extract_urls(str(candidate)):
+                if _is_placeholder_source_url(url):
+                    continue
                 if url not in urls:
                     urls.append(url)
     return urls
 
 
-def _payload_has_weak_sources(payload: dict) -> bool:
+def filter_urls_to_allowed(urls: Any, allowed_urls: Any) -> List[str]:
+    """Keep only normalized URLs that were already collected as evidence."""
+    allowed = set(_normalize_source_urls(allowed_urls))
+    if not allowed:
+        return []
+    return [url for url in _normalize_source_urls(urls) if url in allowed]
+
+
+def build_allowed_theme_source_map(themes: List[ThemeItem]) -> Dict[str, List[str]]:
+    """Map theme names to the exact source URLs collected before report synthesis."""
+    allowed: Dict[str, List[str]] = {}
+    for theme in themes:
+        if theme.name:
+            allowed[theme.name] = _normalize_source_urls(theme.sources)
+    return allowed
+
+
+def build_allowed_stock_source_set(stock_audits: List[AuditResult]) -> List[str]:
+    """Collect exact stock URLs gathered by audit/opportunity research."""
+    urls: List[str] = []
+    for audit in stock_audits:
+        for source in _normalize_source_urls(audit.sources):
+            if source not in urls:
+                urls.append(source)
+        for finding in audit.positive_findings or []:
+            for source in _normalize_source_urls(finding.source_url):
+                if source not in urls:
+                    urls.append(source)
+    return urls
+
+
+def _count_unproven_urls(values: Any, allowed_urls: Any) -> int:
+    urls = _normalize_source_urls(values)
+    allowed = set(_normalize_source_urls(allowed_urls))
+    return sum(1 for url in urls if url not in allowed)
+
+
+def _is_placeholder_source_url(url: str) -> bool:
+    """Reject prompt/example URLs that are syntactically valid but not real evidence."""
+    text = str(url or "").strip().lower()
+    if not text:
+        return True
+    parsed = urlparse(text)
+    host = parsed.netloc.split("@")[-1].split(":")[0]
+    if host in {"example.com", "example.org", "example.net"}:
+        return True
+    if text in {"url1", "url2", "https://...", "http://...", "https://", "http://"}:
+        return True
+    if "example.com/" in text or "url1" in text or "url2" in text:
+        return True
+    return False
+
+
+def _payload_has_weak_sources(payload: dict, allowed_urls: Optional[List[str]] = None) -> bool:
     """Return True when the payload lacks enough usable source URLs."""
     if not isinstance(payload, dict):
         return True
@@ -4076,6 +4643,8 @@ def _payload_has_weak_sources(payload: dict) -> bool:
         payload.get("positive_findings"),
         payload.get("summary"),
     )
+    if allowed_urls is not None:
+        normalized_urls = filter_urls_to_allowed(normalized_urls, allowed_urls)
     if len(normalized_urls) >= 2:
         return False
     findings = payload.get("positive_findings")
@@ -4085,7 +4654,10 @@ def _payload_has_weak_sources(payload: dict) -> bool:
     for item in findings:
         if not isinstance(item, dict):
             continue
-        if _normalize_source_urls(item.get("source_url"), item.get("url")):
+        finding_urls = _normalize_source_urls(item.get("source_url"), item.get("url"))
+        if allowed_urls is not None:
+            finding_urls = filter_urls_to_allowed(finding_urls, allowed_urls)
+        if finding_urls:
             valid_finding_urls += 1
     return valid_finding_urls < min(2, len(findings))
 
@@ -4343,7 +4915,11 @@ def _render_source_links(urls: List[str]) -> str:
     return "<div class=\"source-links\">" + "".join(links) + "</div>"
 
 
-def _normalize_positive_findings(items: Any, fallback: Optional[List[PositiveFinding]] = None) -> List[PositiveFinding]:
+def _normalize_positive_findings(
+    items: Any,
+    fallback: Optional[List[PositiveFinding]] = None,
+    allowed_urls: Optional[List[str]] = None,
+) -> List[PositiveFinding]:
     normalized: List[PositiveFinding] = []
     for item in items if isinstance(items, list) else []:
         if not isinstance(item, dict):
@@ -4351,13 +4927,16 @@ def _normalize_positive_findings(items: Any, fallback: Optional[List[PositiveFin
         description = str(item.get("description", "")).strip()
         if not description:
             continue
+        source_urls = _normalize_source_urls(item.get("source_url"), item.get("url"))
+        if allowed_urls is not None:
+            source_urls = filter_urls_to_allowed(source_urls, allowed_urls)
         normalized.append(
             PositiveFinding(
                 category=str(item.get("category", "other")).strip() or "other",
                 description=description,
                 evidence=str(item.get("evidence", "")).strip(),
                 confidence=_coerce_float(item.get("confidence"), 0.5),
-                source_url=(_normalize_source_urls(item.get("source_url"), item.get("url")) or [""])[0],
+                source_url=(source_urls or [""])[0],
                 date=str(item.get("date", "")).strip() or None,
             )
         )
@@ -4406,15 +4985,24 @@ def _fallback_market_overview(themes: List[ThemeItem]) -> List[ReportThemeOvervi
     return items
 
 
-def _normalize_market_overview_item(raw: Optional[dict], fallback_theme: ThemeItem) -> ReportThemeOverview:
+def _normalize_market_overview_item(
+    raw: Optional[dict],
+    fallback_theme: ThemeItem,
+    allowed_urls: Optional[List[str]] = None,
+) -> ReportThemeOverview:
     raw = raw or {}
+    raw_source_urls = _normalize_source_urls(raw.get("source_urls"), raw.get("logic"))
+    if allowed_urls is not None:
+        source_urls = filter_urls_to_allowed(raw_source_urls, allowed_urls)
+    else:
+        source_urls = _normalize_source_urls(raw.get("source_urls"), raw.get("logic"), fallback_theme.sources)
     return ReportThemeOverview(
         name=str(raw.get("name") or fallback_theme.name),
         validation_status=_normalize_validation_status(raw.get("validation_status", fallback_theme.validation_status)),
         logic=_coerce_lines(raw.get("logic")) or _coerce_lines(fallback_theme.summary) or ["题材逻辑待补充。"],
         capital_validation=_coerce_lines(raw.get("capital_validation")) or _coerce_lines(fallback_theme.capital_signal) or ["龙虎榜资金信号待补充。"],
         watch_items=_coerce_lines(raw.get("watch_items")) or [f"持续跟踪 {fallback_theme.name} 的政策催化与资金延续性。"],
-        source_urls=_normalize_source_urls(raw.get("source_urls"), raw.get("logic"), fallback_theme.sources),
+        source_urls=source_urls,
     )
 
 
@@ -4479,6 +5067,7 @@ def _generate_market_overview(theme_summary: list, trace_path: Path, themes: Lis
     """Generate structured market overview via DeepSeek with fallback."""
     if not themes:
         return []
+    allowed_by_theme = build_allowed_theme_source_map(themes)
     messages = [
         {"role": "system", "content": _MARKET_OVERVIEW_SYSTEM_PROMPT},
         {"role": "user", "content": json.dumps({"themes": theme_summary}, ensure_ascii=False)},
@@ -4488,7 +5077,7 @@ def _generate_market_overview(theme_summary: list, trace_path: Path, themes: Lis
     if not content:
         return _fallback_market_overview(themes)
     trace_append(trace_path, "overview_response", {"content": truncate(content, 8000)})
-    def parse_overview(payload: str) -> Optional[tuple[List[ReportThemeOverview], bool]]:
+    def parse_overview(payload: str) -> Optional[tuple[List[ReportThemeOverview], bool, int]]:
         parsed = safe_json_loads(payload)
         raw_items = parsed.get("themes") if isinstance(parsed, dict) else None
         if not isinstance(raw_items, list):
@@ -4499,28 +5088,37 @@ def _generate_market_overview(theme_summary: list, trace_path: Path, themes: Lis
             if isinstance(item, dict) and str(item.get("name", "")).strip()
         }
         weak_raw_sources = False
+        dropped_unproven_url_count = 0
+        overview_items: List[ReportThemeOverview] = []
         for theme in themes:
             raw = by_name.get(theme.name) or {}
             status = _normalize_validation_status(raw.get("validation_status", theme.validation_status))
-            if status in {"confirmed", "web_only"} and not _normalize_source_urls(
-                raw.get("source_urls"),
-                raw.get("logic"),
-            ):
+            allowed_urls = allowed_by_theme.get(theme.name, [])
+            raw_urls = _normalize_source_urls(raw.get("source_urls"), raw.get("logic"))
+            dropped_unproven_url_count += _count_unproven_urls(raw_urls, allowed_urls)
+            allowed_raw_urls = filter_urls_to_allowed(raw_urls, allowed_urls)
+            if status in {"confirmed", "web_only"} and not allowed_raw_urls:
                 weak_raw_sources = True
+            overview_items.append(_normalize_market_overview_item(raw, theme, allowed_urls=allowed_urls))
         return (
-            [_normalize_market_overview_item(by_name.get(theme.name), theme) for theme in themes],
+            overview_items,
             weak_raw_sources,
+            dropped_unproven_url_count,
         )
 
     overview_parsed = parse_overview(content)
     if overview_parsed is None:
         return _fallback_market_overview(themes)
-    overview_items, weak_raw_sources = overview_parsed
+    overview_items, weak_raw_sources, dropped_unproven_url_count = overview_parsed
     weak_sources = weak_raw_sources or market_overview_has_weak_sources(overview_items)
     trace_append(
         trace_path,
         "overview_source_check",
-        {"weak_sources": weak_sources, "theme_count": len(overview_items)},
+        {
+            "weak_sources": weak_sources,
+            "theme_count": len(overview_items),
+            "dropped_unproven_url_count": dropped_unproven_url_count,
+        },
     )
     if not weak_sources:
         return overview_items
@@ -4534,8 +5132,8 @@ def _generate_market_overview(theme_summary: list, trace_path: Path, themes: Lis
             "role": "user",
             "content": (
                 "上一次市场概览JSON可解析，但source_urls薄弱或缺失。"
-                "不要新增web搜索；只使用已给定theme上下文中的sources，"
-                "为confirmed/web_only主题补齐可验证source_urls，并返回同一JSON结构。"
+                "不要新增web搜索；source_urls必须从已给定theme上下文中的sources逐字复制，"
+                "不得编造、改写或补全URL。为confirmed/web_only主题补齐可验证source_urls，并返回同一JSON结构。"
             ),
         },
     ]
@@ -4548,7 +5146,17 @@ def _generate_market_overview(theme_summary: list, trace_path: Path, themes: Lis
     )
     corrected_parsed = parse_overview(corrected_content or "") if corrected_content else None
     if corrected_parsed is not None:
-        corrected_items, corrected_raw_weak = corrected_parsed
+        corrected_items, corrected_raw_weak, corrected_dropped = corrected_parsed
+        trace_append(
+            trace_path,
+            "overview_source_check",
+            {
+                "weak_sources": corrected_raw_weak or market_overview_has_weak_sources(corrected_items),
+                "theme_count": len(corrected_items),
+                "dropped_unproven_url_count": corrected_dropped,
+                "corrected": True,
+            },
+        )
         if not corrected_raw_weak and not market_overview_has_weak_sources(corrected_items):
             return corrected_items
     return _fallback_market_overview(themes)
@@ -4631,18 +5239,26 @@ def _normalize_stock_section_payload(
     stock_audits: List[AuditResult],
     chart: Optional[ChartArtifact],
     signal: Optional[Dict[str, object]],
+    allowed_source_urls: Optional[List[str]] = None,
 ) -> ReportStockSection:
     fallback = _fallback_stock_section(row, stock_audits, chart, signal)
     business_quality = aggregate_business_quality(stock_audits)
     recommendation, label = _normalize_recommendation(payload.get("recommendation"))
-    positive_findings = _normalize_positive_findings(payload.get("positive_findings"), fallback.positive_findings)
+    positive_findings = _normalize_positive_findings(
+        payload.get("positive_findings"),
+        fallback.positive_findings,
+        allowed_urls=allowed_source_urls,
+    )
     growth_catalysts = _normalize_growth_catalysts(payload.get("growth_catalysts"), fallback.growth_catalysts)
     source_urls = _normalize_source_urls(
         payload.get("source_urls"),
         [finding.source_url for finding in positive_findings],
         payload.get("summary"),
         [audit.sources for audit in stock_audits],
-    ) or fallback.source_urls
+    )
+    if allowed_source_urls is not None:
+        source_urls = filter_urls_to_allowed(source_urls, allowed_source_urls)
+    source_urls = source_urls or fallback.source_urls
     return ReportStockSection(
         ts_code=str(payload.get("ts_code") or row.get("ts_code", "")),
         name=str(payload.get("name") or row.get("name", "")),
@@ -4697,6 +5313,7 @@ def _generate_stock_section(
     repeated_failure_count = 0
     max_iterations = 5
     missing_sources_feedback_sent = False
+    allowed_source_urls = build_allowed_stock_source_set(stock_audits)
     trace_append(trace_path, "stock_section_request", {"ts_code": ts_code, "name": name})
     for iteration in range(max_iterations):
         content = deepseek_chat(messages) if deepseek_chat else None
@@ -4743,6 +5360,10 @@ def _generate_stock_section(
                     "result": truncate(result, 4000),
                 },
             )
+            if tool == "web_search" and status == "success":
+                for source in _normalize_source_urls(parse_search_payload(result).get("urls", []), result):
+                    if source not in allowed_source_urls:
+                        allowed_source_urls.append(source)
             if tool_stats is not None:
                 tool_stats["total_calls"] = int(tool_stats.get("total_calls", 0)) + 1
                 per_tool = tool_stats.setdefault("per_tool", {})
@@ -4777,15 +5398,43 @@ def _generate_stock_section(
             if isinstance(candidate_payload, dict):
                 payload = candidate_payload
         if payload is not None:
+            dropped_unproven_url_count = _count_unproven_urls(
+                [
+                    payload.get("source_urls"),
+                    payload.get("positive_findings"),
+                    payload.get("summary"),
+                ],
+                allowed_source_urls,
+            )
+            source_weak = _payload_has_weak_sources(payload, allowed_source_urls)
+            trace_append(
+                trace_path,
+                "stock_section_source_check",
+                {
+                    "ts_code": ts_code,
+                    "name": name,
+                    "allowed_source_count": len(allowed_source_urls),
+                    "dropped_unproven_url_count": dropped_unproven_url_count,
+                    "weak_sources": source_weak,
+                    "missing_sources_feedback_sent": missing_sources_feedback_sent,
+                },
+            )
             if (
                 not missing_sources_feedback_sent
-                and _payload_has_weak_sources(payload)
+                and source_weak
                 and iteration < max_iterations - 1
             ):
                 missing_sources_feedback_sent = True
                 messages.append({"role": "user", "content": _build_missing_sources_feedback(row, stock_audits)})
                 continue
-            return _normalize_stock_section_payload(payload, row, stock_audits, chart, ctx.get("signals"))
+            return _normalize_stock_section_payload(
+                payload,
+                row,
+                stock_audits,
+                chart,
+                ctx.get("signals"),
+                allowed_source_urls=allowed_source_urls,
+            )
         messages.append({"role": "user", "content": "仅返回JSON对象 {\"stock\": {...}}，不要Markdown，不要代码块。"})
     return _fallback_stock_section(row, stock_audits, chart, ctx.get("signals"))
 
