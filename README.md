@@ -472,7 +472,13 @@ trend-agent/
 │   ├── stock_ticks/              # 历史行情 (每只股票一个parquet)
 │   ├── financial/                # 财务数据
 │   ├── top_list/                 # 龙虎榜汇总 (每日)
-│   └── top_inst/                 # 龙虎榜明细 (每日)
+│   ├── top_inst/                 # 龙虎榜明细 (每日)
+│   ├── signals/                  # 验证信号快照与标签
+│   │   ├── signal_snapshots.parquet
+│   │   └── signal_labels.parquet
+│   └── validation_reports/       # 因子评估与回测报告
+│       ├── factor_report_YYYYMMDD.html
+│       └── backtest_report_YYYYMMDD.html
 │
 ├── charts/                        # 输出K线图
 │   ├── 000001.SZ.png
@@ -529,7 +535,7 @@ trend-agent/
 python -m venv .venv
 source .venv/bin/activate
 pip install -U pandas numpy duckdb mplfinance matplotlib \
-               langchain-core langchain-community python-dotenv
+               scipy pyarrow langchain-core langchain-community python-dotenv
 ```
 
 ### 系统依赖
@@ -607,6 +613,91 @@ python test_deepseek_thinking.py
 
 # 离线评估候选池（5/10/20日收益 + 消融）
 python strategy_evaluator.py --candidates reports/candidates_YYYYMMDD_HHMMSS.csv
+```
+
+### 统计验证与回测
+
+验证模块位于 `validation/`，通过 CLI 持久化候选信号、构建未来收益标签、评估因子预测力，并运行轻量 top-N 等权周频回测。所有命令建议使用项目 venv：
+
+```bash
+source .venv/bin/activate
+```
+
+#### 1) 保存候选信号快照
+
+完整流水线会导出 `reports/candidates_YYYYMMDD_HHMMSS.csv`。将该文件固化为不可变信号快照：
+
+```bash
+python -m validation.cli snapshot \
+  --input reports/candidates_YYYYMMDD_HHMMSS.csv \
+  --signal-date YYYYMMDD \
+  --run-id run_YYYYMMDD
+```
+
+输出：
+
+```text
+data/signals/signal_snapshots.parquet
+```
+
+快照以 `(run_id, signal_date, ts_code)` 为不可变键。重复写入相同内容会保持幂等；相同键但内容不同会报错，避免历史信号被静默覆盖。每条记录会保留 `run_id`、`config_hash`、`agent_version` 和候选表中的主要因子列。
+
+#### 2) 构建未来收益标签
+
+```bash
+python -m validation.cli build-labels \
+  --snapshots data/signals/signal_snapshots.parquet \
+  --prices data/stock_ticks \
+  --output data/signals/signal_labels.parquet
+```
+
+默认生成 `1D/3D/5D/10D/20D/40D` 标签。为防止未来函数，`signal_date=t` 的入场价使用 `t+1` 或之后第一个可交易日的开盘价，未来收益按 `exit_close / entry_open - 1` 计算。
+
+#### 3) 评估因子预测力
+
+```bash
+python -m validation.cli eval-factors \
+  --labels data/signals/signal_labels.parquet \
+  --factor alpha_rank_score \
+  --top-n 10
+```
+
+输出包含 IC、RankIC、分位数组合收益、top-N 未来收益，以及按行业、市场、交易所、`list_type` 的基础稳健性拆分。
+
+#### 4) 运行 top-N 周频等权回测
+
+```bash
+python -m validation.cli backtest \
+  --labels data/signals/signal_labels.parquet \
+  --prices data/stock_ticks \
+  --score-col alpha_rank_score \
+  --top-n 10 \
+  --cost-bps 10 \
+  --slippage-bps 5
+```
+
+回测默认按周取最新信号、按分数选择 top-N、等权持有，并应用交易成本和滑点。买入使用下一交易日开盘；涨停开盘默认不买入，跌停开盘默认延迟卖出。
+
+#### 5) 生成 HTML/Markdown 报告
+
+```bash
+python -m validation.cli report --kind all
+```
+
+输出：
+
+```text
+data/validation_reports/factor_report_YYYYMMDD.html
+data/validation_reports/factor_report_YYYYMMDD.md
+data/validation_reports/backtest_report_YYYYMMDD.html
+data/validation_reports/backtest_report_YYYYMMDD.md
+```
+
+可单独生成：
+
+```bash
+python -m validation.cli report --kind factor
+python -m validation.cli report --kind backtest
 ```
 
 ### 调试模式
