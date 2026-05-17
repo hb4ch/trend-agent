@@ -48,6 +48,9 @@ VALUATION_WEIGHTS = {
     "ps_ttm": 0.2,
 }
 
+OBV_DIVERGENCE_MIN_NORM = 0.05
+OBV_DIVERGENCE_MAX_PRICE_CHANGE = 0.03
+
 
 def load_stock_basic() -> pd.DataFrame:
     """Load stock basic information."""
@@ -139,6 +142,143 @@ def compute_obv(df: pd.DataFrame) -> pd.Series:
     return (direction * df[vol_col]).cumsum()
 
 
+def compute_obv_features(df: pd.DataFrame, window: int = 20) -> Dict[str, float | bool]:
+    """Return raw and volume-normalized OBV accumulation features."""
+    vol_col = "volume" if "volume" in df.columns else "vol"
+    obv_series = compute_obv(df)
+    obv_recent = obv_series.tail(window).dropna()
+    if len(obv_recent) >= 2:
+        obv_slope = float(np.polyfit(range(len(obv_recent)), obv_recent.values, 1)[0])
+    else:
+        obv_slope = 0.0
+
+    avg_volume = float(df[vol_col].tail(window).mean()) if vol_col in df.columns else 0.0
+    obv_slope_norm = obv_slope / (avg_volume + EPSILON) if avg_volume > EPSILON else 0.0
+
+    if len(df) > window:
+        base_close = float(df["close"].iloc[-(window + 1)])
+        price_change = (float(df["close"].iloc[-1]) / (base_close + EPSILON)) - 1.0 if base_close > EPSILON else 0.0
+    else:
+        price_change = 0.0
+
+    obv_divergence = obv_slope_norm >= OBV_DIVERGENCE_MIN_NORM and price_change <= OBV_DIVERGENCE_MAX_PRICE_CHANGE
+    return {
+        "obv_slope": obv_slope,
+        "obv_slope_norm": float(obv_slope_norm),
+        "price_change_20d": float(price_change),
+        "obv_divergence": bool(obv_divergence),
+    }
+
+
+def compute_trend_emergence_score(
+    return_5d: float,
+    return_10d: float,
+    return_20d: float,
+    volume_ratio_5d_vs_60d: float,
+    fresh_breakout: bool,
+    near_breakout: bool,
+    obv_accumulation_score: float = 0.0,
+) -> float:
+    """Score early trend emergence from returns, volume, breakout proximity, and OBV."""
+    r5 = finite_float(return_5d)
+    r10 = finite_float(return_10d)
+    r20 = finite_float(return_20d)
+    vol_ratio = finite_float(volume_ratio_5d_vs_60d, 1.0)
+
+    if r20 > 0.45:
+        return_score = min(8.0, linear_score(r20, 0.0, 0.45, 25.0))
+    elif r20 <= 0.25:
+        return_score = linear_score(r20, 0.0, 0.05, 25.0)
+    else:
+        return_score = max(0.0, 25.0 * (1.0 - (r20 - 0.25) / 0.20))
+
+    acceleration_score = 0.0
+    if r5 > 0:
+        acceleration_score += linear_score(r5, 0.0, 0.08, 10.0)
+    if r10 > 0:
+        acceleration_score += linear_score(r10, 0.0, 0.15, 6.0)
+    if r5 > r20 / 4.0:
+        acceleration_score += 4.0
+
+    volume_score = linear_score(vol_ratio, 1.0, 2.5, 20.0)
+    if vol_ratio > 4.0:
+        volume_score = min(volume_score, 12.0)
+
+    breakout_score = 20.0 if fresh_breakout else (12.0 if near_breakout else 0.0)
+    obv_score = linear_score(finite_float(obv_accumulation_score), 0.0, 100.0, 15.0)
+    return min(100.0, return_score + acceleration_score + volume_score + breakout_score + obv_score)
+
+
+def compute_trend_emergence_features(
+    df: pd.DataFrame,
+    obv_accumulation_score: float = 0.0,
+) -> Dict[str, float | bool]:
+    """Return simple features for stocks that are starting to trend now."""
+    if df is None or df.empty:
+        return {
+            "return_5d": 0.0,
+            "return_10d": 0.0,
+            "return_20d": 0.0,
+            "volume_ratio_5d_vs_60d": 1.0,
+            "fresh_breakout": False,
+            "near_breakout": False,
+            "trend_emergence_score": 0.0,
+        }
+
+    data = df.sort_values("trade_date").reset_index(drop=True) if "trade_date" in df.columns else df.reset_index(drop=True)
+    close = pd.to_numeric(data["close"], errors="coerce")
+    latest_close = finite_float(close.iloc[-1])
+
+    def period_return(days: int) -> float:
+        if len(close) <= days:
+            return 0.0
+        base = finite_float(close.iloc[-(days + 1)])
+        if base <= EPSILON or latest_close <= EPSILON:
+            return 0.0
+        return float(latest_close / (base + EPSILON) - 1.0)
+
+    return_5d = period_return(5)
+    return_10d = period_return(10)
+    return_20d = period_return(20)
+
+    vol_col = "volume" if "volume" in data.columns else "vol"
+    if vol_col in data.columns and len(data) >= 60:
+        volume = pd.to_numeric(data[vol_col], errors="coerce")
+        avg_5 = finite_float(volume.tail(5).mean())
+        avg_60 = finite_float(volume.tail(60).mean())
+        volume_ratio = avg_5 / (avg_60 + EPSILON) if avg_60 > EPSILON else 1.0
+    else:
+        volume_ratio = 1.0
+
+    fresh_breakout = False
+    near_breakout = False
+    if len(data) >= 61 and "high" in data.columns:
+        prior_60d_high = finite_float(pd.to_numeric(data["high"], errors="coerce").iloc[-61:-1].max())
+        if prior_60d_high > EPSILON:
+            fresh_breakout = latest_close >= prior_60d_high
+            near_breakout = latest_close >= 0.95 * prior_60d_high
+
+    trend_score = compute_trend_emergence_score(
+        return_5d,
+        return_10d,
+        return_20d,
+        volume_ratio,
+        fresh_breakout,
+        near_breakout,
+        obv_accumulation_score,
+    )
+
+    return {
+        "return_5d": float(return_5d),
+        "return_10d": float(return_10d),
+        "return_20d": float(return_20d),
+        "volume_ratio_5d_vs_60d": float(volume_ratio),
+        "fresh_breakout": bool(fresh_breakout),
+        "near_breakout": bool(near_breakout),
+        "trend_emergence_score": float(trend_score),
+    }
+
+
 def compute_rsi(df: pd.DataFrame, period: int = 14) -> pd.Series:
     """Relative Strength Index."""
     delta = df["close"].diff()
@@ -182,6 +322,27 @@ def range_score(value: float, lo: float, hi: float, max_points: float) -> float:
     if value < lo:
         return max(0.0, max_points * (1.0 - (lo - value) / (hi - lo + EPSILON)))
     return max(0.0, max_points * (1.0 - (value - hi) / (hi - lo + EPSILON)))
+
+
+def finite_float(value, default: float = 0.0) -> float:
+    """Return a finite float, otherwise a default."""
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return default
+    return out if np.isfinite(out) else default
+
+
+def compute_volume_quality_score(
+    volume_boost: float,
+    avg_turnover: float,
+    obv_accumulation_score: float = 0.0,
+) -> float:
+    """Score volume quality with calibrated OBV accumulation instead of raw OBV sign."""
+    vq_obv = linear_score(finite_float(obv_accumulation_score), 0.0, 100.0, 40.0)
+    vq_boost = range_score(finite_float(volume_boost, 1.0), 1.2, 3.0, 35.0)
+    vq_turnover = range_score(finite_float(avg_turnover), 1.0, 5.0, 25.0)
+    return min(100.0, vq_obv + vq_boost + vq_turnover)
 
 
 def safe_positive_float(value) -> Optional[float]:
@@ -371,12 +532,12 @@ def analyze_stock_technical(df, current_date=None):
     else:
         bbw_percentile = 0.5
 
-    obv_series = compute_obv(df)
-    obv_recent = obv_series.tail(20)
-    if len(obv_recent) >= 2:
-        obv_slope = float(np.polyfit(range(len(obv_recent)), obv_recent.values, 1)[0])
-    else:
-        obv_slope = 0.0
+    obv_features = compute_obv_features(df, window=20)
+    obv_slope = float(obv_features["obv_slope"])
+    obv_slope_norm = float(obv_features["obv_slope_norm"])
+    price_change_20d = float(obv_features["price_change_20d"])
+    obv_divergence = bool(obv_features["obv_divergence"])
+    trend_features = compute_trend_emergence_features(df, obv_accumulation_score=0.0)
 
     rsi_series = compute_rsi(df)
     rsi_now = float(rsi_series.iloc[-1]) if rsi_series.notna().any() else 50.0
@@ -410,6 +571,17 @@ def analyze_stock_technical(df, current_date=None):
         'adx_slope': adx_slope,
         'bbw_percentile': bbw_percentile,
         'obv_slope': obv_slope,
+        'obv_slope_norm': obv_slope_norm,
+        'price_change_20d': price_change_20d,
+        'obv_divergence': obv_divergence,
+        'obv_accumulation_score': 0.0,
+        'return_5d': float(trend_features["return_5d"]),
+        'return_10d': float(trend_features["return_10d"]),
+        'return_20d': float(trend_features["return_20d"]),
+        'volume_ratio_5d_vs_60d': float(trend_features["volume_ratio_5d_vs_60d"]),
+        'fresh_breakout': bool(trend_features["fresh_breakout"]),
+        'near_breakout': bool(trend_features["near_breakout"]),
+        'trend_emergence_score': float(trend_features["trend_emergence_score"]),
         'rsi': rsi_now,
         'vwap_ratio': vwap_ratio,
     }
@@ -431,11 +603,8 @@ def analyze_stock_technical(df, current_date=None):
     squeeze_readiness = min(100.0, sq_atr + sq_bbw + sq_adx)
     scores['squeeze_readiness'] = squeeze_readiness
 
-    # 4c. Volume Quality Score (0-100) - NEW
-    vq_obv = linear_score(obv_slope, 0.0, abs(obv_slope) * 2 + EPSILON, 40.0) if obv_slope > 0 else 0.0
-    vq_boost = range_score(volume_boost, 1.2, 3.0, 35.0)
-    vq_turnover = range_score(avg_turnover, 1.0, 5.0, 25.0)
-    volume_quality_score = min(100.0, vq_obv + vq_boost + vq_turnover)
+    # 4c. Volume Quality Score (0-100) - recomputed with universe OBV percentiles later
+    volume_quality_score = compute_volume_quality_score(volume_boost, avg_turnover, 0.0)
     scores['volume_quality_score'] = volume_quality_score
 
     # 5. 趋势判断
@@ -451,6 +620,8 @@ def analyze_stock_technical(df, current_date=None):
         df, latest, ema20, ma60, ma120, ma250,
         recent_high, recent_low, volume_boost,
         adx_now, adx_slope, obv_slope, vwap_ratio,
+        obv_slope_norm=obv_slope_norm,
+        obv_divergence=obv_divergence,
     )
     scores['momentum_score'] = momentum_score
 
@@ -471,6 +642,10 @@ def compute_momentum_score(
     adx_slope: float = 0.0,
     obv_slope: float = 0.0,
     vwap_ratio: float = 1.0,
+    obv_slope_norm: Optional[float] = None,
+    obv_accumulation_score: Optional[float] = None,
+    obv_divergence: bool = False,
+    box_position: Optional[float] = None,
 ) -> float:
     """
     Compute momentum score for a stock (enhanced with continuous scoring).
@@ -479,14 +654,14 @@ def compute_momentum_score(
     - MA Alignment (EMA20 > MA60 > MA120): 0-25 points
     - ADX Inflection (rising from < 25):    0-20 points
     - Box Position (0.6-0.95 ideal):        0-15 points
-    - OBV Divergence (positive slope):      0-20 points
+    - OBV Accumulation/Divergence:          0-20 points
     - Volume Confirmation (1.2-3.0x):       0-10 points
     - VWAP Confirmation (close near/above): 0-10 points
 
     Returns:
         Momentum score from 0-100
     """
-    close = float(latest['close'])
+    close = finite_float(latest.get('close', latest.get('current_price', 0.0)))
     score = 0.0
 
     # 1. MA Alignment Score (0-25 points) - continuous
@@ -508,14 +683,24 @@ def compute_momentum_score(
         score += 5.0  # Low ADX about to inflect
 
     # 3. Box Position Score (0-15 points) - continuous taper
-    box_range = box_top - box_bottom
-    if box_range > EPSILON:
-        position = (close - box_bottom) / box_range
-        score += range_score(position, 0.6, 0.95, 15.0)
+    position = box_position
+    if position is None:
+        box_range = box_top - box_bottom
+        position = (close - box_bottom) / box_range if box_range > EPSILON else None
+    if position is not None:
+        score += range_score(position, 0.25, 0.65, 15.0)
 
-    # 4. OBV Divergence Score (0-20 points) - positive OBV slope = accumulation
-    if obv_slope > 0:
-        score += min(20.0, linear_score(obv_slope, 0.0, abs(obv_slope) * 2 + EPSILON, 20.0))
+    # 4. OBV Accumulation/Divergence Score (0-20 points)
+    if obv_accumulation_score is not None:
+        score += linear_score(finite_float(obv_accumulation_score), 0.0, 100.0, 15.0)
+        if obv_divergence:
+            score += 5.0
+    else:
+        norm = obv_slope_norm if obv_slope_norm is not None else (0.0 if obv_slope <= 0 else None)
+        if norm is not None:
+            score += linear_score(finite_float(norm), 0.0, 0.20, 20.0)
+        elif obv_slope > 0:
+            score += 5.0
 
     # 5. Volume Confirmation Score (0-10 points) - continuous
     score += range_score(volume_boost, 1.2, 3.0, 10.0)
@@ -619,18 +804,76 @@ def screen_all_stocks() -> pd.DataFrame:
         logger.warning("No stocks remained after valuation filter!")
         return None
 
+    results_df["obv_slope_norm"] = results_df.get("obv_slope_norm", pd.Series(0.0, index=results_df.index)).apply(finite_float)
+    results_df["obv_divergence"] = results_df.get("obv_divergence", pd.Series(False, index=results_df.index)).astype(bool)
+    results_df["obv_slope_norm_percentile"] = 0.0
+    positive_obv = results_df["obv_slope_norm"] > 0
+    if positive_obv.any():
+        results_df.loc[positive_obv, "obv_slope_norm_percentile"] = results_df.loc[positive_obv, "obv_slope_norm"].rank(pct=True)
+    divergence_bonus = results_df["obv_divergence"].map(lambda value: 15.0 if value else 0.0)
+    results_df["obv_accumulation_score"] = (
+        results_df["obv_slope_norm_percentile"] * 85.0 + divergence_bonus
+    ).clip(lower=0.0, upper=100.0)
+
+    results_df["volume_quality_score"] = results_df.apply(
+        lambda row: compute_volume_quality_score(
+            row.get("volume_boost", 1.0),
+            row.get("avg_turnover", 0.0),
+            row.get("obv_accumulation_score", 0.0),
+        ),
+        axis=1,
+    )
+    results_df["momentum_score"] = results_df.apply(
+        lambda row: compute_momentum_score(
+            pd.DataFrame(),
+            row,
+            finite_float(row.get("ema20")),
+            finite_float(row.get("ma60")),
+            finite_float(row.get("ma120")),
+            finite_float(row.get("ma250")),
+            0.0,
+            0.0,
+            row.get("volume_boost", 1.0),
+            row.get("adx", 20.0),
+            row.get("adx_slope", 0.0),
+            row.get("obv_slope", 0.0),
+            row.get("vwap_ratio", 1.0),
+            obv_slope_norm=row.get("obv_slope_norm", 0.0),
+            obv_accumulation_score=row.get("obv_accumulation_score", 0.0),
+            obv_divergence=bool(row.get("obv_divergence", False)),
+            box_position=row.get("price_position", None),
+        ),
+        axis=1,
+    )
+    results_df["trend_emergence_score"] = results_df.apply(
+        lambda row: compute_trend_emergence_score(
+            row.get("return_5d", 0.0),
+            row.get("return_10d", 0.0),
+            row.get("return_20d", 0.0),
+            row.get("volume_ratio_5d_vs_60d", 1.0),
+            bool(row.get("fresh_breakout", False)),
+            bool(row.get("near_breakout", False)),
+            row.get("obv_accumulation_score", 0.0),
+        ),
+        axis=1,
+    )
+
     # Composite ranking: trend-first, valuation-aware
     results_df['composite_score'] = (
-        results_df['consolidation_score'] * 0.30 +
-        results_df['momentum_score'] * 0.25 +
+        results_df['consolidation_score'] * 0.40 +
+        results_df['momentum_score'] * 0.15 +
         results_df['volume_quality_score'] * 0.18 +
         results_df['squeeze_readiness'] * 0.15 +
         results_df['valuation_quality_score'] * 0.12
     )
+    results_df["technical_selection_score"] = (
+        results_df["composite_score"] * 0.70 +
+        results_df["trend_emergence_score"] * 0.30
+    )
     results_df = results_df.sort_values('composite_score', ascending=False)
 
     # Distribution logging for calibration
-    for col in ['composite_score', 'consolidation_score', 'momentum_score', 'squeeze_readiness', 'volume_quality_score']:
+    for col in ['composite_score', 'consolidation_score', 'momentum_score', 'squeeze_readiness', 'volume_quality_score', 'trend_emergence_score']:
         if col in results_df.columns:
             vals = results_df[col].dropna()
             if len(vals) > 0:

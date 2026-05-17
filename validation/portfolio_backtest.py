@@ -32,6 +32,7 @@ class BacktestConfig:
     exclude_limit_up_buys: bool = True
     delay_limit_down_sells: bool = True
     min_turnover_rate: float | None = None
+    week_ending: str | pd.Timestamp | None = None
 
 
 @dataclass(frozen=True)
@@ -53,6 +54,13 @@ def run_backtest(config: BacktestConfig, labels: pd.DataFrame | None = None) -> 
     if "entry_date" in labels.columns:
         labels["entry_date"] = pd.to_datetime(labels["entry_date"]).dt.normalize()
 
+    if config.week_ending is not None:
+        target = pd.to_datetime(config.week_ending).normalize()
+        anchor = labels["signal_date"].apply(_anchor_friday)
+        labels = labels[anchor == target].copy()
+        if labels.empty:
+            raise ValueError(f"No signals found for week ending {target.date()}")
+
     price_cache: dict[str, pd.DataFrame] = {}
     rebalance_dates = _weekly_signal_dates(labels["signal_date"], config.frequency)
     current: dict[str, float] = {}
@@ -62,8 +70,29 @@ def run_backtest(config: BacktestConfig, labels: pd.DataFrame | None = None) -> 
     holding_rows: list[dict[str, Any]] = []
     trade_rows: list[dict[str, Any]] = []
 
-    for signal_date in rebalance_dates:
-        universe = labels[labels["signal_date"] == signal_date].copy()
+    for anchor_friday in rebalance_dates:
+        if config.frequency == "signal":
+            universe = labels[labels["signal_date"] == anchor_friday].copy()
+        else:
+            anchor = labels["signal_date"].apply(_anchor_friday)
+            week_labels = labels[anchor == anchor_friday]
+            if week_labels.empty:
+                continue
+            best_date = _best_signal_date_in_week(week_labels)
+            if best_date is None:
+                nav_rows.append(
+                    {
+                        "signal_date": anchor_friday,
+                        "trade_date": pd.NaT,
+                        "nav": nav,
+                        "period_return": np.nan,
+                        "holding_count": len(current),
+                        "turnover": np.nan,
+                    }
+                )
+                continue
+            universe = labels[labels["signal_date"] == best_date].copy()
+
         if config.min_turnover_rate is not None and "turnover_rate" in universe.columns:
             universe = universe[pd.to_numeric(universe["turnover_rate"], errors="coerce") >= config.min_turnover_rate]
         if config.require_tradable_buy and "tradable_buy" in universe.columns:
@@ -71,8 +100,21 @@ def run_backtest(config: BacktestConfig, labels: pd.DataFrame | None = None) -> 
         if config.exclude_limit_up_buys and "limit_up_at_entry" in universe.columns:
             universe = universe[~universe["limit_up_at_entry"].fillna(False).astype(bool)]
 
+        if universe.empty:
+            nav_rows.append(
+                {
+                    "signal_date": anchor_friday,
+                    "trade_date": pd.NaT,
+                    "nav": nav,
+                    "period_return": np.nan,
+                    "holding_count": len(current),
+                    "turnover": np.nan,
+                }
+            )
+            continue
+
         desired = select_top_n(universe, config.score_col, config.top_n)
-        trade_date = _trade_date_for_rebalance(desired, labels, signal_date)
+        trade_date = _trade_date_for_rebalance(desired, labels, anchor_friday)
         if trade_date is None:
             continue
 
@@ -92,9 +134,9 @@ def run_backtest(config: BacktestConfig, labels: pd.DataFrame | None = None) -> 
             if config.delay_limit_down_sells and row is not None and is_limit_down_open(ts_code, row, prev_close):
                 next_codes.add(ts_code)
                 delayed_sells.append(ts_code)
-                trade_rows.append(_trade_record(signal_date, trade_date, ts_code, "sell_delayed", row, "limit_down"))
+                trade_rows.append(_trade_record(anchor_friday, trade_date, ts_code, "sell_delayed", row, "limit_down"))
             else:
-                trade_rows.append(_trade_record(signal_date, trade_date, ts_code, "sell", row, "rebalance"))
+                trade_rows.append(_trade_record(anchor_friday, trade_date, ts_code, "sell", row, "rebalance"))
 
         skipped_buys: list[str] = []
         for _, row in desired.iterrows():
@@ -105,10 +147,10 @@ def run_backtest(config: BacktestConfig, labels: pd.DataFrame | None = None) -> 
             prev_close = _previous_close(ts_code, price_row, config.price_root, price_cache)
             if config.exclude_limit_up_buys and price_row is not None and is_limit_up_open(ts_code, price_row, prev_close):
                 skipped_buys.append(ts_code)
-                trade_rows.append(_trade_record(signal_date, trade_date, ts_code, "buy_skipped", price_row, "limit_up"))
+                trade_rows.append(_trade_record(anchor_friday, trade_date, ts_code, "buy_skipped", price_row, "limit_up"))
                 continue
             next_codes.add(ts_code)
-            trade_rows.append(_trade_record(signal_date, trade_date, ts_code, "buy", price_row, "rebalance"))
+            trade_rows.append(_trade_record(anchor_friday, trade_date, ts_code, "buy", price_row, "rebalance"))
 
         old_weights = current
         new_weight = 1.0 / len(next_codes) if next_codes else 0.0
@@ -118,7 +160,7 @@ def run_backtest(config: BacktestConfig, labels: pd.DataFrame | None = None) -> 
 
         holding_rows.append(
             {
-                "signal_date": signal_date,
+                "signal_date": anchor_friday,
                 "trade_date": trade_date,
                 "holdings": json.dumps(sorted(current), ensure_ascii=False),
                 "holding_count": len(current),
@@ -129,7 +171,7 @@ def run_backtest(config: BacktestConfig, labels: pd.DataFrame | None = None) -> 
         )
         nav_rows.append(
             {
-                "signal_date": signal_date,
+                "signal_date": anchor_friday,
                 "trade_date": trade_date,
                 "nav": nav,
                 "period_return": np.nan if len(nav_rows) == 0 else nav / nav_rows[-1]["nav"] - 1.0,
@@ -145,14 +187,33 @@ def run_backtest(config: BacktestConfig, labels: pd.DataFrame | None = None) -> 
     return BacktestResult(nav=nav_df, holdings=holdings_df, trades=trades_df, stats=_backtest_stats(nav_df))
 
 
+def _anchor_friday(d: pd.Timestamp) -> pd.Timestamp:
+    return d + pd.Timedelta(days=(4 - d.day_of_week))
+
+
+def _best_signal_date_in_week(week_labels: pd.DataFrame) -> pd.Timestamp | None:
+    """Return the most recent signal_date in the week that has at least one tradable label."""
+    if week_labels.empty:
+        return None
+    wl = week_labels.copy()
+    if "tradable_buy" in wl.columns:
+        wl["_valid"] = wl["tradable_buy"].fillna(False).astype(bool)
+    else:
+        wl["_valid"] = wl.get("label_status", pd.Series("ok", index=wl.index)) == "ok"
+    valid = wl[wl["_valid"]]
+    if valid.empty:
+        return None
+    return pd.to_datetime(valid["signal_date"].max()).normalize()
+
+
 def _weekly_signal_dates(dates: pd.Series, frequency: str) -> list[pd.Timestamp]:
     unique = pd.Series(pd.to_datetime(dates).dt.normalize().dropna().unique()).sort_values()
     if unique.empty:
         return []
     if frequency == "signal":
         return [pd.Timestamp(x) for x in unique]
-    indexed = pd.Series(unique.values, index=pd.DatetimeIndex(unique.values))
-    return [pd.Timestamp(x) for x in indexed.resample(frequency).last().dropna().values]
+    anchors = unique.apply(_anchor_friday).sort_values().unique()
+    return [pd.Timestamp(x) for x in anchors]
 
 
 def _trade_date_for_rebalance(desired: pd.DataFrame, labels: pd.DataFrame, signal_date: pd.Timestamp) -> pd.Timestamp | None:

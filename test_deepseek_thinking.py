@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Comprehensive tests for DeepSeek V3.2 thinking mode implementation.
+Comprehensive tests for official DeepSeek reasoning mode implementation.
 
 Tests:
 1. Basic thinking mode - Verify reasoning_content is returned
@@ -302,9 +302,9 @@ def test_5_clear_reasoning_from_messages():
 def run_all_tests():
     """Run all tests and report results."""
     print("\n" + "="*70)
-    print("DeepSeek V3.2 Thinking Mode - Comprehensive Test Suite")
+    print("DeepSeek Reasoning Mode - Comprehensive Test Suite")
     print("="*70)
-    print(f"Using SiliconFlow API with thinking_budget={THINKING_BUDGET}")
+    print(f"Using official DeepSeek API with thinking_budget={THINKING_BUDGET}")
     print("="*70)
 
     tests = [

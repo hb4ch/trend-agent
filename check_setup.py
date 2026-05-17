@@ -1,7 +1,6 @@
 import os
 from zai import ZhipuAiClient
 from langchain_core.messages import HumanMessage
-from langchain_community.chat_models import ChatZhipuAI # 也可以用社区版集成，但官方SDK写Tool更稳
 try:
     from dotenv import load_dotenv
 except Exception:
@@ -20,7 +19,7 @@ try:
         raise ValueError("未设置 ZHIPUAI_API_KEY")
     client = ZhipuAiClient(api_key=api_key)
     response = client.web_search.web_search(
-        search_engine="search_pro",
+        search_engine="search_std",
         search_query="今天A股上证指数收盘多少？",
         count=5,
         search_recency_filter="noLimit",

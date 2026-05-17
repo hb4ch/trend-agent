@@ -49,7 +49,7 @@ export FORCE_LLM_LOGGING=1  # Print all LLM I/O to screen
 | File | Purpose |
 |------|---------|
 | `trend_agent.py` | Main pipeline orchestrator (all 5 phases) |
-| `llm_provider.py` | Unified LLM provider (DeepSeek, Zhipu, Gemma) with thinking mode |
+| `llm_provider.py` | Two-tier LLM provider: official DeepSeek heavy tier + local Gemma light tier |
 | `screen_growth_stocks.py` | Stock screening logic & technical analysis |
 | `deep_researcher.py` | AI research engine (Zhipu search + query planning) |
 | `utils.py` | Shared utilities (Dragon Tiger List, JSON parsing, etc.) |
@@ -69,11 +69,12 @@ export FORCE_LLM_LOGGING=1  # Print all LLM I/O to screen
 ```python
 from llm_provider import get_llm, invoke_llm_messages, invoke_deepseek_thinking
 
-# Get langchain LLM instance
-llm = get_llm(model="deepseek")  # or "zhipu", "gemma"
+# Get langchain LLM instances
+heavy_llm = get_llm(model="heavy")  # official DeepSeek deepseek-v4-pro
+light_llm = get_llm(model="light")  # local DGX Spark Gemma 4
 
 # Simple invoke with message dicts
-response = invoke_llm_messages("deepseek", [
+response = invoke_llm_messages("heavy", [
     {"role": "system", "content": "You are a helpful assistant"},
     {"role": "user", "content": "Hello"}
 ])
@@ -149,10 +150,10 @@ VOLATILITY_THRESHOLD = 0.50 # 50% max amplitude (relaxed from 35%)
 # Zhipu AI (Web Search)
 ZHIPUAI_API_KEY=xxx
 
-# Local/OpenAI-compatible Gemma + SiliconFlow DeepSeek
-SILICONFLOW_BASE_URL=https://api.siliconflow.cn/v1
-SILICONFLOW_API_KEY=sk-xxx
-DEEPSEEK_MODEL=Pro/deepseek-ai/DeepSeek-V3.2
+# Two LLM tiers: official DeepSeek heavy tier + local Gemma light tier
+DEEPSEEK_BASE_URL=https://api.deepseek.com
+DEEPSEEK_API_KEY=sk-xxx
+DEEPSEEK_MODEL=deepseek-v4-pro
 GEMMA_MODEL=gemma-4-31B-nvfp4
 GEMMA_BASE_URL=http://192.168.3.46:8000/v1
 GEMMA_API_KEY=dummy
@@ -270,13 +271,12 @@ No Pandoc / XeLaTeX dependency is required for report generation.
 
 | Model | Provider | Purpose |
 |-------|----------|---------|
-| `glm-4-flash` | Zhipu AI | Web search |
-| `DeepSeek-V3.2` | SiliconFlow | Report generation, query planning, thinking mode |
-| `gemma-4-31B-nvfp4` | Local vLLM | Theme matching, classification |
+| `deepseek-v4-pro` | Official DeepSeek API | Heavy driver: report generation, query planning, deep audit synthesis |
+| `gemma-4-31B-nvfp4` | Local DGX Spark OpenAI-compatible endpoint | Light tier: sentiment matching, labeling, classification |
 
 ### DeepSeek Thinking Mode
 
-DeepSeek V3.2 supports reasoning mode that returns both `reasoning_content` (chain of thought) and `content` (final answer). Configured via `llm_provider.py`:
+DeepSeek `deepseek-v4-pro` supports reasoning mode through the official DeepSeek API. Configured via `llm_provider.py`:
 
 ```python
 # Enable thinking mode for complex analysis

@@ -33,18 +33,25 @@ except ImportError:
     def log_to_screen(msg): print(msg, flush=True)
 
 
-DEEPSEEK_BASE_URL = os.environ.get("DEEPSEEK_BASE_URL", "https://api.siliconflow.cn/v1")
-DEEPSEEK_MODEL = os.environ.get("DEEPSEEK_MODEL", "Pro/deepseek-ai/DeepSeek-V3.2")
+DEEPSEEK_BASE_URL = os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
+DEEPSEEK_MODEL = os.environ.get("DEEPSEEK_MODEL", "deepseek-v4-pro")
 DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY")
-SILICONFLOW_BASE_URL = os.environ.get("SILICONFLOW_BASE_URL", DEEPSEEK_BASE_URL)
-SILICONFLOW_API_KEY = os.environ.get("SILICONFLOW_API_KEY", DEEPSEEK_API_KEY)
 GEMMA_MODEL = os.environ.get("GEMMA_MODEL", "gemma-4-31B-nvfp4")
+GEMMA_BASE_URL = os.environ.get("GEMMA_BASE_URL", "http://192.168.3.46:8000/v1")
+GEMMA_API_KEY = os.environ.get("GEMMA_API_KEY", "dummy")
+GEMMA_TEMPERATURE = 1.0
+GEMMA_TOP_P = 0.95
+GEMMA_TOP_K = 64
 
 DEBUG_DEEPSEEK = os.environ.get("DEBUG_DEEPSEEK", "").strip() in {"1", "true", "True", "YES", "yes"}
 DEBUG_ZHIPU_SEARCH = os.environ.get("DEBUG_ZHIPU_SEARCH", "").strip() in {"1", "true", "True", "YES", "yes"}
-DEBUG_SILICONFLOW = os.environ.get("DEBUG_SILICONFLOW", "").strip() in {"1", "true", "True", "YES", "yes"}
+DEBUG_OPENAI_COMPAT = (
+    os.environ.get("DEBUG_OPENAI_COMPAT", "")
+    .strip()
+    in {"1", "true", "True", "YES", "yes"}
+)
 
-ZHIPU_SEARCH_ENGINE = os.environ.get("ZHIPU_SEARCH_ENGINE", "search_pro")
+ZHIPU_SEARCH_ENGINE = os.environ.get("ZHIPU_SEARCH_ENGINE", "search_std")
 ZHIPU_SEARCH_COUNT = int(os.environ.get("ZHIPU_SEARCH_COUNT", "15"))
 ZHIPU_SEARCH_CONTENT_SIZE = os.environ.get("ZHIPU_SEARCH_CONTENT_SIZE", "high")
 ZHIPU_SEARCH_RECENCY_FILTER = os.environ.get("ZHIPU_SEARCH_RECENCY_FILTER", "oneMonth")
@@ -242,22 +249,24 @@ def _safe_json_from_text(text: str) -> Optional[dict]:
 
 
 def deepseek_chat(messages: List[dict]) -> Optional[str]:
-    return siliconflow_chat(messages=messages, model=DEEPSEEK_MODEL, api_key=DEEPSEEK_API_KEY, base_url=DEEPSEEK_BASE_URL, debug=DEBUG_DEEPSEEK, debug_prefix="DeepSeek")
+    return openai_compatible_chat(messages=messages, model=DEEPSEEK_MODEL, api_key=DEEPSEEK_API_KEY, base_url=DEEPSEEK_BASE_URL, debug=DEBUG_DEEPSEEK, debug_prefix="DeepSeek")
 
 
-def siliconflow_chat(
+def openai_compatible_chat(
     messages: List[dict],
     model: str,
     api_key: Optional[str] = None,
     base_url: Optional[str] = None,
     temperature: float = 0.2,
+    top_p: Optional[float] = None,
+    top_k: Optional[int] = None,
     timeout_s: int = 300,
     debug: bool = False,
-    debug_prefix: str = "SiliconFlow",
+    debug_prefix: str = "OpenAICompat",
 ) -> Optional[str]:
     if not api_key:
         return None
-    url_base = (base_url or SILICONFLOW_BASE_URL or "").rstrip("/")
+    url_base = (base_url or "").rstrip("/")
     if not url_base:
         return None
     url = f"{url_base}/chat/completions"
@@ -266,12 +275,16 @@ def siliconflow_chat(
         "messages": messages,
         "temperature": temperature,
     }
+    if top_p is not None:
+        payload["top_p"] = top_p
+    if top_k is not None:
+        payload["top_k"] = top_k
 
     # Log input if forced logging is enabled
     if FORCE_LLM_LOGGING and format_messages_for_screen:
         log_to_screen(format_messages_for_screen(messages, model))
 
-    if debug or DEBUG_SILICONFLOW:
+    if debug or DEBUG_OPENAI_COMPAT:
         try:
             print(
                 f"[{debug_prefix}] request:\n"
@@ -323,7 +336,7 @@ def siliconflow_chat(
             if FORCE_LLM_LOGGING and format_response_for_screen:
                 log_to_screen(format_response_for_screen(content, model))
 
-            if debug or DEBUG_SILICONFLOW:
+            if debug or DEBUG_OPENAI_COMPAT:
                 try:
                     print(f"[{debug_prefix}] response:\n" + _truncate(content, 4000))
                 except Exception:
@@ -338,37 +351,39 @@ def siliconflow_chat(
                         sleep_s = max(sleep_s, float(retry_after))
                     except Exception:
                         pass
-                if debug or DEBUG_SILICONFLOW:
+                if debug or DEBUG_OPENAI_COMPAT:
                     print(f"[{debug_prefix}] HTTP 429 rate limited, retrying in {sleep_s:.1f}s (attempt {attempt + 1}/{max_retries})")
                 time.sleep(sleep_s)
                 continue
             elapsed_ms = int((time.perf_counter() - t0) * 1000)
             logger.warning("LLM call failed: model=%s msgs=%d elapsed=%dms error=HTTP_%d", model, msg_count, elapsed_ms, e.code)
-            if debug or DEBUG_SILICONFLOW:
+            if debug or DEBUG_OPENAI_COMPAT:
                 print(f"[{debug_prefix}] HTTP error: {e.code} - {e.reason}")
             return None
         except urllib.error.URLError as e:
             elapsed_ms = int((time.perf_counter() - t0) * 1000)
             logger.warning("LLM call failed: model=%s msgs=%d elapsed=%dms error=URLError", model, msg_count, elapsed_ms)
-            if debug or DEBUG_SILICONFLOW:
+            if debug or DEBUG_OPENAI_COMPAT:
                 print(f"[{debug_prefix}] URL error: {e.reason}")
             return None
         except Exception as e:
             elapsed_ms = int((time.perf_counter() - t0) * 1000)
             logger.warning("LLM call failed: model=%s msgs=%d elapsed=%dms error=%s", model, msg_count, elapsed_ms, type(e).__name__)
-            if debug or DEBUG_SILICONFLOW:
+            if debug or DEBUG_OPENAI_COMPAT:
                 print(f"[{debug_prefix}] error: {str(e)}")
             return None
     return None
 
 
 def gemma_chat(messages: List[dict]) -> Optional[str]:
-    return siliconflow_chat(
+    return openai_compatible_chat(
         messages=messages,
         model=GEMMA_MODEL,
-        api_key=SILICONFLOW_API_KEY,
-        base_url=SILICONFLOW_BASE_URL,
-        temperature=0.1,
+        api_key=GEMMA_API_KEY,
+        base_url=GEMMA_BASE_URL,
+        temperature=GEMMA_TEMPERATURE,
+        top_p=GEMMA_TOP_P,
+        top_k=GEMMA_TOP_K,
         debug=False,
         debug_prefix="Gemma",
     )
@@ -416,9 +431,13 @@ class ZhipuSearchTool:
             raise ValueError("❌ 未找到 ZHIPUAI_API_KEY，请检查 .env 文件")
         self.client = ZhipuAiClient(api_key=api_key)
 
-    def search(self, query: str) -> str:
+    def search(self, query: str, engine: str = "") -> str:
         """
         调用智谱 ZAI 原生 web_search 接口（更 raw、更稳定地拿到链接）
+
+        Args:
+            query: Search query string
+            engine: Override search engine (e.g. "search_std"). Empty = use default.
         """
         print(f"📡 Zhipu/Zai Searching: {query}...")
         try:
@@ -430,8 +449,9 @@ class ZhipuSearchTool:
                 domain_filter = m.group(1).strip()
                 cleaned_query = re.sub(r"site:[^\s]+", "", query).strip()
 
+            search_engine = engine or ZHIPU_SEARCH_ENGINE
             kwargs = {
-                "search_engine": ZHIPU_SEARCH_ENGINE,
+                "search_engine": search_engine,
                 "search_query": cleaned_query,
                 "count": max(1, min(50, ZHIPU_SEARCH_COUNT)),
                 "search_recency_filter": ZHIPU_SEARCH_RECENCY_FILTER,

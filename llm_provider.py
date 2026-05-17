@@ -1,9 +1,8 @@
 """
-Unified LLM Provider for Trend Agent
+Two-tier LLM provider for Trend Agent.
 
-Supports multiple LLM backends through langchain:
-- ZhipuAI: Used for web search (zhipu_search tool)
-- SiliconFlow DeepSeek V3.2: Default for all other tasks
+Heavy tier: official DeepSeek API, deepseek-v4-pro.
+Light tier: local DGX Spark Gemma 4 endpoint for matching/labeling tasks.
 """
 
 import os
@@ -14,7 +13,6 @@ from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
-from langchain_community.chat_models import ChatZhipuAI
 from langchain_openai import ChatOpenAI
 
 try:
@@ -206,18 +204,33 @@ def log_to_screen(message: str) -> None:
 
 
 # Model configurations
-ZHIPU_MODEL = os.environ.get("ZHIPU_MODEL", "glm-4-flash")
-ZHIPU_API_KEY = os.environ.get("ZHIPUAI_API_KEY")
-
-SILICONFLOW_BASE_URL = os.environ.get("SILICONFLOW_BASE_URL", os.environ.get("DEEPSEEK_BASE_URL", "https://api.siliconflow.cn/v1"))
-SILICONFLOW_API_KEY = os.environ.get("SILICONFLOW_API_KEY", os.environ.get("DEEPSEEK_API_KEY"))
-DEEPSEEK_MODEL = os.environ.get("DEEPSEEK_MODEL", "Pro/deepseek-ai/DeepSeek-V3.2")
+DEEPSEEK_BASE_URL = os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
+DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY")
+DEEPSEEK_MODEL = os.environ.get("DEEPSEEK_MODEL", "deepseek-v4-pro")
 DEEPSEEK_TIMEOUT_SEC = float(os.environ.get("DEEPSEEK_TIMEOUT_SEC", "600"))
 DEEPSEEK_MAX_RETRIES = max(0, int(os.environ.get("DEEPSEEK_MAX_RETRIES", "8")))
 
 GEMMA_MODEL = os.environ.get("GEMMA_MODEL", "gemma-4-31B-nvfp4")
 GEMMA_BASE_URL = os.environ.get("GEMMA_BASE_URL", "http://192.168.3.46:8000/v1")
 GEMMA_API_KEY = os.environ.get("GEMMA_API_KEY", "dummy")
+GEMMA_TEMPERATURE = 1.0
+GEMMA_TOP_P = 0.95
+GEMMA_TOP_K = 64
+
+HEAVY_TIER_ALIASES = {"heavy", "main", "driver", "deepseek", "deepseek-v4-pro"}
+LIGHT_TIER_ALIASES = {"light", "gemma", "matching", "labeling", "sentiment", "sentiment-matching"}
+
+
+def normalize_model_tier(model: str = "heavy") -> str:
+    """Normalize compatibility aliases to one of the two supported LLM tiers."""
+    normalized = (model or "heavy").strip().lower().replace("_", "-")
+    if normalized in HEAVY_TIER_ALIASES:
+        return "heavy"
+    if normalized in LIGHT_TIER_ALIASES:
+        return "light"
+    raise ValueError(
+        f"Unknown LLM tier: {model}. Choose heavy/deepseek/main or light/gemma/matching/labeling/sentiment."
+    )
 
 # Bypass proxy for local vLLM endpoint
 if "192.168." in GEMMA_BASE_URL:
@@ -230,23 +243,23 @@ if "192.168." in GEMMA_BASE_URL:
 
 class LLMProvider:
     """
-    Unified LLM provider supporting multiple backends.
+    Two-tier LLM provider.
 
     Usage:
         provider = LLMProvider()
 
-        # Get DeepSeek for general tasks
-        llm = provider.get_llm(model="deepseek")
+        # Heavy driver tier: official DeepSeek API
+        llm = provider.get_llm(model="heavy")
 
-        # Get Zhipu for search tasks
-        llm = provider.get_llm(model="zhipu")
+        # Light matching/labeling tier: local Gemma
+        llm = provider.get_llm(model="light")
 
         # Simple invoke
-        response = provider.invoke("deepseek", "Hello, world!")
+        response = provider.invoke("heavy", "Hello, world!")
 
         # With prompt template
         prompt = ChatPromptTemplate.from_template("Tell me a joke about {topic}")
-        chain = prompt | provider.get_llm("deepseek") | StrOutputParser()
+        chain = prompt | provider.get_llm("heavy") | StrOutputParser()
         result = chain.invoke({"topic": "programming"})
     """
 
@@ -254,63 +267,56 @@ class LLMProvider:
         self._llm_cache: Dict[str, BaseChatModel] = {}
         logger.info("LLM Provider initialized")
 
-    def get_llm(self, model: str = "deepseek", temperature: float = 0.2) -> BaseChatModel:
+    def get_llm(self, model: str = "heavy", temperature: float = 0.2) -> BaseChatModel:
         """
         Get a langchain LLM instance for the specified model.
 
         Args:
-            model: Model name ("deepseek", "zhipu", or "gemma")
+            model: Tier name or compatibility alias: heavy/deepseek/main or light/gemma/matching/labeling/sentiment
             temperature: Sampling temperature
 
         Returns:
             langchain BaseChatModel instance
         """
-        cache_key = f"{model}_{temperature}"
+        tier = normalize_model_tier(model)
+        effective_temperature = GEMMA_TEMPERATURE if tier == "light" else temperature
+        cache_key = f"{tier}_{effective_temperature}"
 
         if cache_key in self._llm_cache:
             return self._llm_cache[cache_key]
 
-        llm = self._create_llm(model, temperature)
+        llm = self._create_llm(tier, effective_temperature)
         self._llm_cache[cache_key] = llm
         return llm
 
     def _create_llm(self, model: str, temperature: float) -> BaseChatModel:
         """Create a new LLM instance."""
 
-        if model == "zhipu":
-            if not ZHIPU_API_KEY:
-                raise ValueError("ZHIPUAI_API_KEY not set")
-            return ChatZhipuAI(
-                model=ZHIPU_MODEL,
-                temperature=temperature,
-                api_key=ZHIPU_API_KEY,
-            )
-
-        elif model == "deepseek":
-            if not SILICONFLOW_API_KEY:
-                raise ValueError("SILICONFLOW_API_KEY not set")
-            # Use ChatOpenAI with SiliconFlow's OpenAI-compatible API
-            # Enable thinking mode for DeepSeek V3.2 by using max_completion_tokens
+        if model == "heavy":
+            if not DEEPSEEK_API_KEY:
+                raise ValueError("DEEPSEEK_API_KEY not set")
             return ChatOpenAI(
                 model=DEEPSEEK_MODEL,
-                base_url=SILICONFLOW_BASE_URL,
-                api_key=SILICONFLOW_API_KEY,
+                base_url=DEEPSEEK_BASE_URL,
+                api_key=DEEPSEEK_API_KEY,
                 temperature=temperature,
                 timeout=DEEPSEEK_TIMEOUT_SEC,
                 max_retries=DEEPSEEK_MAX_RETRIES,
-                max_completion_tokens=8192,  # Required for thinking mode
+                max_tokens=8192,
             )
 
-        elif model == "gemma":
+        elif model == "light":
             return ChatOpenAI(
                 model=GEMMA_MODEL,
                 base_url=GEMMA_BASE_URL,
                 api_key=GEMMA_API_KEY,
-                temperature=temperature,
+                temperature=GEMMA_TEMPERATURE,
+                top_p=GEMMA_TOP_P,
+                extra_body={"top_k": GEMMA_TOP_K},
             )
 
         else:
-            raise ValueError(f"Unknown model: {model}. Choose from: deepseek, zhipu, gemma")
+            raise ValueError(f"Unknown normalized LLM tier: {model}")
 
     def invoke(
         self,
@@ -324,7 +330,7 @@ class LLMProvider:
         Simple invoke interface.
 
         Args:
-            model: Model name ("deepseek", "zhipu", or "gemma")
+            model: Tier name or compatibility alias
             messages: List of message strings (user messages)
             system_prompt: Optional system prompt
             temperature: Sampling temperature
@@ -374,7 +380,7 @@ class LLMProvider:
         Invoke with message dicts in OpenAI format.
 
         Args:
-            model: Model name ("deepseek", "zhipu", or "gemma")
+            model: Tier name or compatibility alias
             messages: List of message dicts with "role" and "content" keys
                      e.g., [{"role": "system", "content": "..."}, {"role": "user", "content": "..."}]
             temperature: Sampling temperature
@@ -452,12 +458,12 @@ def get_llm_provider() -> LLMProvider:
     return _llm_provider
 
 
-def get_llm(model: str = "deepseek", temperature: float = 0.2) -> BaseChatModel:
+def get_llm(model: str = "heavy", temperature: float = 0.2) -> BaseChatModel:
     """
     Convenience function to get an LLM instance.
 
     Args:
-        model: Model name ("deepseek", "zhipu", or "gemma")
+        model: Tier name or compatibility alias
         temperature: Sampling temperature
 
     Returns:
@@ -476,7 +482,7 @@ def invoke_llm(
     Convenience function to invoke an LLM.
 
     Args:
-        model: Model name ("deepseek", "zhipu", or "gemma")
+        model: Tier name or compatibility alias
         messages: List of message strings
         system_prompt: Optional system prompt
         temperature: Sampling temperature
@@ -496,7 +502,7 @@ def invoke_llm_messages(
     Convenience function to invoke an LLM with message dicts.
 
     Args:
-        model: Model name ("deepseek", "zhipu", or "gemma")
+        model: Tier name or compatibility alias
         messages: List of message dicts with "role" and "content" keys
         temperature: Sampling temperature
 
@@ -515,11 +521,9 @@ import json
 from typing import Literal, Optional, Union, Callable
 
 # DeepSeek thinking mode models
-DEEPSEEK_REASONING_MODEL = os.environ.get("DEEPSEEK_REASONING_MODEL", DEEPSEEK_MODEL)  # Default to configured DeepSeek model
-DEEPSEEK_THINKING_BUDGET = int(os.environ.get("DEEPSEEK_THINKING_BUDGET", "4096"))  # Default 4K tokens for reasoning
-
-# Special models that support interleaved thinking with tools
-DEEPSEEK_V3_THINKING_MODEL = os.environ.get("DEEPSEEK_V3_THINKING_MODEL", "deepseek-chat")  # For V3.2 with thinking enabled
+DEEPSEEK_REASONING_MODEL = os.environ.get("DEEPSEEK_REASONING_MODEL", DEEPSEEK_MODEL)
+DEEPSEEK_THINKING_BUDGET = int(os.environ.get("DEEPSEEK_THINKING_BUDGET", "4096"))
+DEEPSEEK_REASONING_EFFORT = os.environ.get("DEEPSEEK_REASONING_EFFORT", "high")
 
 
 class DeepSeekThinkingClient:
@@ -538,7 +542,7 @@ class DeepSeekThinkingClient:
     def __init__(
         self,
         api_key: Optional[str] = None,
-        base_url: str = "https://api.siliconflow.cn/v1",
+        base_url: str = DEEPSEEK_BASE_URL,
         reasoning_model: str = None,
         default_thinking_budget: int = DEEPSEEK_THINKING_BUDGET,
     ):
@@ -546,18 +550,18 @@ class DeepSeekThinkingClient:
         Initialize DeepSeek thinking mode client.
 
         Args:
-            api_key: SiliconFlow API key
+            api_key: DeepSeek API key
             base_url: API base URL
-            reasoning_model: Model name for thinking mode (e.g., "Pro/deepseek-ai/DeepSeek-R1")
+            reasoning_model: Model name for thinking mode
             default_thinking_budget: Default token budget for reasoning
         """
-        self.api_key = api_key or SILICONFLOW_API_KEY
+        self.api_key = api_key or DEEPSEEK_API_KEY
         self.base_url = base_url
         self.reasoning_model = reasoning_model or DEEPSEEK_REASONING_MODEL
         self.default_thinking_budget = default_thinking_budget
 
         if not self.api_key:
-            raise ValueError("SILICONFLOW_API_KEY not set")
+            raise ValueError("DEEPSEEK_API_KEY not set")
 
         self._client = OpenAIClient(
             api_key=self.api_key,
@@ -609,10 +613,8 @@ class DeepSeekThinkingClient:
             "messages": messages,
             "max_tokens": max_tokens,
             "stream": stream,
-            # Enable thinking mode via extra_body
-            "extra_body": {
-                "thinking_budget": thinking_budget
-            },
+            "reasoning_effort": DEEPSEEK_REASONING_EFFORT,
+            "extra_body": {"thinking": {"type": "enabled"}},
         }
 
         # Add tools if provided

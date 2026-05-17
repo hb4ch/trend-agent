@@ -142,7 +142,9 @@ def run_test(batch_size: int = 4):
                     {"role": "system", "content": SYSTEM_PROMPT},
                     {"role": "user", "content": user_content},
                 ],
-                temperature=0.1,
+                temperature=1.0,
+                top_p=0.95,
+                extra_body={"top_k": 64},
             )
         except Exception as e:
             print(f"ERROR: {e}")

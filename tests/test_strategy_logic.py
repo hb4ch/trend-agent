@@ -98,6 +98,290 @@ def test_compute_signals_breakout_boundaries(monkeypatch):
     assert signals["D"]["ready_to_break"] is False
 
 
+def test_obv_features_normalize_accumulation_and_detect_divergence():
+    dates = pd.date_range("2026-01-01", periods=60, freq="B")
+    close = [10.0] * 39
+    volume = [1000.0] * 39
+    for i in range(21):
+        close.append(10.1 if i % 2 == 0 else 10.0)
+        volume.append(3000.0 if i % 2 == 0 else 100.0)
+    close[-1] = 10.0
+    df = pd.DataFrame(
+        {
+            "trade_date": dates,
+            "open": close,
+            "high": [x + 0.2 for x in close],
+            "low": [x - 0.2 for x in close],
+            "close": close,
+            "volume": volume,
+            "turnover_rate": [1.5] * 60,
+            "total_mv": [50_0000.0] * 60,
+        }
+    )
+
+    features = screen_growth_stocks.compute_obv_features(df)
+
+    assert features["obv_slope"] > 0
+    assert features["obv_slope_norm"] >= screen_growth_stocks.OBV_DIVERGENCE_MIN_NORM
+    assert features["price_change_20d"] <= screen_growth_stocks.OBV_DIVERGENCE_MAX_PRICE_CHANGE
+    assert features["obv_divergence"] is True
+
+
+def test_momentum_uses_normalized_obv_not_raw_positive_sign():
+    latest = pd.Series({"close": 10.0})
+    weak = screen_growth_stocks.compute_momentum_score(
+        pd.DataFrame(), latest, 9.0, 8.0, 7.0, 6.0, 11.0, 9.0, 1.0,
+        adx=30.0, adx_slope=0.0, obv_slope=1000.0, vwap_ratio=1.0,
+        obv_slope_norm=0.01,
+    )
+    strong = screen_growth_stocks.compute_momentum_score(
+        pd.DataFrame(), latest, 9.0, 8.0, 7.0, 6.0, 11.0, 9.0, 1.0,
+        adx=30.0, adx_slope=0.0, obv_slope=1000.0, vwap_ratio=1.0,
+        obv_slope_norm=0.15,
+    )
+    negative = screen_growth_stocks.compute_momentum_score(
+        pd.DataFrame(), latest, 9.0, 8.0, 7.0, 6.0, 11.0, 9.0, 1.0,
+        adx=30.0, adx_slope=0.0, obv_slope=-1000.0, vwap_ratio=1.0,
+        obv_slope_norm=-0.05,
+    )
+
+    assert strong > weak
+    assert negative < weak
+
+
+def _trend_feature_df(
+    closes,
+    volumes=None,
+    highs=None,
+) -> pd.DataFrame:
+    n = len(closes)
+    dates = pd.date_range("2025-01-01", periods=n, freq="B")
+    volumes = volumes or [1000.0] * n
+    highs = highs or [float(c) + 0.1 for c in closes]
+    return pd.DataFrame(
+        {
+            "trade_date": dates,
+            "open": closes,
+            "high": highs,
+            "low": [float(c) - 0.1 for c in closes],
+            "close": closes,
+            "volume": volumes,
+            "turnover_rate": [1.5] * n,
+            "total_mv": [200000.0] * n,
+            "pe_ttm": [20.0] * n,
+            "pb": [2.0] * n,
+            "ps_ttm": [3.0] * n,
+        }
+    )
+
+
+def test_trend_emergence_uses_prior_60d_high_excluding_today():
+    closes = [10.0] * 60 + [10.6]
+    highs = [10.5] * 60 + [11.0]
+    df = _trend_feature_df(closes, highs=highs)
+
+    features = screen_growth_stocks.compute_trend_emergence_features(df)
+
+    assert features["fresh_breakout"] is True
+    assert features["near_breakout"] is True
+
+    not_breakout = _trend_feature_df([10.0] * 60 + [10.4], highs=highs)
+    features = screen_growth_stocks.compute_trend_emergence_features(not_breakout)
+    assert features["fresh_breakout"] is False
+    assert features["near_breakout"] is True
+
+
+def test_trend_emergence_scores_active_setup_above_flat_stock():
+    flat = _trend_feature_df([10.0] * 80, volumes=[1000.0] * 80)
+    active_closes = [10.0] * 59 + [10.2, 10.3, 10.5, 10.8, 11.0, 11.2, 11.4, 11.5, 11.6, 11.7, 11.9, 12.0, 12.1, 12.2, 12.25, 12.3, 12.4, 12.45, 12.5, 12.55, 12.6]
+    active_volumes = [1000.0] * 60 + [2400.0] * 20
+    active_highs = [12.0] * 80
+    active_highs[-1] = 12.7
+    active = _trend_feature_df(active_closes, volumes=active_volumes, highs=active_highs)
+
+    flat_score = screen_growth_stocks.compute_trend_emergence_features(flat)["trend_emergence_score"]
+    active_score = screen_growth_stocks.compute_trend_emergence_features(active, obv_accumulation_score=80.0)["trend_emergence_score"]
+
+    assert active_score > flat_score
+    assert active_score >= 60.0
+
+
+def test_trend_emergence_overextended_return_does_not_get_max_return_credit():
+    normal = screen_growth_stocks.compute_trend_emergence_score(
+        return_5d=0.02,
+        return_10d=0.08,
+        return_20d=0.20,
+        volume_ratio_5d_vs_60d=1.0,
+        fresh_breakout=False,
+        near_breakout=False,
+        obv_accumulation_score=0.0,
+    )
+    overextended = screen_growth_stocks.compute_trend_emergence_score(
+        return_5d=0.02,
+        return_10d=0.08,
+        return_20d=0.50,
+        volume_ratio_5d_vs_60d=1.0,
+        fresh_breakout=False,
+        near_breakout=False,
+        obv_accumulation_score=0.0,
+    )
+
+    assert overextended < normal
+
+
+def test_analyze_stock_technical_emits_new_obv_columns():
+    dates = pd.date_range("2025-01-01", periods=280, freq="B")
+    close = [10.0 + (i % 30) * 0.01 for i in range(280)]
+    df = pd.DataFrame(
+        {
+            "trade_date": dates,
+            "open": close,
+            "high": [x + 0.2 for x in close],
+            "low": [x - 0.2 for x in close],
+            "close": close,
+            "volume": [1000.0 + (i % 5) * 100 for i in range(280)],
+            "turnover_rate": [1.5] * 280,
+            "total_mv": [200000.0] * 280,
+            "pe_ttm": [20.0] * 280,
+            "pb": [2.0] * 280,
+            "ps_ttm": [3.0] * 280,
+        }
+    )
+
+    analysis = screen_growth_stocks.analyze_stock_technical(df)
+
+    assert analysis is not None
+    assert "obv_slope" in analysis
+    assert "obv_slope_norm" in analysis
+    assert "obv_accumulation_score" in analysis
+    assert "obv_divergence" in analysis
+    assert "price_change_20d" in analysis
+    assert "return_5d" in analysis
+    assert "return_10d" in analysis
+    assert "return_20d" in analysis
+    assert "volume_ratio_5d_vs_60d" in analysis
+    assert "fresh_breakout" in analysis
+    assert "near_breakout" in analysis
+    assert "trend_emergence_score" in analysis
+
+
+def test_screen_all_stocks_outputs_trend_emergence_columns(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    tick_dir = tmp_path / "data" / "stock_ticks"
+    tick_dir.mkdir(parents=True)
+    closes = [10.0 + min(i, 250) * 0.005 for i in range(280)]
+    df = _trend_feature_df(closes, volumes=[1000.0 + (i % 10) * 50.0 for i in range(280)])
+    df.to_parquet(tick_dir / "000001.SZ.parquet")
+
+    monkeypatch.setattr(
+        screen_growth_stocks,
+        "load_stock_basic",
+        lambda: pd.DataFrame(
+            [
+                {
+                    "ts_code": "000001.SZ",
+                    "name": "测试股",
+                    "industry": "软件",
+                    "market": "主板",
+                    "exchange": "SZSE",
+                    "area": "北京",
+                }
+            ]
+        ),
+    )
+    monkeypatch.setattr(screen_growth_stocks, "load_stock_company", lambda: pd.DataFrame())
+    monkeypatch.setattr(
+        screen_growth_stocks,
+        "compute_industry_relative_valuation",
+        lambda df: df.assign(
+            valuation_outlier=False,
+            valuation_quality_score=50.0,
+            valuation_stretch_score=50.0,
+            valuation_label="估值待补充",
+            pe_percentile_industry=0.5,
+            pe_baseline_source="test",
+            pb_percentile_industry=0.5,
+            pb_baseline_source="test",
+            ps_ttm_percentile_industry=0.5,
+            ps_ttm_baseline_source="test",
+            valuation_data_points=1,
+            valuation_has_peer_context=False,
+        ),
+    )
+
+    out = screen_growth_stocks.screen_all_stocks()
+
+    assert out is not None
+    row = out.iloc[0]
+    for col in [
+        "return_5d",
+        "return_10d",
+        "return_20d",
+        "volume_ratio_5d_vs_60d",
+        "fresh_breakout",
+        "near_breakout",
+        "trend_emergence_score",
+        "technical_selection_score",
+    ]:
+        assert col in out.columns
+    assert row["technical_selection_score"] == row["composite_score"] * 0.70 + row["trend_emergence_score"] * 0.30
+
+
+def test_compute_signals_merges_candidate_technical_context(monkeypatch):
+    monkeypatch.setattr(trend_agent, "load_price_data", lambda ts: _price_df(9.8))
+    candidates = pd.DataFrame(
+        [
+            {
+                "ts_code": "A",
+                "name": "A",
+                "ema20": 9.7,
+                "momentum_score": 66.0,
+                "volume_quality_score": 71.0,
+                "obv_slope_norm": 0.12,
+                "obv_accumulation_score": 88.0,
+                "obv_divergence": True,
+                "price_change_20d": 0.01,
+                "return_5d": 0.03,
+                "return_10d": 0.08,
+                "return_20d": 0.18,
+                "volume_ratio_5d_vs_60d": 1.9,
+                "fresh_breakout": False,
+                "near_breakout": True,
+                "trend_emergence_score": 72.0,
+                "technical_selection_score": 64.0,
+            }
+        ]
+    )
+
+    signals = trend_agent.compute_signals(candidates)
+
+    assert signals["A"]["ready_to_break"] is True
+    assert signals["A"]["ema20"] == 9.7
+    assert signals["A"]["momentum_score"] == 66.0
+    assert signals["A"]["volume_quality_score"] == 71.0
+    assert signals["A"]["obv_slope_norm"] == 0.12
+    assert signals["A"]["obv_accumulation_score"] == 88.0
+    assert signals["A"]["obv_divergence"] is True
+    assert signals["A"]["return_5d"] == 0.03
+    assert signals["A"]["return_10d"] == 0.08
+    assert signals["A"]["return_20d"] == 0.18
+    assert signals["A"]["volume_ratio_5d_vs_60d"] == 1.9
+    assert signals["A"]["fresh_breakout"] is False
+    assert signals["A"]["near_breakout"] is True
+    assert signals["A"]["trend_emergence_score"] == 72.0
+    assert signals["A"]["technical_selection_score"] == 64.0
+
+
+def test_run_python_can_access_signal_ema20():
+    result = trend_agent.run_python(
+        "result = {'ema20': signal_row['ema20']}",
+        {"stock_profile": {"ts_code": "000001.SZ"}, "signal_row": {"ema20": 12.34}},
+    )
+
+    assert "result_type: dict" in result
+    assert '"ema20": 12.34' in result
+
+
 def test_invoke_with_timeout_retries_retries_on_timeout(monkeypatch):
     calls = {"n": 0}
     sleeps = []
@@ -2374,6 +2658,54 @@ def test_phase2_theme_pre_audit_cap_expands_to_20_and_keeps_technical(monkeypatc
     tech_rows = out[out["list_type"] == "technical"]
     assert len(theme_rows) == 20
     assert not tech_rows.empty
+
+
+def test_phase2_technical_selection_prefers_trend_emergence_score(monkeypatch):
+    class FakeDTL:
+        def load_recent_toplist(self, days=60):
+            return pd.DataFrame(columns=["ts_code"])
+
+    monkeypatch.setattr(trend_agent, "DragonTigerList", FakeDTL)
+    monkeypatch.setattr(
+        trend_agent,
+        "screen_all_stocks",
+        lambda: pd.DataFrame(
+            [
+                {
+                    "ts_code": "000001.SZ",
+                    "name": "CompositeOnly",
+                    "industry": "软件",
+                    "main_business": "软件",
+                    "business_scope": "软件",
+                    "introduction": "软件",
+                    "consolidation_score": 70,
+                    "volume_boost": 1.3,
+                    "composite_score": 80.0,
+                    "trend_emergence_score": 10.0,
+                    "technical_selection_score": 59.0,
+                },
+                {
+                    "ts_code": "000002.SZ",
+                    "name": "EmergingTrend",
+                    "industry": "软件",
+                    "main_business": "软件",
+                    "business_scope": "软件",
+                    "introduction": "软件",
+                    "consolidation_score": 70,
+                    "volume_boost": 1.3,
+                    "composite_score": 76.0,
+                    "trend_emergence_score": 90.0,
+                    "technical_selection_score": 80.2,
+                },
+            ]
+        ),
+    )
+
+    out = trend_agent.phase2_quant_filter([], config=StrategyConfig())
+    tech_rows = out[out["list_type"] == "technical"]
+
+    assert tech_rows.iloc[0]["ts_code"] == "000002.SZ"
+    assert tech_rows.iloc[0]["alpha_rank_score"] == 80.2
 
 
 def test_rank_candidates_for_alpha_prefers_reasonable_valuation():

@@ -31,6 +31,7 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import plotly.io as pio
+from timing_models import compute_timing_signals
 from plotly.offline import get_plotlyjs
 from plotly.subplots import make_subplots
 from langchain_core.language_models import BaseChatModel
@@ -43,7 +44,7 @@ from screen_growth_stocks import (
     compute_atr,
     compute_adx,
     compute_bollinger_width,
-    compute_obv,
+    compute_obv_features,
     compute_rsi,
     compute_ema,
     classify_valuation_label,
@@ -108,7 +109,7 @@ class StrategyConfig:
     hard_fail_max_age_days: int = REGULATORY_MAX_AGE_DAYS
     hard_fail_reduce_materiality_threshold: float = 0.03
     theme_match_policy: str = "conservative"  # conservative|balanced|aggressive
-    theme_pre_audit_cap: int = 20
+    theme_pre_audit_cap: int = 30
     theme_post_audit_cap: int = 5
     max_names_per_theme: int = 4
     max_names_per_industry: int = 4
@@ -148,7 +149,7 @@ class StrategyConfig:
             hard_fail_max_age_days=int(os.environ.get("HARD_FAIL_MAX_AGE_DAYS", str(REGULATORY_MAX_AGE_DAYS))),
             hard_fail_reduce_materiality_threshold=float(os.environ.get("HARD_FAIL_REDUCE_MATERIALITY_THRESHOLD", "0.03")),
             theme_match_policy=theme_match_policy,
-            theme_pre_audit_cap=max(1, int(os.environ.get("THEME_PRE_AUDIT_CAP", "20"))),
+            theme_pre_audit_cap=max(1, int(os.environ.get("THEME_PRE_AUDIT_CAP", "30"))),
             theme_post_audit_cap=max(1, int(os.environ.get("THEME_POST_AUDIT_CAP", "5"))),
             max_names_per_theme=int(os.environ.get("MAX_NAMES_PER_THEME", "4")),
             max_names_per_industry=int(os.environ.get("MAX_NAMES_PER_INDUSTRY", "4")),
@@ -317,8 +318,16 @@ class ReportArtifacts:
     trace_path: Path
 
 
-def run_search(query: str) -> str:
-    """Execute web search using Zhipu AI."""
+def run_search(query: str, engine: str = "") -> str:
+    """Execute web search using Zhipu AI.
+
+    Args:
+        query: Search query string
+        engine: Override search engine (e.g. "search_std"). Empty = use ZHIPU_SEARCH_ENGINE default.
+    """
+    if engine:
+        from deep_researcher import ZhipuSearchTool
+        return ZhipuSearchTool().search(query, engine=engine)
     if hasattr(zhipu_search, "invoke"):
         return zhipu_search.invoke(query)
     if callable(zhipu_search):
@@ -1054,7 +1063,7 @@ def gemma_match_themes(
         max_attempts = config.gemma_rate_limit_max_retries + 1
         for attempt in range(1, max_attempts + 1):
             try:
-                content = invoke_llm_messages("gemma", messages, temperature=0.1)
+                content = invoke_llm_messages("light", messages, temperature=1.0)
                 break
             except Exception as err:
                 if not is_rate_limit_error(err):
@@ -1967,7 +1976,7 @@ def init_llm():
     Returns:
         LangChain BaseChatModel configured for DeepSeek
     """
-    return get_llm_provider().get_llm("deepseek", temperature=0.2)
+    return get_llm_provider().get_llm("heavy", temperature=0.2)
 
 
 def deepseek_merge_themes(
@@ -2070,7 +2079,7 @@ def deepseek_merge_themes(
             ]
         )
 
-        chain = prompt | llm_provider.get_llm("deepseek", temperature=0.2) | StrOutputParser()
+        chain = prompt | llm_provider.get_llm("heavy", temperature=0.2) | StrOutputParser()
         result = chain.invoke({
             "web_summary": "\n".join(web_summary),
             "capital_summary": "\n".join(capital_summary) if capital_summary else "暂无龙虎榜数据",
@@ -2178,7 +2187,7 @@ def phase1_market_intel(llm: BaseChatModel) -> List[ThemeItem]:
 
     # Use DeepSeek for theme extraction (to avoid Zhipu rate limits)
     llm_provider = get_llm_provider()
-    deepseek_llm = llm_provider.get_llm("deepseek", temperature=0.2)
+    deepseek_llm = llm_provider.get_llm("heavy", temperature=0.2)
 
     prompt = ChatPromptTemplate.from_messages(
         [
@@ -2502,11 +2511,13 @@ def phase2_quant_filter(themes: List[ThemeItem], config: Optional[StrategyConfig
                 valuation_quality = theme_matched.get("valuation_quality_score", pd.Series(50.0, index=theme_matched.index))
                 valuation_stretch = theme_matched.get("valuation_stretch_score", pd.Series(50.0, index=theme_matched.index))
                 valuation_penalty = valuation_stretch / 100.0
+                trend_emergence = theme_matched.get("trend_emergence_score", pd.Series(0.0, index=theme_matched.index))
                 theme_matched["alpha_rank_score"] = (
                     theme_matched[momentum_col] * 0.30
                     + theme_matched["theme_strength_score"] * 20.0
                     + theme_matched[volume_col] * 0.15
                     + theme_matched["composite_score"] * 0.10
+                    + trend_emergence * 0.10
                     + valuation_quality * 0.20
                     - toplist_penalty * (config.toplist_penalty_weight * 10.0)
                     - valuation_penalty * 8.0
@@ -2526,14 +2537,15 @@ def phase2_quant_filter(themes: List[ThemeItem], config: Optional[StrategyConfig
     # ============ Step B: Build Technical Alpha List (kept complementary pre-audit) ============
     tech_budget = TOTAL_CAP
     logger.info(f"Step B: Building technical alpha list (pre-audit budget={tech_budget})...")
+    technical_order_col = "technical_selection_score" if "technical_selection_score" in screen_df.columns else "composite_score"
 
     con_b = duckdb.connect()
     con_b.register("screen", screen_df)
-    tech_pool = con_b.execute("""
+    tech_pool = con_b.execute(f"""
         SELECT *
         FROM screen
         WHERE consolidation_score >= 50
-        ORDER BY composite_score DESC
+        ORDER BY {technical_order_col} DESC
     """).df()
     con_b.close()
     logger.info(f"Technical pool: {len(tech_pool)} candidates after consolidation filter")
@@ -2556,7 +2568,10 @@ def phase2_quant_filter(themes: List[ThemeItem], config: Optional[StrategyConfig
                 tech_pool = heuristic_match_themes(heuristic_themes, tech_pool)
             tech_pool = normalize_match_columns(tech_pool)
         tech_pool["theme_strength_score"] = 0.0
-        tech_pool["alpha_rank_score"] = tech_pool["composite_score"]
+        if "technical_selection_score" in tech_pool.columns:
+            tech_pool["alpha_rank_score"] = tech_pool["technical_selection_score"]
+        else:
+            tech_pool["alpha_rank_score"] = tech_pool["composite_score"]
 
         tech_list = tech_pool.head(tech_budget).copy()
         tech_list["list_type"] = "technical"
@@ -3225,9 +3240,7 @@ def rank_candidates_for_alpha(
         ts_code = str(row["ts_code"])
         sig = signals.get(ts_code, {})
         af = audit_features(ts_code)
-        breakout_window_ok = 1.0 if sig.get("breakout_window_ok") else 0.0
-        already_breakout = 1.0 if sig.get("already_breakout") else 0.0
-        extended_breakout = 1.0 if sig.get("extended_breakout") else 0.0
+        timing_score = float(sig.get("timing_score", 0.0))
         turnover_mult = float(sig.get("turnover_mult", row.get("volume_boost", 1.0)) or 1.0)
         volume_quality = clamp01(1.0 - abs(turnover_mult - 1.8) / 1.8)
         ma_spread = float(row.get("ma_spread", 0.3) or 0.3)
@@ -3242,11 +3255,26 @@ def rank_candidates_for_alpha(
         audit_safe = 1.0 - clamp01(af["audit_risk_score"])
         toplist_recency = clamp01(float(row.get("toplist_recency_score", 0.0) or 0.0))
         blowoff_penalty = clamp01(max(0.0, turnover_mult - 3.0) / 2.0)
-        breakout_penalty = 0.20 if extended_breakout > 0 else (0.08 if already_breakout > 0 else 0.0)
         overcrowding_penalty = clamp01(0.65 * toplist_recency + 0.35 * blowoff_penalty)
 
+        # IC-validated sub-scores: mean reversion dominates, consolidation wins
+        atr_pct_sig = float(sig.get("atr_pct", 0.05))
+        low_vol_score = clamp01(1.0 - atr_pct_sig / 0.08)
+        price_pos_sig = float(sig.get("price_position_60d", 0.5))
+        mid_range_score = clamp01(1.0 - abs(price_pos_sig - 0.3) / 0.5)
+        lps_pullback_sig = float(sig.get("lps_pullback", 0.0))
+        lps_norm = clamp01(lps_pullback_sig / 5.0)
+        consolidation_alpha = 0.40 * low_vol_score + 0.35 * mid_range_score + 0.25 * lps_norm
+
+        range_60d_sig = float(sig.get("range_pct_60d", 0.30))
+        volatility_penalty = clamp01(atr_pct_sig / 0.06 + range_60d_sig / 0.50) / 2.0
+
+        bos_recent = bool(sig.get("timing_bos", False)) or bool(sig.get("bos_20d", False))
+        in_pullback_zone = 0.5 <= lps_pullback_sig <= 4.0
+        pullback_reward = clamp01(lps_pullback_sig / 3.0) if (bos_recent and in_pullback_zone) else 0.0
+
         score_01 = (
-            0.22 * breakout_window_ok +
+            0.10 * consolidation_alpha +
             0.17 * volume_quality +
             0.16 * ma_comp +
             0.15 * theme_strength +
@@ -3258,7 +3286,8 @@ def rank_candidates_for_alpha(
             0.07 * audit_safe
             - 0.12 * overcrowding_penalty
             - (0.10 if config.valuation_allow_premium else 0.18) * valuation_stretch
-            - breakout_penalty
+            - 0.08 * volatility_penalty
+            + 0.05 * pullback_reward
         )
         score_01 = clamp01(score_01)
         alpha_rows.append(
@@ -4300,6 +4329,18 @@ def compute_signals(candidates: pd.DataFrame) -> Dict[str, Dict[str, object]]:
         ma20 = df["close"].rolling(20).mean()
         ma60 = df["close"].rolling(60).mean()
         ma120 = df["close"].rolling(120).mean()
+        ma250 = df["close"].rolling(250).mean()
+        ema20_series = compute_ema(df["close"], 20)
+        ema20 = float(ema20_series.iloc[-1]) if len(ema20_series) else close
+        ma60_value = float(ma60.iloc[-1]) if ma60.notna().any() else None
+        ma120_value = float(ma120.iloc[-1]) if ma120.notna().any() else None
+        ma250_value = float(ma250.iloc[-1]) if ma250.notna().any() else None
+        ma_trend = "neutral"
+        if ma60_value is not None and ma120_value is not None and ma250_value is not None:
+            if ma60_value > ma120_value > ma250_value:
+                ma_trend = "bullish"
+            elif ma60_value < ma120_value < ma250_value:
+                ma_trend = "bearish"
         ma_recent = pd.concat([ma20, ma60, ma120], axis=1).tail(20).dropna()
         if ma_recent.empty:
             ma_spread_mean = None
@@ -4343,17 +4384,49 @@ def compute_signals(candidates: pd.DataFrame) -> Dict[str, Dict[str, object]]:
         adx_5d_ago = float(adx_series.iloc[-5]) if len(adx_series) >= 5 and adx_series.iloc[-5] == adx_series.iloc[-5] else adx_value
         adx_inflecting = adx_value < 25 and (adx_value - adx_5d_ago) > 0
 
-        obv_series = compute_obv(df)
-        obv_recent = obv_series.tail(20)
-        obv_accumulating = False
-        if len(obv_recent) >= 2:
-            obv_slope = float(np.polyfit(range(len(obv_recent)), obv_recent.values, 1)[0])
-            obv_accumulating = obv_slope > 0
+        obv_features = compute_obv_features(df, window=20)
+        obv_slope = float(obv_features["obv_slope"])
+        obv_slope_norm = float(obv_features["obv_slope_norm"])
+        obv_divergence = bool(obv_features["obv_divergence"])
+        price_change_20d = float(obv_features["price_change_20d"])
+        obv_accumulating = obv_slope_norm > 0
 
         rsi_series = compute_rsi(df)
         rsi_val = float(rsi_series.iloc[-1]) if rsi_series.notna().any() else 50.0
 
-        signals[ts_code] = {
+        timing = compute_timing_signals(df)
+
+        # ── New IC-validated signals ──
+        close_price = float(df["close"].iloc[-1])
+        high_60d = float(df["high"].tail(60).max())
+        low_60d = float(df["low"].tail(60).min())
+        ma20_series = df["close"].rolling(20).mean()
+        ma20_now = float(ma20_series.iloc[-1])
+        ma20_5d_ago = float(ma20_series.iloc[-6]) if len(ma20_series) >= 6 else ma20_now
+        atr_val_now = float(atr_series.iloc[-1]) if atr_now is not None else (high_60d - low_60d) * 0.02
+
+        # atr_pct: volatility as % of price (strongest negative IC)
+        atr_pct = atr_val_now / (close_price + EPSILON) if atr_val_now > 0 else 0.0
+
+        # range_pct_60d: 60-day range relative to price
+        range_pct_60d = (high_60d - low_60d) / (close_price + EPSILON) if close_price > 0 else 0.0
+
+        # price_position_60d: where close sits in the 60-day range
+        price_position_60d = (close_price - low_60d) / (high_60d - low_60d + EPSILON) if high_60d > low_60d else 0.5
+
+        # bos_20d: was a BOS triggered in the past 20 trading days
+        bos_20d = False
+        if len(df) >= 30:
+            for i in range(max(0, len(df) - 21), len(df)):
+                if float(df["close"].iloc[i]) > float(df["high"].iloc[:i].max()):
+                    bos_20d = True
+                    break
+
+        # lps_pullback: pullback depth in ATR units (only valid in uptrend)
+        lps_pullback = (ma20_now - close_price) / (atr_val_now + EPSILON) if (ma20_now > ma20_5d_ago and atr_val_now > 0) else 0.0
+
+        signal = {
+            "ts_code": ts_code,
             "name": name,
             "box_top": box_top,
             "box_top_prev": box_top_prev,
@@ -4365,6 +4438,11 @@ def compute_signals(candidates: pd.DataFrame) -> Dict[str, Dict[str, object]]:
             "turnover_mult": turn_mult,
             "ma_spread_mean_20": ma_spread_mean,
             "ma_spread_std_20": ma_spread_std,
+            "ema20": ema20,
+            "ma60": ma60_value,
+            "ma120": ma120_value,
+            "ma250": ma250_value,
+            "ma_trend": ma_trend,
             "ignition": ignition,
             "breakout_window_ok": breakout_window_ok,
             "already_breakout": already_breakout,
@@ -4372,11 +4450,47 @@ def compute_signals(candidates: pd.DataFrame) -> Dict[str, Dict[str, object]]:
             "ready_to_break": ready,
             "atr_squeeze": atr_squeeze,
             "bbw_squeeze": bbw_squeeze,
+            "bbw_percentile": bbw_pct if len(bbw_120) > 1 and bbw_now is not None else None,
+            "adx": adx_value,
             "adx_value": adx_value,
+            "adx_slope": adx_value - adx_5d_ago,
             "adx_inflecting": adx_inflecting,
+            "obv_slope": obv_slope,
+            "obv_slope_norm": obv_slope_norm,
+            "obv_divergence": obv_divergence,
             "obv_accumulating": obv_accumulating,
+            "price_change_20d": price_change_20d,
             "rsi": rsi_val,
+            "timing_bos": timing["timing_bos"],
+            "timing_true_bos": timing["timing_true_bos"],
+            "timing_joc": timing["timing_joc"],
+            "timing_poc": timing["timing_poc"],
+            "timing_poc_retest": timing["timing_poc_retest"],
+            "timing_gap_hold": timing["timing_gap_hold"],
+            "timing_lps": timing["timing_lps"],
+            "timing_score": timing["timing_score"],
+            "atr_pct": atr_pct,
+            "range_pct_60d": range_pct_60d,
+            "price_position_60d": price_position_60d,
+            "bos_20d": bos_20d,
+            "lps_pullback": lps_pullback,
         }
+        passthrough_cols = [
+            "ema20", "ma60", "ma120", "ma250", "ma_trend", "momentum_score",
+            "volume_quality_score", "obv_slope", "obv_slope_norm",
+            "obv_accumulation_score", "obv_divergence", "adx", "adx_slope",
+            "bbw_percentile", "vwap_ratio", "price_change_20d",
+            "return_5d", "return_10d", "return_20d", "volume_ratio_5d_vs_60d",
+            "fresh_breakout", "near_breakout", "trend_emergence_score",
+            "technical_selection_score",
+        ]
+        for col in passthrough_cols:
+            if col in row and pd.notna(row[col]):
+                value = row[col]
+                if isinstance(value, np.generic):
+                    value = value.item()
+                signal[col] = value
+        signals[ts_code] = signal
     return signals
 
 
@@ -5182,10 +5296,22 @@ def _fallback_stock_section(
     else:
         recommendation, label = ("watch", "观察")
     spike_note = "、".join(chart.spike_dates[:6]) if chart and chart.spike_dates else "未检测到明显量能异动"
+    timing_names = {
+        "timing_bos": "突破结构 (BOS)", "timing_true_bos": "真突破确认 (True BOS)",
+        "timing_joc": "强势突破 (JOC)", "timing_poc": "筹码轴心 (POC)",
+        "timing_poc_retest": "POC回踩确认", "timing_gap_hold": "缺口不回补",
+        "timing_lps": "最后支撑 (LPS)",
+    }
+    triggered_timing = [
+        name for key, name in timing_names.items()
+        if (signal or {}).get(key)
+    ]
+    timing_line = f"结构信号 ({len(triggered_timing)}/7)：{', '.join(triggered_timing)} — 用于确认趋势结构，非收益预测因子" if triggered_timing else "结构信号：暂无触发 — 无确认的趋势结构，入场风险较高"
     technical_analysis = [
         f"量能异动日：{spike_note}",
         f"温和放量倍数：{_coerce_float((signal or {}).get('turnover_mult'), 0.0):.2f}",
         f"距箱体上沿：{_coerce_float((signal or {}).get('dist_to_box_top'), 0.0) * 100:.1f}%",
+        timing_line,
     ]
     capital_validation = _coerce_lines([a.capital_signal_summary for a in stock_audits if a.capital_signal_summary])
     if not capital_validation:

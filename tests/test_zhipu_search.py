@@ -32,7 +32,7 @@ class TestZhipuRawSearch(unittest.TestCase):
         os.environ.setdefault("ZHIPUAI_API_KEY", "test-key")
         os.environ["DEBUG_ZHIPU_SEARCH"] = "0"
         os.environ["DEBUG_DEEPSEEK"] = "0"
-        os.environ["DEBUG_SILICONFLOW"] = "0"
+        os.environ["DEBUG_OPENAI_COMPAT"] = "0"
 
     def test_returns_structured_results_and_parses_site_filter(self):
         from deep_researcher import ZhipuSearchTool

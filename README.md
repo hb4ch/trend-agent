@@ -1,40 +1,99 @@
-# Trend Agent - A股趋势跟踪与投资研究系统
+# Trend Agent — A股盘整突破与均值回归投资研究系统
 
-一个遵循 **"重势、通过滤、待时机"** 理念的自动化投资研究流水线，通过五阶段处理将市场情报转化为可操作的研报。
-
----
-
-## 理念概述
-
-| 原则 | 含义 | 实现方式 |
-|------|------|----------|
-| **重势** | 跟踪市场主线，顺应资金趋势 | Web搜索提取热点 + 龙虎榜资金验证 |
-| **通过滤** | 严格的量化筛选和审计排雷 | 技术指标过滤 + 多轮审计式尽调 |
-| **待时机** | 等待确定性信号出现 | 横盘整理 + 温和放量 + 箱体上沿 |
+一个基于 **实证IC分析** 校准的自动化投资研究流水线。通过对5,439只A股、5年数据的横截面IC分析，我们发现A股市场由**均值回归主导**，并据此将策略从"趋势跟踪"重新校准为"盘整低吸"。
 
 ---
 
-## 五阶段流水线
+## 核心发现：均值回归主导A股
+
+对1,118个交易日、570万行日线数据的横截面IC分析（经严格前视偏差审计）揭示：
+
+<p align="center">
+  <img src="assets/fig1_lookahead_bias.png" alt="Look-Ahead Bias Smoking Gun" width="85%">
+</p>
+
+**所有趋势跟踪信号 IC 均为负值。** 更高的波动率、更强的近期动量、更宽的股价区间——这些传统"强势"信号——反而预测未来收益下行。
+
+<p align="center">
+  <img src="assets/fig2_feature_ic_20d.png" alt="Feature Rank IC at 20d Horizon" width="85%">
+</p>
+
+**仅有逆向/回踩信号呈现正IC：**
+
+| 类别 | 信号 | Rank IC (20d) | T-Stat | 经济含义 |
+|------|------|:---:|:---:|------|
+| 🔴 波动率 | atr_pct | **-0.097** | 15.6 | 高波动 → 未来跑输，应回避 |
+| 🔴 动量 | ma20_slope_5d | **-0.077** | 17.6 | 近期上涨 → 即将均值回归 |
+| 🔴 区间 | range_pct_20d | **-0.076** | 13.3 | 宽幅震荡 → 消耗性波动 |
+| 🔴 结构突破 | BOS | **-0.056** | 23.8 | 突破 = 耗尽，非启动 |
+| 🔴 强势突破 | JOC | **-0.058** | 35.8 | 放量突破 = 高潮，非加速 |
+| 🟢 回踩低吸 | lps_pullback | **+0.055** | 14.1 | MA20下方回调 → 良好买点 |
+| 🟢 缺口回补 | gap_pct | **+0.027** | 12.7 | 缺口幅度 → 回补后反弹 |
+
+<p align="center">
+  <img src="assets/fig3_ic_decay.png" alt="IC Decay by Horizon" width="85%">
+</p>
+
+**均值回归在更长时间尺度上增强。** 负IC信号在20日时间尺度上比1日更强，说明这不是短期噪音，而是系统性的市场特性。
+
+### 为什么是均值回归？（经济逻辑）
+
+1. **散户追涨被收割**：A股约80%的交易量来自散户，追涨买入后在高位被机构反向交易
+2. **动量 = 拥挤**：当一只股票"看起来很强"时，它已经被充分定价，边际买家消失
+3. **突破 = 高潮，非启动**：放量突破箱体上沿是行情的终点，不是起点——先手资金利用突破流动性出货
+4. **盘整 = 吸筹**：低波动、窄区间、低价格位置 → 聪明的资金在无人关注时悄悄建仓
+
+---
+
+## 策略哲学：从"重势"到"重质"
+
+| 原始原则 | 实证发现 | 修正后原则 |
+|----------|----------|-----------|
+| **重势** — 趋势是朋友 | 趋势信号IC全部为负 | **重质** — 盘整质量是朋友 |
+| **通过滤** — 严格筛选排雷 | 盘整过滤信号IC验证有效 | **通过滤** — 强化，收紧波动/区间阈值 |
+| **待时机** — 等待突破确认 | 突破 = 耗尽，非启动信号 | **待回踩** — 在回调中买入，不在突破中买入 |
+
+### 择时模型：从Alpha因子降级为防御性入场过滤器
+
+7个威科夫/道氏择时模型（BOS、JOC、True BOS、Gap Hold、LPS、POC、POC Retest）在清理前视偏差后**全部呈现负IC**。它们不再作为Alpha评分权重出现，而是：
+
+- **确认趋势结构**：没有任何择时模型触发 = 无趋势结构 = 入场风险更高
+- **辅助报告叙述**：展示触发了哪些技术形态，但不用于排序
+- **防御性过滤**：有LPS回踩信号 → 结构性买点；仅有BOS突破 → 警惕消耗性突破
+
+---
+
+## 架构概览
 
 ```mermaid
 flowchart TD
-    P1["Phase 1: Market Intelligence<br/>输出: 市场主线白名单<br/>- Web Search 热点/催化<br/>- Dragon Tiger List 资金流向<br/>- 多源融合验证主线"]
-    P2["Phase 2: Quantitative Mining<br/>输出: 技术面候选股票池<br/>- 市值过滤 20-300亿<br/>- 120日横盘振幅 < 35%<br/>- MA20/60/120 粘合度 < 15%<br/>- 量能 1.2-3.0x<br/>- Gemma语义题材匹配"]
-    P3["Phase 3: Deep Research (Audit)<br/>输出: 尽调结论 + 排雷<br/>- 多轮检索验证题材真实性<br/>- 一票否决: 立案/诉讼/减持/退市风险/伪概念<br/>- 监管事件近2年时效<br/>- 信源优先级: cninfo > 交易所 > 其他"]
-    P4["Phase 4: Visualization<br/>输出: K线图表 + 技术信号<br/>- mplfinance K线<br/>- MA20/60/120叠加<br/>- 量能异动点标注<br/>- 箱体位置与突破距离"]
-    P5["Phase 5: Report Generation<br/>输出: 自包含HTML研报 + 调试Markdown<br/>- DeepSeek V3.2 结构化JSON section<br/>- 工具调用: web_search / duckdb / python<br/>- 交互式筛选/折叠/导航<br/>- 内嵌 Plotly 图表，无需 PDF/LaTeX"]
+    P1["Phase 1: Market Intelligence<br/>市场主线白名单<br/>Web Search + 龙虎榜资金验证"]
+    P2["Phase 2: Quantitative Mining<br/>技术面候选股票池<br/>盘整40% + 动量15% + 量能18% + 挤压15% + 估值12%"]
+    P3["Phase 3: Deep Audit<br/>尽调 + 排雷<br/>机会发现 → 对抗性否决<br/>一票否决: 立案/减持/退市/伪概念"]
+    P4["Phase 4: Visualization<br/>K线图表 + 技术信号<br/>Plotly交互图表 + 量能异动标注"]
+    P5["Phase 5: Report Generation<br/>自包含HTML研报<br/>DeepSeek工具调用 + IC校准评分"]
 
     P1 --> P2 --> P3 --> P4 --> P5
+
+    subgraph "IC-Calibrated Alpha Score"
+        CA["0.10 × 盘整Alpha<br/>低波动 + 区间中低位 + 回踩"]
+        VQ["0.17 × 量能质量"]
+        MC["0.16 × 均线粘合"]
+        TS["0.15 × 题材强度"]
+        VA["0.10 × 估值"]
+        VP["-0.08 × 波动惩罚<br/>高ATR + 宽区间"]
+        PR["+0.05 × 回踩奖励<br/>BOS确认 + 回踩MA20"]
+    end
 ```
 
 ---
 
-## Phase 1: Market Intelligence (市场情报)
+## Phase 1: Market Intelligence（市场情报）
 
 ### 目标
 提取当前市场的3-5个核心主线题材，并验证其有效性。
 
-### 1a) Web Search - 新闻热点提取
+### 1a) Web Search — 新闻热点提取
 
 **数据来源**: Zhipu AI Web Search
 
@@ -47,215 +106,89 @@ queries = [
 ]
 ```
 
-**LLM处理**: DeepSeek V3.2 分析搜索结果，提取:
-- 主题名称 (name)
-- 关键词列表 (keywords)
-- 摘要说明 (summary)
-- 来源URL (sources)
+**LLM处理**: heavy tier（官方 DeepSeek `deepseek-v4-pro`）分析搜索结果，提取主题名称、关键词、摘要、来源URL。
 
-**输出格式**:
-```json
-{
-  "themes": [
-    {
-      "name": "AI应用",
-      "keywords": ["AI营销", "端侧AI", "物理AI"],
-      "summary": "大模型商业化加速，端侧部署成趋势...",
-      "sources": ["url1", "url2"]
-    }
-  ],
-  "market_summary": "当前市场围绕AI应用、低空经济..."
-}
-```
-
-### 1b) Dragon Tiger List - 资金流向分析
+### 1b) Dragon Tiger List — 资金流向分析
 
 **数据来源**: 本地 `data/top_list/YYYYMMDD.parquet`
 
-**分析维度**:
-- 上榜次数: 该主题股票在龙虎榜出现频率
-- 累计净买入: 资金净流入/流出情况
-- 热门股票: 该主题下最活跃的股票
-- 资金结构: 北向资金、机构、游资占比
-- 趋势判断: 资金流入/流出趋势
+分析维度：上榜次数、累计净买入、热门股票、资金结构（北向/机构/游资占比）、资金趋势。
 
-**行业聚合逻辑**:
-```python
-# 按行业聚合30日龙虎榜数据
-for each day in last 30 days:
-    load top_list/YYYYMMDD.parquet
-    group by stock's industry
-    sum: net_amount, l_buy, l_sell
-    count: appearances
-```
+### 1c) Multi-Source Fusion — 多源融合
 
-### 1c) Multi-Source Fusion - 多源融合
-
-**核心思想**: Web搜索提供"情绪和催化"，龙虎榜提供"真实资金行为"
-
-**融合原则**:
 | validation_status | Web验证 | 资金验证 | 策略 |
-|-------------------|---------|----------|------|
+|-------------------|:---:|:---:|------|
 | `confirmed` | ✅ | ✅ | 重点布局，双轮驱动 |
 | `web_only` | ✅ | ❌ | 观察中，等待资金入场 |
 | `capital_only` | ❌ | ✅ | 潜在机会，深入挖掘逻辑 |
 | `weak` | ❌ | ❌ | 不关注 |
 
-**DeepSeek融合提示词结构**:
-```
-输入:
-  - Web Search结果 (主题、关键词、摘要)
-  - Dragon Tiger List结果 (上榜次数、净买入、资金结构)
-
-输出:
-  - validation_status: 4选1
-  - summary: 综合Web+资金双方面证据
-  - capital_signal: 资金行为总结
-```
-
 ---
 
-## Phase 2: Quantitative Mining (量化筛选)
-
-### 目标
-从5000+ A股中筛选出30-50只符合技术形态的候选股票。
+## Phase 2: Quantitative Mining（量化筛选）
 
 ### 筛选参数
 
 | 参数 | 值 | 说明 |
 |------|-----|------|
-| 市值范围 | 20-300亿 | 避免大盘股和小微盘 |
-| 最少交易日 | 120天 | 确保有足够历史数据 |
+| 市值范围 | 10-500亿 | 避免大盘股和小微盘 |
+| 最少交易日 | 180天 | 确保有足够历史数据 |
 | 横盘观察期 | 120天 | 计算箱体振幅的时间窗口 |
-| 最大振幅 | 35% | 横盘整理的波动上限 |
-| 最小换手率 | 1.0% | 确保流动性 |
-| 放量倍数 | 1.2-3.0x | 近期相对温和放量 |
+| 最大振幅 | 50% | 横盘整理的波动上限（放宽） |
 
-### 技术指标详解
+### 复合评分权重（IC校准后）
 
-#### 1) 横盘得分 (Consolidation Score: 0-100)
+| 成分 | 权重 | 验证来源 |
+|------|:---:|------|
+| **盘整质量** | **40%** | ✓ 低波动+窄区间 IC显著为正 |
+| 动量信号 | 15% | ⚠ 从25%下调，动量IC为负 |
+| 量能质量 | 18% | 温和放量 > 激进放量 |
+| 挤压准备 | 15% | 低波动挤压 → 变盘 |
+| 估值质量 | 12% | 低估值 → 正向 |
 
-```
-得分 = 波动分 + MA粘合分 + MA稳定分 + 位置分 + 量能分
+### 动量评分修正
 
-- 波动分 (40分): max(0, 1 - 振幅/0.35) × 40
-- MA粘合分 (25分): max(0, 1 - MA价差/0.15) × 25
-- MA稳定分 (5分): max(0, 1 - MA标准差/0.03) × 5
-- 位置分 (20分): max(0, 1 - |位置-0.5|/0.2) × 20
-- 量能分 (10分): max(0, (放量倍数-1)/0.5) × 10
-```
-
-#### 2) 均线系统 (MA Alignment)
-
-- **MA20/60/120**: 计算均线价差
-- **均线粘合度**: (max(MA) - min(MA)) / min(MA)
-- **稳定性**: 近20天均线价差的标准差
-
-#### 3) 量能分析 (Volume)
-
-- **基准换手率**: 120日平均换手率
-- **近期换手率**: 近10日平均换手率
-- **放量倍数**: 近期 / 基准 (1.2-3.0x为理想区间)
-
-#### 4) 价格位置 (Price Position)
+**箱体位置**：从奖励"接近箱体上沿"(0.6-0.95) 改为奖励**"箱体中下位"(0.25-0.65)**
 
 ```
-位置 = (当前价 - 箱体底) / (箱体顶 - 箱体底)
-- 0.4-0.6: 理想位置 (箱体中部)
-- <0.3: 偏离底部
-- >0.7: 接近箱体顶部
+修正前: range_score(position, 0.6, 0.95, 15.0)  ← 奖励即将突破
+修正后: range_score(position, 0.25, 0.65, 15.0) ← 奖励回踩低吸位
 ```
+
+这是动量评分中影响最大的单次修改——不再奖励那些即将均值回归的股票。
 
 ### DuckDB SQL 筛选
 
 ```sql
 SELECT *
 FROM screen
-WHERE consolidation_score >= 70      -- 横盘得分高
-  AND ma_spread <= 0.15              -- 均线粘合
-  AND ma_spread_std <= 0.03          -- 均线稳定
-  AND volume_boost >= 1.2            -- 有放量
-  AND volume_boost <= 3.0            -- 但不是巨量
+WHERE consolidation_score >= 70
+  AND ma_spread <= 0.15
+  AND ma_spread_std <= 0.03
+  AND volume_boost >= 1.2
+  AND volume_boost <= 3.0
 ORDER BY composite_score DESC
 ```
 
 ### Gemma 语义题材匹配
 
-**目的**: 将筛选出的股票与Phase 1的主题进行语义匹配
-
-**输入**:
-- 市场主题白名单 (名称、关键词、摘要)
-- 股票信息 (名称、行业、主营业务、经营范围、公司简介)
-
-**LLM任务**:
-```
-给定题材白名单和股票业务简介，判断该股票是否属于白名单题材。
-只允许从白名单里选择0-2个题材；不确定就返回空数组。
-
-输出JSON:
-{
-  "matches": {
-    "ts_code": ["theme1", "theme2"]
-  },
-  "notes": {
-    "ts_code": "判断理由"
-  }
-}
-```
-
-**执行优化**:
-- 每次基于当前主题集重新执行匹配，避免旧主题结果污染当前筛选
-- 批处理: 每批8只股票（可通过运行时配置调整）
-- 通过请求间隔与重试控制应对本地/远端模型限流
+将筛选出的股票与Phase 1的主题进行语义匹配。批处理（每批8只），通过请求间隔与重试机制应对模型限流。
 
 ---
 
-## Phase 3: Deep Research (审计级尽调)
+## Phase 3: Deep Audit（审计级尽调）
 
-### 目标
-对候选股票进行多轮检索式尽调，排除"雷股"并验证题材真实性。
+### 两阶段策略
 
-### 尽调流程
+1. **机会发现阶段（优先）**：寻找正面催化剂
+   - 使用宽泛搜索（无 site: 限制）
+   - 提取：合同、客户、政策支持、技术突破、扩张
+   - 输出：`PositiveFinding` 和 `GrowthCatalyst` 对象
 
-```
-初始化
-  ↓
-Pass 1: 预设查询 (验证题材实锤 + 监管检查)
-  ↓
-Pass 2-3: DeepSeek规划查询 (基于已有证据动态规划)
-  ↓
-LLM判读 (pass/warn/fail)
-  ↓
-输出审计结果
-```
-
-### 检索策略
-
-#### Pass 1: 预设查询
-
-```python
-queries = [
-    f"{name} {theme} 实锤 订单 客户 概念",
-    f"site:cninfo.com.cn {symbol} {name} 重大合同",
-    f"site:cninfo.com.cn {symbol} {name} 监管函 问询函 处罚",
-]
-```
-
-#### Pass 2-3: DeepSeek动态规划
-
-**输入**: 已收集的证据摘要 (最近4条，最多2000字符)
-
-**输出**:
-```json
-{
-  "stop": false,           -- 是否停止检索
-  "reason": "已找到确凿订单证据",  -- 停止原因
-  "queries": [             -- 下一轮查询
-    "site:cninfo.com.cn ...",
-    "..."
-  ]
-}
-```
+2. **对抗性否决阶段（其次）**：尽职调查
+   - 使用官方信源（site:cninfo.com.cn）
+   - 检查硬性否决项
+   - 输出：verdict (pass/warn/fail)
 
 ### 一票否决 (Hard Veto)
 
@@ -267,61 +200,17 @@ queries = [
 | 退市风险 | `终止上市` 或 `退市风险警示` | 退市风险警示 |
 | 伪概念 | 多轮检索无订单/客户/中标等硬证据 | 概念炒作无实质 |
 
-### 监管事件时效性
-
-| 严重程度 | 关键词 | 有效期 | 判定 |
-|----------|--------|--------|------|
-| 严重 | 行政处罚、纪律处分、公开谴责、市场禁入 | 730天 | Fail |
-| 一般 | 监管函、问询函、关注函、责令改正 | 730天 | Warn (附加说明) |
-
-**判断逻辑**:
-```python
-if match_severe_pattern() and is_recent(date, 730_days):
-    verdict = "fail"
-elif match_minor_pattern() and is_recent(date, 730_days):
-    verdict = "warn"  # 添加风险提示
-```
-
-### 积极信号 (Positive Signals)
-
-**关键词**: 订单、中标、客户、签约、签署、签订、合同、协议、合作、供货、落地、框架协议
-
-**判断**:
-```python
-if has_positive_signals:
-    verdict = "pass"  # 提前终止检索
-elif executed_passes >= 2 and no_positive_signals:
-    verdict = "fail"  -- 多轮检索无实锤，判定伪概念
-```
-
 ### 信源优先级
 
-1. **cninfo.com.cn** (巨潮资讯网) - 官方公告
-2. **sse.com.cn** (上交所)
-3. **szse.cn** (深交所)
-4. 其他财经媒体
-
-**降级规则**: 如果pass判定但缺少一级信源，降级为warn
-
-### 输出格式
-
-```python
-AuditResult(
-    ts_code="000001.SZ",
-    name="平安银行",
-    theme="AI金融",
-    verdict="pass",  # pass | warn | fail
-    rationale="检索到多项AI相关订单落地，无监管负面...",
-    sources=["url1", "url2", ...]
-)
-```
+1. **cninfo.com.cn** (巨潮资讯网) — 官方公告
+2. **sse.com.cn / szse.cn** — 交易所
+3. 财经媒体（东方财富、同花顺、财联社、第一财经、财新网等）
+4. 政策来源（gov.cn、发改委、工信部、科技部）
+5. 企业背景（天眼查、企查查）
 
 ---
 
-## Phase 4: Visualization (可视化)
-
-### 目标
-生成K线图表，标注关键技术信号。
+## Phase 4: Visualization（可视化）
 
 ### K线图元素
 
@@ -332,131 +221,87 @@ AuditResult(
 | MA20 | line | 橙色，20日均线 |
 | MA60 | line | 蓝色，60日均线 |
 | MA120 | line | 紫色，120日均线 |
-| 量能异动 | scatter (^) | 红色三角，放量>1.5倍 |
-
-### 量能异动检测
-
-```python
-def detect_turnover_spikes(df, window=20, multiple=1.5):
-    rolling = df['turnover_rate'].rolling(window).mean()
-    spikes = df['turnover_rate'] > (rolling * multiple)
-    return spikes  # True/False Series
-```
+| 量能异动 | scatter (▲) | 红色三角，放量>1.5倍 |
 
 ### 技术信号计算
 
 | 信号 | 计算方式 | 用途 |
 |------|----------|------|
-| box_top | 120日最高价 | 箱体上沿 |
-| box_bottom | 120日最低价 | 箱体下沿 |
+| box_top / box_bottom | 120日最高/低价 | 箱体边界 |
 | amplitude_120 | (顶-底)/底 | 横盘振幅 |
 | close_position | (当前价-底)/(顶-底) | 价格位置 |
 | turnover_mult | 近10日/120日平均换手 | 放量倍数 |
-| ignition | 1.2 ≤ turnover_mult ≤ 3.0 | 点火信号 |
-| ready_to_break | ignition 且 接近箱体顶 且 站上MA20 | 突破就绪 |
+| atr_pct | ATR / 收盘价 | 波动率%（最强负IC信号） |
+| lps_pullback | (MA20-收盘价) / ATR | 回踩深度（最强正IC信号） |
+| price_position_60d | 收盘价在60日区间位置 | 均值回归位置 |
 
 ---
 
-## Phase 5: Report Generation (研报生成)
-
-### 目标
-生成结构化、可操作的投资研究报告。
+## Phase 5: Report Generation（研报生成）
 
 ### DeepSeek工具调用
 
-**支持工具**:
-- `web_search`: 联网检索补充信息
-- `duckdb`: 执行SQL查询数据
-- `python`: 执行Python代码分析
-
-**交互流程**:
-```
-用户发送任务 → DeepSeek生成回复
-              ↓
-          有工具调用?
-              ↓ 是
-      执行工具 → 返回结果 → DeepSeek继续
-              ↓
-          输出最终报告
-```
+支持工具: `web_search`（联网检索）、`duckdb`（SQL查询）、`python`（代码执行）
 
 ### 报告结构
 
-```markdown
-# A股趋势跟踪研报
+- **市场风向标**：主线题材、资金验证、持续观察
+- **核心金股**：按IC校准Alpha评分排序的候选股票
+- **深度图解**：每只股票的技术分析、资金验证、核心催化、交易建议
+- **结构信号**：择时模型触发情况（标注"用于确认趋势结构，非收益预测因子"）
+- **风险提示**：系统性风险和个股风险
 
-## 【市场风向标】
+### Alpha评分公式（IC校准后）
 
-### AI应用 (confirmed)
-- **主题逻辑**: 大模型商业化加速，端侧部署成趋势...
-- **资金验证**: 上榜18次，累计净买入12.5亿，北上资金占比60%，资金持续流入
-- **持续观察**: 关注大模型厂商合作进展、端侧AI落地情况
+```python
+consolidation_alpha = (
+    0.40 * low_vol_score      # 低ATR = 高得分（IC=-0.097的反转）
+    + 0.35 * mid_range_score  # 区间中低位 = 高得分（IC=-0.055的反转）
+    + 0.25 * lps_norm         # 回踩MA20 = 高得分（IC=+0.055）
+)
 
-## 【核心金股】
-
-| 股票 | 所属主线 | 形态特征 | 推荐理由 |
-|------|----------|----------|----------|
-| 平安银行(000001.SZ) | AI金融 | 横盘分85, 量能1.8 | 市值200亿, 换手2.5 |
-
-## 【深度图解】
-
-### 平安银行 000001.SZ
-
-<font color='blue'>**【投资逻辑】**</font>
-- **观察现象**: 横盘120日，近期温和放量1.8倍，均线(MA20>MA60>MA120)呈多头排列
-- **分析意义**: 资金悄然吸筹，趋势向好，接近箱体上沿
-- **验证方式**: 龙虎榜显示机构连续买入，财报显示AI业务收入增长35%
-- **结论**: 强烈推荐 - 突破在即，资金认可度高
-
-**【技术分析】**
-- 横盘时长: 120天 | 波动率: 28%
-- 量能信号: 近期放量1.8倍，温和资金入场
-- 均线排列: MA20(15.2) > MA60(14.8) > MA120(14.5)，多头排列
-- 箱体位置: 当前价15.8，距箱体顶16.2仅3%，突破在即
-
-<font color='purple'>**【资金验证】**</font>
-- 龙虎榜: 近30日上榜3次，机构净买入2.5亿
-- 估值水平: PE 8.5，处于历史低位
-- 市值适合度: 200亿，适合中等资金运作
-
-<font color='red'>**【核心催化】**</font>
-- 政策: 金融科技支持政策即将出台
-- 事件: 公司AI中台即将上线，预计提升运营效率20%
-- 市场: AI金融应用场景获得市场认可
-
-<font color='green'>**【交易建议】**</font>
-- **买入时机**: 突破箱体上沿16.2并回踩确认
-- **仓位配置**: 首批15%，突破加仓20%，回踩支撑加仓25%
-- **止盈止损**: 目标20%分批止盈，止损-15%严格执行
-- **持仓周期**: 3-6个月，中期持股
-
-<font color='orange'>**【风险提示】**</font>
-- 核心风险: 系统性风险，大盘调整可能影响个股表现
-- 应对措施: 严格止损，控制仓位，分批建仓
-
-- 量能异动日：2024-12-15, 2024-12-28, 2025-01-05
-![平安银行 000001.SZ](../charts/000001.SZ.png)
-
-- **尽调结论** (AI金融): pass
-  - 说明: 检索到多项AI相关订单落地，无监管负面信息
-  - 来源: [cninfo.com.cn](url1), [sse.com.cn](url2)
-
-## 【风险提示】
-
-<font color='orange'>- 题材轮动快，注意情绪退潮风险。</font>
-<font color='orange'>- 量能异动需配合市场主线验证。</font>
-<font color='orange'>- 若出现监管函、立案调查等硬伤，直接剔除。</font>
+alpha_rank_score = (
+    0.10 * consolidation_alpha   # 盘整Alpha（取代原timing_score）
+    + 0.17 * volume_quality
+    + 0.16 * ma_comp
+    + 0.15 * theme_strength
+    + 0.10 * valuation
+    + 0.08 * business_quality
+    + 0.10 * finding_score
+    + 0.07 * catalyst_score
+    + 0.06 * source_quality
+    + 0.07 * audit_safe
+    - 0.12 * overcrowding_penalty
+    - 0.10 * valuation_stretch
+    - 0.08 * volatility_penalty    # 新增：高波动惩罚
+    + 0.05 * pullback_reward       # 新增：回踩奖励（仅BOS确认时）
+)
 ```
 
-### HTML报告
+<p align="center">
+  <img src="assets/fig4_alpha_rebalance.png" alt="Alpha Score Before vs After" width="85%">
+</p>
 
-**输出契约**: `reports/report_*.html` 为正式产物，`reports/report_*.md` 仅用于调试。
+---
 
-**特性**:
-- 单文件自包含 HTML
-- 内嵌 Plotly JS 与交互图表
-- 主题/股票筛选、折叠、粘性导航
-- 浏览器打印可作为 PDF fallback
+## 盘整理论：实证验证
+
+<p align="center">
+  <img src="assets/fig5_consolidation_thesis.png" alt="Consolidation Thesis Validation" width="85%">
+</p>
+
+**三个维度全部验证通过：**
+
+1. **低波动 → 正向收益**：ATR越低，未来20日收益越高。安静的市场中资金悄然建仓。
+2. **低价格位置 → 正向收益**：处于60日区间中下位的股票优于处于高位的股票。均值回归效应显著。
+3. **回踩买入 > 突破买入**：LPS回踩和缺口回补的正IC vs BOS/JOC/Higher High突破的负IC——买弱势，卖强势。
+
+### 这对策略意味着什么
+
+1. **择时模型不是Alpha因子** — 它们对收益无独立预测力，不应在排序中给予正权重
+2. **择时模型仍有用作入场过滤器** — 不是因为它们预测收益，而是帮助避免糟糕的入场（追入已展开的行情）。其价值在于**防御**，而非进攻
+3. **盘整理论实证成立** — 低ATR、低区间、低价格位置均预测正向未来收益
+4. **"结构形态有效而动量失效"的叙事是错误的** — 它完全是前视偏差的人为产物
 
 ---
 
@@ -473,57 +318,19 @@ trend-agent/
 │   ├── financial/                # 财务数据
 │   ├── top_list/                 # 龙虎榜汇总 (每日)
 │   ├── top_inst/                 # 龙虎榜明细 (每日)
+│   ├── zhihu_factor_panel.parquet # 因子面板 (IC分析用)
 │   ├── signals/                  # 验证信号快照与标签
-│   │   ├── signal_snapshots.parquet
-│   │   └── signal_labels.parquet
 │   └── validation_reports/       # 因子评估与回测报告
-│       ├── factor_report_YYYYMMDD.html
-│       └── backtest_report_YYYYMMDD.html
 │
 ├── charts/                        # 输出K线图
-│   ├── 000001.SZ.png
+├── reports/                       # 输出研报 + IC分析 + 图表
+│   ├── report_*.html
+│   ├── zhihu_signal_report_clean.md  # 清洗后IC分析报告
+│   ├── fig1_lookahead_bias.png       # 前视偏差对比图
+│   ├── fig2_feature_ic_20d.png       # 因子IC排序图
 │   └── ...
-│
-├── reports/                       # 输出研报
-│   ├── report_20250123_120000.html
-│   ├── report_20250123_120000.md    # 调试用
-│   ├── audit_trace_*.jsonl       # 审计过程trace
-│   └── deepseek_trace_*.jsonl    # 报告生成trace
-│
 └── .cache/                        # 缓存
-    └── gemma_theme_match.json    # 题材匹配缓存
 ```
-
-### 数据Schema
-
-#### stock_ticks/{ts_code}.parquet
-
-| 列名 | 类型 | 说明 |
-|------|------|------|
-| ts_code | str | 股票代码 |
-| trade_date | str | 交易日期 YYYYMMDD |
-| open/high/low/close | float | OHLC价格 |
-| vol | float | 成交量 (手) |
-| amount | float | 成交额 (元) |
-| turnover_rate | float | 换手率 (%) |
-| pe/pb | float | 估值指标 |
-| total_mv | float | 总市值 (元) |
-
-#### top_list/YYYYMMDD.parquet
-
-| 列名 | 类型 | 说明 |
-|------|------|------|
-| ts_code | str | 股票代码 |
-| name | str | 股票名称 |
-| trade_date | str | 交易日期 |
-| close | float | 收盘价 |
-| pct_change | float | 涨跌幅 (%) |
-| turnover_rate | float | 换手率 (%) |
-| l_buy | float | 买入额 (元) |
-| l_sell | float | 卖出额 (元) |
-| net_amount | float | 净买入 (元) |
-| amount_rate | float | 买入占比 (%) |
-| reason | str | 上榜原因 |
 
 ---
 
@@ -534,59 +341,30 @@ trend-agent/
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-pip install -U pandas numpy duckdb mplfinance matplotlib \
+pip install -U pandas numpy duckdb plotly matplotlib \
                scipy pyarrow langchain-core langchain-community python-dotenv
 ```
-
-### 系统依赖
-
-无额外 PDF/LaTeX 依赖；HTML 报告直接由 Python 生成。
 
 ### 环境变量 (.env)
 
 ```env
 # Zhipu AI (Web Search)
 ZHIPUAI_API_KEY=xxx
-ZHIPU_SEARCH_COUNT=15
 
-# Local/OpenAI-compatible Gemma + SiliconFlow DeepSeek
-SILICONFLOW_BASE_URL=https://api.siliconflow.cn/v1
-SILICONFLOW_API_KEY=sk-xxx
-DEEPSEEK_MODEL=Pro/deepseek-ai/DeepSeek-V3.2
+# Two LLM tiers: official DeepSeek heavy tier + local Gemma light tier
+DEEPSEEK_BASE_URL=https://api.deepseek.com
+DEEPSEEK_API_KEY=sk-xxx
+DEEPSEEK_MODEL=deepseek-v4-pro
 GEMMA_MODEL=gemma-4-31B-nvfp4
 GEMMA_BASE_URL=http://192.168.3.46:8000/v1
 GEMMA_API_KEY=dummy
 
-# Debug Flags
-DEBUG_DEEPSEEK=0
-DEBUG_ZHIPU_SEARCH=0
-DEBUG_SILICONFLOW=0
-
 # Strategy Parameters
 REGULATORY_MAX_AGE_DAYS=730
-HOLDING_HORIZON=swing_2_8w
-TOPLIST_EXCLUSION_MODE=penalty
-TOPLIST_PENALTY_WEIGHT=0.25
-TOPLIST_LOOKBACK_DAYS=60
-TOPLIST_CROWDED_MIN_HITS=4
-HARD_FAIL_REQUIRE_RECENCY=1
-HARD_FAIL_MAX_AGE_DAYS=730
-HARD_FAIL_REDUCE_MATERIALITY_THRESHOLD=0.03
 THEME_MATCH_POLICY=conservative
 MAX_NAMES_PER_THEME=4
 MAX_NAMES_PER_INDUSTRY=4
-
-# Gemma Theme Match Rate-Limit Controls (Phase 2)
-GEMMA_BATCH_SIZE=4
-GEMMA_RATE_LIMIT_MAX_RETRIES=6
-GEMMA_RATE_LIMIT_BASE_DELAY_SEC=1.0
-GEMMA_RATE_LIMIT_MAX_DELAY_SEC=20.0
-GEMMA_REQUEST_INTERVAL_SEC=0.35
 ```
-
-说明:
-- 当Gemma在批次匹配中持续返回`429`并耗尽重试后，系统会对该批次降级为空匹配（`rate_limited_exhausted`），流水线继续执行并进入既有heuristic/off-theme fallback逻辑。
-- 默认采用“可靠性优先”策略：更小批次 + 请求节流 + 指数退避，降低TPM突发峰值导致的整体失败概率。
 
 ---
 
@@ -602,102 +380,46 @@ python trend_agent.py
 ### 单独运行各模块
 
 ```bash
-# 仅技术筛选
-python screen_growth_stocks.py
+python screen_growth_stocks.py          # 仅技术筛选
+python check_setup.py                   # 检查环境
+```
 
-# 检查环境
-python check_setup.py
+### IC分析与前视偏差审计
 
-# 测试DeepSeek思维模式
-python test_deepseek_thinking.py
-
-# 离线评估候选池（5/10/20日收益 + 消融）
-python strategy_evaluator.py --candidates reports/candidates_YYYYMMDD_HHMMSS.csv
+```bash
+python zhihu_clean_analysis.py          # 清洗后IC分析（多进程）
+python zhihu_leak_audit.py              # 8点前视偏差审计
+python zhihu_bias_check.py              # 原始 vs 清洗 IC对比
 ```
 
 ### 统计验证与回测
 
-验证模块位于 `validation/`，通过 CLI 持久化候选信号、构建未来收益标签、评估因子预测力，并运行轻量 top-N 等权周频回测。所有命令建议使用项目 venv：
-
 ```bash
 source .venv/bin/activate
-```
 
-#### 1) 保存候选信号快照
-
-完整流水线会导出 `reports/candidates_YYYYMMDD_HHMMSS.csv`。将该文件固化为不可变信号快照：
-
-```bash
+# 保存候选信号快照
 python -m validation.cli snapshot \
   --input reports/candidates_YYYYMMDD_HHMMSS.csv \
-  --signal-date YYYYMMDD \
-  --run-id run_YYYYMMDD
-```
+  --signal-date YYYYMMDD --run-id run_YYYYMMDD
 
-输出：
-
-```text
-data/signals/signal_snapshots.parquet
-```
-
-快照以 `(run_id, signal_date, ts_code)` 为不可变键。重复写入相同内容会保持幂等；相同键但内容不同会报错，避免历史信号被静默覆盖。每条记录会保留 `run_id`、`config_hash`、`agent_version` 和候选表中的主要因子列。
-
-#### 2) 构建未来收益标签
-
-```bash
+# 构建未来收益标签
 python -m validation.cli build-labels \
   --snapshots data/signals/signal_snapshots.parquet \
-  --prices data/stock_ticks \
-  --output data/signals/signal_labels.parquet
-```
+  --prices data/stock_ticks --output data/signals/signal_labels.parquet
 
-默认生成 `1D/3D/5D/10D/20D/40D` 标签。为防止未来函数，`signal_date=t` 的入场价使用 `t+1` 或之后第一个可交易日的开盘价，未来收益按 `exit_close / entry_open - 1` 计算。
-
-#### 3) 评估因子预测力
-
-```bash
+# 评估因子预测力
 python -m validation.cli eval-factors \
   --labels data/signals/signal_labels.parquet \
-  --factor alpha_rank_score \
-  --top-n 10
-```
+  --factor alpha_rank_score --top-n 10
 
-输出包含 IC、RankIC、分位数组合收益、top-N 未来收益，以及按行业、市场、交易所、`list_type` 的基础稳健性拆分。
-
-#### 4) 运行 top-N 周频等权回测
-
-```bash
+# 运行top-N周频等权回测
 python -m validation.cli backtest \
   --labels data/signals/signal_labels.parquet \
-  --prices data/stock_ticks \
-  --score-col alpha_rank_score \
-  --top-n 10 \
-  --cost-bps 10 \
-  --slippage-bps 5
-```
+  --prices data/stock_ticks --score-col alpha_rank_score \
+  --top-n 10 --cost-bps 10 --slippage-bps 5
 
-回测默认按周取最新信号、按分数选择 top-N、等权持有，并应用交易成本和滑点。买入使用下一交易日开盘；涨停开盘默认不买入，跌停开盘默认延迟卖出。
-
-#### 5) 生成 HTML/Markdown 报告
-
-```bash
+# 生成报告
 python -m validation.cli report --kind all
-```
-
-输出：
-
-```text
-data/validation_reports/factor_report_YYYYMMDD.html
-data/validation_reports/factor_report_YYYYMMDD.md
-data/validation_reports/backtest_report_YYYYMMDD.html
-data/validation_reports/backtest_report_YYYYMMDD.md
-```
-
-可单独生成：
-
-```bash
-python -m validation.cli report --kind factor
-python -m validation.cli report --kind backtest
 ```
 
 ### 调试模式
@@ -705,62 +427,25 @@ python -m validation.cli report --kind backtest
 ```bash
 export DEBUG_DEEPSEEK=1
 export DEBUG_ZHIPU_SEARCH=1
+export FORCE_LLM_LOGGING=1
 python trend_agent.py
 ```
 
 ---
 
-## 输出示例
+## 关键模块
 
-### 1) K线图 (charts/{ts_code}.png)
-
-- 240日K线 + 成交量
-- MA20(橙) / MA60(蓝) / MA120(紫) 叠加
-- 量能异动日标注 (红色三角)
-- 中文标题
-
-### 2) HTML研报 (reports/report_*.html)
-
-- 单文件自包含
-- 交互式筛选、折叠、导航
-- 内嵌 Plotly 图表
-- 浏览器可直接打印导出
-
-### 3) Debug Markdown (reports/report_*.md)
-
-- 与 HTML 同源的调试输出
-- 无 PDF 专用格式处理
-- 便于快速 diff 和排查 LLM 输出
-
-### 4) Trace文件
-
-- `audit_trace_*.jsonl`: 审计过程完整记录
-- `deepseek_trace_*.jsonl`: 报告生成工具调用记录
-
----
-
-## 投资指引 (仅供参考)
-
-### 仓位管理
-
-| 买入阶段 | 仓位 | 条件 |
-|----------|------|------|
-| 首批建仓 | 15% | 突破箱体上沿 |
-| 突破加仓 | 20% | 回踩确认不破 |
-| 回踩加仓 | 25% | 触及MA20支撑 |
-
-### 止盈止损
-
-- **止盈**: +30% 分批止盈
-- **止损**: -15% 严格执行
-- **持仓周期**: 3-6个月
-
-### 风险控制
-
-1. 不追高，等待回踩
-2. 严格止损，不抱侥幸
-3. 控制仓位，不赌单只
-4. 分散配置，相关度低的3-5只
+| 文件 | 用途 |
+|------|------|
+| `trend_agent.py` | 主流水线编排器（5个阶段） |
+| `llm_provider.py` | 双层LLM：DeepSeek重型 + Gemma轻型 |
+| `screen_growth_stocks.py` | 股票筛选逻辑与IC校准技术分析 |
+| `deep_researcher.py` | AI研究引擎（Zhipu搜索 + 查询规划） |
+| `timing_models.py` | 7个威科夫/道氏择时检测器（防御性使用） |
+| `zhihu_clean_analysis.py` | 清洗后IC分析（无前视偏差，多进程） |
+| `zhihu_leak_audit.py` | 8点前视偏差审计 |
+| `validation/cli.py` | 验证流水线CLI |
+| `validation/portfolio_backtest.py` | 组合回测引擎 |
 
 ---
 
@@ -770,32 +455,9 @@ python trend_agent.py
 
 ---
 
-## 常见问题
-
-### Q: HTML报告打开后没有交互图表？
-
-A: 检查浏览器是否禁用了页面脚本，或确认生成的 `report_*.html` 文件没有被截断。
-
-### Q: Zhipu搜索报错？
-
-A: 检查API Key和网络连接:
-```bash
-export ZHIPUAI_API_KEY=xxx
-export DEBUG_ZHIPU_SEARCH=1
-```
-
-### Q: 数据文件缺失？
-
-A: 确保 `data/` 符号链接指向正确的数据目录，并验证Parquet文件存在。
-
-### Q: 字体显示问题？
-
-A: 系统需要中文字体，项目会尝试自动加载 `Source Han Sans CN`，可通过 `CHART_FONT` 环境变量自定义。
-
----
-
 ## 版本历史
 
-- **v2.0** - 多源融合 (Web + Dragon Tiger List)
-- **v1.5** - DeepSeek V3.2思维模式支持
-- **v1.0** - 初始版本，五阶段流水线
+- **v3.0** — IC校准：均值回归发现 → Alpha评分重构 → 择时模型降级 → 盘整权重提升
+- **v2.0** — 多源融合 (Web + Dragon Tiger List)
+- **v1.5** — DeepSeek reasoning模式支持
+- **v1.0** — 初始版本，五阶段流水线

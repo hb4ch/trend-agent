@@ -6,9 +6,9 @@ from pathlib import Path
 
 from validation.factor_eval import evaluate_from_labels_path
 from validation.label_builder import LabelConfig, build_forward_labels
-from validation.portfolio_backtest import BacktestConfig, run_backtest
+from validation.portfolio_backtest import BacktestConfig, _weekly_signal_dates, run_backtest
 from validation.report import write_backtest_report, write_factor_report
-from validation.signal_store import SignalConfig, load_candidates, snapshot_candidates
+from validation.signal_store import SignalConfig, load_candidates, read_table, snapshot_candidates
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -44,6 +44,7 @@ def main(argv: list[str] | None = None) -> int:
     p_bt.add_argument("--cost-bps", type=float, default=10.0)
     p_bt.add_argument("--slippage-bps", type=float, default=5.0)
     p_bt.add_argument("--frequency", default="W-FRI")
+    p_bt.add_argument("--week-ending", default=None)
 
     p_report = sub.add_parser("report", help="Generate validation reports")
     p_report.add_argument("--kind", choices=["factor", "backtest", "all"], default="all")
@@ -55,6 +56,7 @@ def main(argv: list[str] | None = None) -> int:
     p_report.add_argument("--cost-bps", type=float, default=10.0)
     p_report.add_argument("--slippage-bps", type=float, default=5.0)
     p_report.add_argument("--output-dir", type=Path, default=Path("data/validation_reports"))
+    p_report.add_argument("--week-ending", default=None)
 
     args = parser.parse_args(argv)
 
@@ -103,8 +105,14 @@ def main(argv: list[str] | None = None) -> int:
                 transaction_cost_bps=args.cost_bps,
                 slippage_bps=args.slippage_bps,
                 frequency=args.frequency,
+                week_ending=args.week_ending,
             )
         )
+        labels_df = read_table(args.labels)
+        if not labels_df.empty:
+            dates = _weekly_signal_dates(labels_df["signal_date"], args.frequency)
+            if dates:
+                print(f"Rebalance dates ({len(dates)} weeks): {', '.join(d.strftime('%Y-%m-%d') for d in dates)}")
         print(result.nav.tail(10).to_string(index=False) if not result.nav.empty else "No backtest rows")
         print(result.stats)
         return 0
@@ -122,6 +130,7 @@ def main(argv: list[str] | None = None) -> int:
                 top_n=args.top_n,
                 transaction_cost_bps=args.cost_bps,
                 slippage_bps=args.slippage_bps,
+                week_ending=args.week_ending,
             )
             html, md = write_backtest_report(run_backtest(bt_config), config=bt_config, output_dir=args.output_dir)
             print(f"Wrote backtest report: {html} ({md})")
