@@ -304,7 +304,7 @@ def _trade_record(
     }
 
 
-def _backtest_stats(nav: pd.DataFrame) -> dict[str, float]:
+def _backtest_stats(nav: pd.DataFrame, periods_per_year: int = 52) -> dict[str, float]:
     if nav.empty:
         return {"total_return": np.nan, "max_drawdown": np.nan, "periods": 0}
     values = pd.to_numeric(nav["nav"], errors="coerce")
@@ -312,7 +312,7 @@ def _backtest_stats(nav: pd.DataFrame) -> dict[str, float]:
     drawdown = values / running_max - 1.0
     periods = int(values.notna().sum())
     total_return = float(values.iloc[-1] - 1.0)
-    annualized = float(values.iloc[-1] ** (52.0 / max(periods, 1)) - 1.0) if values.iloc[-1] > 0 else np.nan
+    annualized = float(values.iloc[-1] ** (periods_per_year / max(periods, 1)) - 1.0) if values.iloc[-1] > 0 else np.nan
     return {
         "total_return": total_return,
         "annualized_return_proxy": annualized,

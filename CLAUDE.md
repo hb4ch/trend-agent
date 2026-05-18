@@ -32,9 +32,9 @@ export FORCE_LLM_LOGGING=1  # Print all LLM I/O to screen
 
 ## Project Overview
 
-**Trend Agent** is an A-share (Chinese stock market) investment research and stock screening system following a "momentum-focused, filter-based, timing-oriented" approach.
+**Contrarian Agent** is an A-share (Chinese stock market) investment research and stock screening system following a "quality-focused, filter-based, pullback-entry" approach, empirically recalibrated after cross-sectional IC analysis proved mean reversion dominates A-shares.
 
-### Core Philosophy: **"重势、通过滤、待时机"**
+### Core Philosophy: **"重质、通过滤、待回踩"**
 
 1. **Phase 1 - Market Intelligence**: Web search + Dragon Tiger List → market themes
 2. **Phase 2 - Quantitative Mining**: DuckDB + technical criteria → candidate stocks (relaxed filters)
@@ -52,6 +52,8 @@ export FORCE_LLM_LOGGING=1  # Print all LLM I/O to screen
 | `llm_provider.py` | Two-tier LLM provider: official DeepSeek heavy tier + local Gemma light tier |
 | `screen_growth_stocks.py` | Stock screening logic & technical analysis |
 | `deep_researcher.py` | AI research engine (Zhipu search + query planning) |
+| `fundamental_quality.py` | Lifecycle-aware fundamental quality scoring (4 dimensions) |
+| `timing_models.py` | 7 Wyckoff/Dow structure detectors (defensive filters, NOT alpha factors) |
 | `utils.py` | Shared utilities (Dragon Tiger List, JSON parsing, etc.) |
 
 ### `trend_agent.py` - Key Functions
@@ -96,11 +98,13 @@ MIN_DATA_DAYS = 180         # Minimum trading days (relaxed from 250)
 VOLATILITY_THRESHOLD = 0.50 # 50% max amplitude (relaxed from 35%)
 ```
 
-**Composite Score Weights (Rebalanced):**
-- Consolidation: 40% (from 60%)
-- Momentum: 20% (new)
-- Volume boost: 25%
-- Turnover: 15%
+**Composite Score Weights (IC-Calibrated):**
+- Consolidation: 35%
+- Momentum: 15%
+- Volume Quality: 18%
+- Squeeze Readiness: 15%
+- Valuation Quality: 10%
+- Fundamental Quality: 7%
 
 ### `deep_researcher.py` - Search Functions
 

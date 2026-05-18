@@ -300,30 +300,6 @@ def create_row_fingerprint(row: Dict[str, Any], fields: List[str]) -> str:
     return f"{row.get('ts_code','')}::{h[:16]}"
 
 
-# Module-level convenience functions for backward compatibility
-def _truncate(text: str, limit: int = 5000) -> str:
-    """Legacy alias for truncate()."""
-    return truncate(text, limit)
-
-
-def _pretty(payload: Any) -> str:
-    """Legacy alias for pretty_print()."""
-    return pretty_print(payload)
-
-
-def _debug_print(prefix: str, payload: Any, debug_flag: bool = False) -> None:
-    """
-    Print debug message if debug flag is enabled.
-
-    Args:
-        prefix: Message prefix
-        payload: Object to print
-        debug_flag: If False, message is not printed
-    """
-    if debug_flag:
-        logger.debug(f"[{prefix}] {truncate(pretty_print(payload), 6000)}")
-
-
 # =============================================================================
 # Dragon Tiger List (龙虎榜) Data Management
 # =============================================================================
@@ -339,9 +315,6 @@ class DragonTigerList:
 
         # 识别热门题材
         themes = dtl.identify_hot_themes(days=30)
-
-        # 获取题材资金分析
-        analysis = dtl.get_theme_capital_analysis("半导体", days=30)
 
         # 获取最近上榜股票（用于排除）
         hot_stocks = dtl.get_recent_toplist_stocks(days=60)
@@ -516,6 +489,10 @@ class DragonTigerList:
                 how="left"
             )
 
+        # Guard against missing industry column (e.g., stock_basic.parquet unavailable)
+        if "industry" not in df_list.columns:
+            return {}
+
         # Group by industry
         result = {}
         for industry, group in df_list.groupby("industry"):
@@ -591,88 +568,6 @@ class DragonTigerList:
         logger.info(f"Identified {len(sorted_result)} themes from toplist")
         return sorted_result
 
-    def get_theme_capital_analysis(self, theme_name: str, days: int = 30) -> Dict:
-        """
-        获取题材的资金流向分析。
-
-        Args:
-            theme_name: 主题名称（行业名称）
-            days: 时间窗口（天）
-
-        Returns:
-            Dict with capital flow analysis
-        """
-        import pandas as pd
-
-        df_list = self.load_recent_toplist(days)
-        if df_list is None or df_list.empty:
-            return {}
-
-        df_basic = self._load_stock_basic()
-        if df_basic is not None:
-            df_list = df_list.merge(
-                df_basic[["ts_code", "industry", "name"]],
-                on="ts_code",
-                how="left"
-            )
-
-        # Filter by theme (industry)
-        theme_df = df_list[df_list["industry"] == theme_name]
-        if theme_df.empty:
-            logger.warning(f"No data found for theme: {theme_name}")
-            return {}
-
-        df_inst = self.load_recent_topinst(days)
-        inst_analysis = []
-        if df_inst is not None:
-            theme_inst = df_inst[df_inst["ts_code"].isin(theme_df["ts_code"])]
-
-            # Top buyers by institution type
-            if not theme_inst.empty:
-                # North money
-                north = theme_inst[theme_inst["exalter"].str.contains("沪股通|深股通", na=False)]
-                inst_analysis.append({
-                    "type": "北上资金",
-                    "net_buy": float(north["net_buy"].sum()),
-                    "buy": float(north["buy"].sum()),
-                })
-
-                # Institutions
-                inst_only = theme_inst[theme_inst["exalter"] == "机构专用"]
-                inst_analysis.append({
-                    "type": "机构专用",
-                    "net_buy": float(inst_only["net_buy"].sum()),
-                    "buy": float(inst_only["buy"].sum()),
-                })
-
-        # Top stocks
-        top_stocks = (
-            theme_df.groupby("ts_code")
-            .agg({
-                "name": "first",
-                "net_amount": "sum",
-                "net_rate": "mean",
-            })
-            .sort_values("net_amount", ascending=False)
-            .head(10)
-            .to_dict("index")
-        )
-
-        return {
-            "theme_name": theme_name,
-            "hit_count": len(theme_df),
-            "total_net_buy": float(theme_df["net_amount"].sum()),
-            "inst_breakdown": inst_analysis,
-            "top_stocks": {
-                code: {
-                    "name": row["name"],
-                    "net_buy": float(row["net_amount"]),
-                    "avg_net_rate": float(row["net_rate"]),
-                }
-                for code, row in top_stocks.items()
-            },
-        }
-
     def get_recent_toplist_stocks(self, days: int = 60) -> List[str]:
         """
         获取最近上榜的股票列表（用于排除已大涨股票）。
@@ -688,143 +583,3 @@ class DragonTigerList:
             return []
 
         return df["ts_code"].unique().tolist()
-
-    def get_stock_toplist_summary(self, ts_code: str, days: int = 30) -> Dict:
-        """
-        获取个股的龙虎榜汇总。
-
-        Args:
-            ts_code: 股票代码
-            days: 时间窗口（天）
-
-        Returns:
-            Dict with toplist summary for the stock
-        """
-        import pandas as pd
-
-        df_list = self.load_recent_toplist(days)
-        if df_list is None or df_list.empty:
-            return {}
-
-        stock_df = df_list[df_list["ts_code"] == ts_code]
-        if stock_df.empty:
-            return {"ts_code": ts_code, "hits": []}
-
-        df_inst = self.load_recent_topinst(days)
-        hits = []
-
-        for _, row in stock_df.iterrows():
-            trade_date = row["trade_date"]
-            reason = row["reason"]
-            net_amount = row["net_amount"]
-            amount_rate = row.get("amount_rate", 0)
-
-            # Get institutional details for this date
-            buyers = []
-            sellers = []
-
-            if df_inst is not None:
-                inst_df = df_inst[
-                    (df_inst["ts_code"] == ts_code) &
-                    (df_inst["trade_date"] == trade_date)
-                ]
-
-                for _, inst_row in inst_df.iterrows():
-                    inst_info = {
-                        "name": inst_row["exalter"],
-                        "buy": float(inst_row["buy"]),
-                        "sell": float(inst_row["sell"]),
-                        "net_buy": float(inst_row["net_buy"]),
-                    }
-                    if inst_row["net_buy"] > 0:
-                        buyers.append(inst_info)
-                    elif inst_row["net_buy"] < 0:
-                        sellers.append(inst_info)
-
-            # Sort by net_buy
-            buyers.sort(key=lambda x: x["net_buy"], reverse=True)
-            sellers.sort(key=lambda x: x["net_buy"])
-
-            hits.append({
-                "trade_date": trade_date,
-                "reason": reason,
-                "net_amount": float(net_amount),
-                "amount_rate": float(amount_rate),
-                "top_buyers": buyers[:5],
-                "top_sellers": sellers[:5],
-            })
-
-        # Summary stats
-        summary = {
-            "ts_code": ts_code,
-            "hit_count": len(hits),
-            "total_net_buy": float(stock_df["net_amount"].sum()),
-            "avg_amount_rate": float(stock_df["amount_rate"].mean()),
-            "hits": hits,
-        }
-
-        return summary
-
-    def identify_smart_money(self, df: Any) -> Dict[str, List[Dict]]:
-        """
-        识别"聪明钱"（北上资金、机构、知名游资）。
-
-        Args:
-            df: top_inst DataFrame
-
-        Returns:
-            Dict mapping smart money type to list of their activities
-        """
-        import pandas as pd
-
-        if df is None or df.empty:
-            return {}
-
-        result = {
-            "north": [],      # 北上资金
-            "inst": [],       # 机构
-            "hot_money": [],  # 游资
-        }
-
-        # Known hot money seats
-        known_seats = [
-            "宁波桑田路",
-            "上海溧阳路",
-            "作手新一",
-            "消闲派",
-            "宁波桑田路",
-            "绍兴路",
-            "湖州",
-            "上海",
-            "深圳",
-        ]
-
-        for _, row in df.iterrows():
-            exalter = row["exalter"]
-            net_buy = float(row["net_buy"])
-
-            info = {
-                "exalter": exalter,
-                "ts_code": row["ts_code"],
-                "buy": float(row["buy"]),
-                "sell": float(row["sell"]),
-                "net_buy": net_buy,
-            }
-
-            # North money
-            if "沪股通" in exalter or "深股通" in exalter:
-                result["north"].append(info)
-
-            # Institutions
-            elif exalter == "机构专用":
-                result["inst"].append(info)
-
-            # Hot money (known seats or large net buy)
-            elif any(seat in exalter for seat in known_seats) or abs(net_buy) > 5e7:
-                result["hot_money"].append(info)
-
-        # Sort by net_buy
-        for key in result:
-            result[key].sort(key=lambda x: x["net_buy"], reverse=True)
-
-        return result

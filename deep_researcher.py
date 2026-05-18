@@ -539,10 +539,10 @@ SOURCE_TIER_WEIGHTS = {
     "sina.com.cn": 0.75,
     "gelonghui.com": 0.75,
     "xueqiu.com": 0.70,
-    "gov.cn": 0.90,
     "ndrc.gov.cn": 0.90,
     "miit.gov.cn": 0.90,
     "most.gov.cn": 0.90,
+    "gov.cn": 0.90,
     "tianyancha.com": 0.70,
     "qichacha.com": 0.70,
 }
@@ -796,4 +796,4 @@ except Exception as e:
     print(f"⚠️ 智谱工具加载失败: {e}")
 
     def zhipu_search(query: str) -> str:
-        return "❌ Zhipu 搜索不可用，请检查 ZHIPUAI_API_KEY 环境变量。"
+        return json.dumps({"error": "Zhipu API key not configured", "results": []}, ensure_ascii=False)

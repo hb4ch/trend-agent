@@ -472,27 +472,6 @@ def get_llm(model: str = "heavy", temperature: float = 0.2) -> BaseChatModel:
     return get_llm_provider().get_llm(model, temperature)
 
 
-def invoke_llm(
-    model: str,
-    messages: List[str],
-    system_prompt: Optional[str] = None,
-    temperature: float = 0.2,
-) -> str:
-    """
-    Convenience function to invoke an LLM.
-
-    Args:
-        model: Tier name or compatibility alias
-        messages: List of message strings
-        system_prompt: Optional system prompt
-        temperature: Sampling temperature
-
-    Returns:
-        Response text
-    """
-    return get_llm_provider().invoke(model, messages, system_prompt, temperature)
-
-
 def invoke_llm_messages(
     model: str,
     messages: List[Dict[str, str]],
@@ -897,28 +876,3 @@ class DeepSeekThinkingClient:
 # Global thinking client instance
 _deepseek_thinking_client: Optional[DeepSeekThinkingClient] = None
 
-
-def get_deepseek_thinking_client() -> DeepSeekThinkingClient:
-    """Get the global DeepSeek thinking mode client instance."""
-    global _deepseek_thinking_client
-    if _deepseek_thinking_client is None:
-        _deepseek_thinking_client = DeepSeekThinkingClient()
-    return _deepseek_thinking_client
-
-
-def invoke_deepseek_thinking(
-    messages: List[Dict[str, str]],
-    thinking_budget: Optional[int] = None,
-) -> Dict[str, Any]:
-    """
-    Convenience function to invoke DeepSeek in thinking mode.
-
-    Args:
-        messages: List of message dicts
-        thinking_budget: Optional token budget for reasoning
-
-    Returns:
-        Dict with content, reasoning_content, tool_calls, usage
-    """
-    client = get_deepseek_thinking_client()
-    return client.invoke_thinking(messages, thinking_budget)

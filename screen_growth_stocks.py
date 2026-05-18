@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
-A股潜力成长组合筛选脚本
-基于"基本面成长+资金面博弈"双重分析体系
+A股盘整低吸筛选脚本 — 基于"重质、通过滤、待回踩"策略
+均值回归主导下的盘整质量+基本面质量复合筛选
 """
 
 import logging
+import os
 import pandas as pd
 import numpy as np
 from pathlib import Path
@@ -15,6 +16,8 @@ from typing import Dict, List, Optional
 from math import exp
 
 from utils import EPSILON
+
+DATA_ROOT = Path("data")
 
 # Setup logging
 logger = logging.getLogger(__name__)
@@ -190,7 +193,7 @@ def compute_trend_emergence_score(
     elif r20 <= 0.25:
         return_score = linear_score(r20, 0.0, 0.05, 25.0)
     else:
-        return_score = max(0.0, 25.0 * (1.0 - (r20 - 0.25) / 0.20))
+        return_score = 8.0  # mid-range returns (0.25-0.45): moderate, avoiding discontinuity
 
     acceleration_score = 0.0
     if r5 > 0:
@@ -204,7 +207,7 @@ def compute_trend_emergence_score(
     if vol_ratio > 4.0:
         volume_score = min(volume_score, 12.0)
 
-    breakout_score = 20.0 if fresh_breakout else (12.0 if near_breakout else 0.0)
+    breakout_score = 0.0 if fresh_breakout else (5.0 if near_breakout else 15.0)
     obv_score = linear_score(finite_float(obv_accumulation_score), 0.0, 100.0, 15.0)
     return min(100.0, return_score + acceleration_score + volume_score + breakout_score + obv_score)
 
@@ -432,12 +435,14 @@ def compute_industry_relative_valuation(
         percentile_cols.append(pct_col)
         out["valuation_data_points"] += out[pct_col].notna().astype(int)
 
-    weight_sum = sum(VALUATION_WEIGHTS.values())
     weighted = []
+    used_weight_sum = pd.Series(0.0, index=out.index)
     for metric in VALUATION_METRICS:
         pct_col = f"{metric}_percentile_industry"
-        weighted.append(out[pct_col].fillna(0.5) * VALUATION_WEIGHTS[metric])
-    out["valuation_stretch_score"] = (sum(weighted) / max(weight_sum, EPSILON)) * 100.0
+        mask = out[pct_col].notna()
+        used_weight_sum += mask.astype(float) * VALUATION_WEIGHTS[metric]
+        weighted.append(out[pct_col].fillna(0.0) * VALUATION_WEIGHTS[metric])
+    out["valuation_stretch_score"] = (sum(weighted) / used_weight_sum.replace(0, 1.0)) * 100.0
     out.loc[out["valuation_data_points"] == 0, "valuation_stretch_score"] = 50.0
     out["valuation_quality_score"] = 100.0 - out["valuation_stretch_score"]
     out["valuation_label"] = out["valuation_stretch_score"].apply(classify_valuation_label)
@@ -617,7 +622,7 @@ def analyze_stock_technical(df, current_date=None):
 
     # 6. Momentum scoring (enhanced with new indicators)
     momentum_score = compute_momentum_score(
-        df, latest, ema20, ma60, ma120, ma250,
+        latest, ema20, ma60, ma120, ma250,
         recent_high, recent_low, volume_boost,
         adx_now, adx_slope, obv_slope, vwap_ratio,
         obv_slope_norm=obv_slope_norm,
@@ -629,7 +634,6 @@ def analyze_stock_technical(df, current_date=None):
 
 
 def compute_momentum_score(
-    df: pd.DataFrame,
     latest: pd.Series,
     ema20: float,
     ma60: float,
@@ -711,6 +715,121 @@ def compute_momentum_score(
     return min(100.0, score)
 
 
+def fundamental_quick_screen(results_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Lightweight fundamental quality pre-screen on already-filtered candidates.
+
+    Runs after technical + valuation filters (on ~100-200 candidates, not 5000+).
+    Loads from local financial parquet cache only — no Tushare calls.
+    Gated by env var FUNDAMENTAL_PRE_SCREEN_ENABLED (default "1").
+
+    Returns the DataFrame with `fundamental_quality_score` and `lifecycle_stage`
+    columns added. Falls back to neutral 50.0 when cache is empty.
+    """
+    enabled = os.environ.get("FUNDAMENTAL_PRE_SCREEN_ENABLED", "1").strip()
+    if enabled not in {"1", "true", "True", "YES", "yes"}:
+        results_df["fundamental_quality_score"] = 50.0
+        results_df["lifecycle_stage"] = "unknown"
+        return results_df
+
+    try:
+        from fundamental_quality import classify_lifecycle, compute_fundamental_quality
+    except ImportError:
+        logger.warning("fundamental_quality module not available, skipping pre-screen")
+        results_df["fundamental_quality_score"] = 50.0
+        results_df["lifecycle_stage"] = "unknown"
+        return results_df
+
+    financial_root = DATA_ROOT / "financial"
+    if not financial_root.exists():
+        logger.info("No financial/ directory, skipping fundamental pre-screen")
+        results_df["fundamental_quality_score"] = 50.0
+        results_df["lifecycle_stage"] = "unknown"
+        return results_df
+
+    # Load all financial parquet files via duckdb
+    fin_files = sorted(p for p in financial_root.rglob("*.parquet") if p.is_file())
+    if not fin_files:
+        logger.info("No financial parquet files found, skipping fundamental pre-screen")
+        results_df["fundamental_quality_score"] = 50.0
+        results_df["lifecycle_stage"] = "unknown"
+        return results_df
+
+    import duckdb
+
+    con = None
+    try:
+        con = duckdb.connect()
+        quoted = ", ".join(
+            f"'{p.as_posix().replace(chr(39), chr(39)+chr(39))}'" for p in fin_files
+        )
+        fin_df = con.execute(f"SELECT * FROM parquet_scan([{quoted}])").df()
+    except Exception as exc:
+        logger.warning("Failed to load financial data: %s", exc)
+        results_df["fundamental_quality_score"] = 50.0
+        results_df["lifecycle_stage"] = "unknown"
+        return results_df
+    finally:
+        if con is not None:
+            con.close()
+
+    # Find date column
+    date_col = None
+    for candidate in ("end_date", "report_date", "ann_date", "f_ann_date", "trade_date"):
+        if candidate in fin_df.columns:
+            date_col = candidate
+            break
+    if date_col is None:
+        results_df["fundamental_quality_score"] = 50.0
+        results_df["lifecycle_stage"] = "unknown"
+        return results_df
+
+    fin_df[date_col] = pd.to_datetime(fin_df[date_col], errors="coerce")
+    fin_df = fin_df[fin_df[date_col].notna()]
+
+    quality_scores: Dict[str, float] = {}
+    lifecycle_stages: Dict[str, str] = {}
+
+    for _, row in results_df.iterrows():
+        ts_code = str(row["ts_code"])
+        stock_fin = fin_df[fin_df["ts_code"] == ts_code].sort_values(date_col)
+        if stock_fin.empty:
+            quality_scores[ts_code] = 50.0
+            lifecycle_stages[ts_code] = "unknown"
+            continue
+
+        stock_fin = stock_fin.drop_duplicates(subset=[date_col], keep="last").tail(12).reset_index(drop=True)
+        if len(stock_fin) < 2:
+            quality_scores[ts_code] = 50.0
+            lifecycle_stages[ts_code] = "unknown"
+            continue
+
+        try:
+            lifecycle = classify_lifecycle(stock_fin, str(row.get("industry", "")))
+            result = compute_fundamental_quality(stock_fin, lifecycle)
+            quality_scores[ts_code] = result["fundamental_quality_score"]
+            lifecycle_stages[ts_code] = lifecycle.get("stage", "unknown")
+        except Exception as exc:
+            logger.warning("Fundamental quality failed for %s: %s", ts_code, exc)
+            quality_scores[ts_code] = 50.0
+            lifecycle_stages[ts_code] = "unknown"
+
+    results_df["fundamental_quality_score"] = results_df["ts_code"].map(
+        lambda c: quality_scores.get(str(c), 50.0)
+    )
+    results_df["lifecycle_stage"] = results_df["ts_code"].map(
+        lambda c: lifecycle_stages.get(str(c), "unknown")
+    )
+
+    logger.info(
+        "Fundamental pre-screen: scored %d/%d candidates (mean=%.1f)",
+        sum(1 for v in quality_scores.values() if v != 50.0),
+        len(results_df),
+        results_df["fundamental_quality_score"].mean(),
+    )
+    return results_df
+
+
 def screen_all_stocks() -> pd.DataFrame:
     """
     Screen all stocks using technical criteria.
@@ -760,6 +879,7 @@ def screen_all_stocks() -> pd.DataFrame:
         try:
             df = pd.read_parquet(tick_file)
         except Exception as e:
+            logger.warning("Skipping corrupt/missing parquet %s: %s", tick_file.name, e)
             skipped['no_data'] += 1
             continue
 
@@ -825,7 +945,6 @@ def screen_all_stocks() -> pd.DataFrame:
     )
     results_df["momentum_score"] = results_df.apply(
         lambda row: compute_momentum_score(
-            pd.DataFrame(),
             row,
             finite_float(row.get("ema20")),
             finite_float(row.get("ma60")),
@@ -858,17 +977,20 @@ def screen_all_stocks() -> pd.DataFrame:
         axis=1,
     )
 
-    # Composite ranking: trend-first, valuation-aware
+    # Composite ranking: consolidation-first with fundamental quality
+    results_df = fundamental_quick_screen(results_df)
+    fundamental_q = results_df.get("fundamental_quality_score", pd.Series(50.0, index=results_df.index))
     results_df['composite_score'] = (
-        results_df['consolidation_score'] * 0.40 +
+        results_df['consolidation_score'] * 0.35 +
         results_df['momentum_score'] * 0.15 +
         results_df['volume_quality_score'] * 0.18 +
         results_df['squeeze_readiness'] * 0.15 +
-        results_df['valuation_quality_score'] * 0.12
+        results_df['valuation_quality_score'] * 0.10 +
+        fundamental_q * 0.07
     )
     results_df["technical_selection_score"] = (
-        results_df["composite_score"] * 0.70 +
-        results_df["trend_emergence_score"] * 0.30
+        results_df["composite_score"] * 0.85 +
+        results_df["trend_emergence_score"] * 0.15
     )
     results_df = results_df.sort_values('composite_score', ascending=False)
 
@@ -922,7 +1044,7 @@ def save_results(df, output_file='screening_results.json'):
 def print_summary(df, top_n=30):
     """Print summary of screening results."""
     logger.info("="*100)
-    logger.info(f"TOP {top_n} 潜力成长股 - 初筛宽名单")
+    logger.info(f"TOP {top_n} 盘整候选股 - 初筛宽名单")
     logger.info("="*100)
 
     summary = df.head(top_n)[[

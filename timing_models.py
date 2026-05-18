@@ -58,7 +58,7 @@ def detect_bos(df: pd.DataFrame, swing_window: int = 10) -> bool:
     swing_indices = swings[swings].index
     if len(swing_indices) == 0:
         return False
-    last_swing_loc = int(swing_indices[-1])
+    last_swing_loc = df.index.get_loc(swing_indices[-1])
     if last_swing_loc >= len(df) - 1:
         return False
     swing_price = float(df["high"].iloc[last_swing_loc])
@@ -74,7 +74,7 @@ def detect_true_bos(df: pd.DataFrame, swing_window: int = 10) -> bool:
     swing_indices = swings[swings].index
     if len(swing_indices) < 2:
         return False
-    prev_swing_loc = int(swing_indices[-2])
+    prev_swing_loc = df.index.get_loc(swing_indices[-2])
     prev_swing_price = float(df["high"].iloc[prev_swing_loc])
     close = df["close"].astype(float)
     after_swing = close.iloc[prev_swing_loc + 1 :]
@@ -84,7 +84,8 @@ def detect_true_bos(df: pd.DataFrame, swing_window: int = 10) -> bool:
     if not broke:
         return False
     after_break = df.iloc[prev_swing_loc + 1 :].copy()
-    break_idx = int(after_break["close"].gt(prev_swing_price).idxmax())
+    break_label = after_break["close"].gt(prev_swing_price).idxmax()
+    break_idx = df.index.get_loc(break_label)
     atr_val = _atr(df).iloc[-1]
     if not np.isfinite(atr_val) or atr_val <= 0:
         return False
@@ -108,10 +109,9 @@ def detect_joc(df: pd.DataFrame, swing_window: int = 10) -> bool:
     swing_indices = swings[swings].index
     if len(swing_indices) == 0:
         return False
-    last_swing_loc = int(swing_indices[-1])
+    last_swing_loc = df.index.get_loc(swing_indices[-1])
     if last_swing_loc >= len(df) - 1:
         return False
-    swing_price = float(df["high"].iloc[last_swing_loc])
     bos = detect_bos(df, swing_window)
     if not bos:
         return False
@@ -181,7 +181,7 @@ def detect_gap_hold(df: pd.DataFrame, min_gap_pct: float = 0.005, min_confirmati
         if days_since < min_confirmation_days:
             continue
         gap_prev_close = float(prev_close.iloc[gap_loc])
-        subsequent_lows = low.iloc[gap_loc:]
+        subsequent_lows = low.iloc[gap_loc + 1:]
         if (subsequent_lows >= gap_prev_close * 0.999).all():
             return True
     return False
@@ -197,13 +197,15 @@ def _bos_recently(df: pd.DataFrame, lookback: int = 20, swing_window: int = 10) 
         return False
     close = df["close"].astype(float)
     last_idx = len(df) - 1
+    swing_positions = [df.index.get_loc(idx) for idx in swing_indices]
     for i in range(max(0, last_idx - lookback), last_idx + 1):
-        sh_idx = int(swing_indices[swing_indices < i][-1]) if any(swing_indices < i) else None
-        if sh_idx is None:
+        pos_swings = [p for p in swing_positions if p < i]
+        sh_pos = pos_swings[-1] if pos_swings else None
+        if sh_pos is None:
             continue
-        if sh_idx >= i:
+        if sh_pos >= i:
             continue
-        if float(close.iloc[i]) > float(df["high"].iloc[sh_idx]):
+        if float(close.iloc[i]) > float(df["high"].iloc[sh_pos]):
             return True
     return False
 
@@ -266,4 +268,5 @@ def compute_timing_signals(df: pd.DataFrame) -> Dict[str, object]:
         "timing_gap_hold": gap_hold,
         "timing_lps": lps,
         "timing_score": triggered / 7.0,
+        "structure_score": triggered / 7.0,  # defensive-only: no predictive power for returns
     }

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Trend Agent - A-share stock research and screening pipeline.
+Contrarian Agent - A-share mean-reversion and consolidation dip-buying research pipeline.
 
 Implements a 5-phase pipeline:
 1. Market Intelligence - Extract market themes
@@ -121,12 +121,9 @@ class StrategyConfig:
     audit_llm_timeout_max_retries: int = 5
     audit_llm_timeout_base_delay_sec: float = 5.0
     audit_llm_timeout_max_delay_sec: float = 90.0
-    valuation_mode: str = "blend"
-    valuation_outlier_percentile: float = 0.97
-    valuation_weight_screen: float = 0.12
     valuation_weight_alpha: float = 0.10
+    fundamental_weight_alpha: float = 0.14
     valuation_allow_premium: bool = True
-    deepseek_max_prompt_tokens: int = DEEPSEEK_MAX_PROMPT_TOKENS
     veto_context_target_tokens: int = VETO_CONTEXT_TARGET_TOKENS
     veto_chunk_target_tokens: int = VETO_CHUNK_TARGET_TOKENS
     veto_combine_target_tokens: int = VETO_COMBINE_TARGET_TOKENS
@@ -161,12 +158,9 @@ class StrategyConfig:
             audit_llm_timeout_max_retries=max(0, int(os.environ.get("AUDIT_LLM_TIMEOUT_MAX_RETRIES", "5"))),
             audit_llm_timeout_base_delay_sec=max(0.0, float(os.environ.get("AUDIT_LLM_TIMEOUT_BASE_DELAY_SEC", "5.0"))),
             audit_llm_timeout_max_delay_sec=max(0.0, float(os.environ.get("AUDIT_LLM_TIMEOUT_MAX_DELAY_SEC", "90.0"))),
-            valuation_mode=os.environ.get("VALUATION_MODE", "blend").strip().lower() or "blend",
-            valuation_outlier_percentile=max(0.5, min(0.999, float(os.environ.get("VALUATION_OUTLIER_PERCENTILE", "0.97")))),
-            valuation_weight_screen=max(0.0, float(os.environ.get("VALUATION_WEIGHT_SCREEN", "0.12"))),
             valuation_weight_alpha=max(0.0, float(os.environ.get("VALUATION_WEIGHT_ALPHA", "0.10"))),
+            fundamental_weight_alpha=max(0.0, float(os.environ.get("FUNDAMENTAL_WEIGHT_ALPHA", "0.14"))),
             valuation_allow_premium=os.environ.get("VALUATION_ALLOW_PREMIUM", "1").strip() in {"1", "true", "True", "YES", "yes"},
-            deepseek_max_prompt_tokens=max(1000, int(os.environ.get("DEEPSEEK_MAX_PROMPT_TOKENS", str(DEEPSEEK_MAX_PROMPT_TOKENS)))),
             veto_context_target_tokens=max(1000, int(os.environ.get("VETO_CONTEXT_TARGET_TOKENS", str(VETO_CONTEXT_TARGET_TOKENS)))),
             veto_chunk_target_tokens=max(1000, int(os.environ.get("VETO_CHUNK_TARGET_TOKENS", str(VETO_CHUNK_TARGET_TOKENS)))),
             veto_combine_target_tokens=max(1000, int(os.environ.get("VETO_COMBINE_TARGET_TOKENS", str(VETO_COMBINE_TARGET_TOKENS)))),
@@ -232,6 +226,9 @@ class AuditResult:
     business_quality_bullets: List[str] = None
     quarters_analyzed: int = 0
     financial_data_source: str = "none"
+    lifecycle_stage: str = "unknown"
+    lifecycle_subflavor: str = ""
+    fundamental_dimension_scores: Dict[str, float] = None
 
     def __post_init__(self):
         if self.positive_findings is None:
@@ -288,6 +285,9 @@ class ReportStockSection:
     business_quality_bullets: List[str]
     quarters_analyzed: int
     source_urls: List[str]
+    lifecycle_stage: str = "unknown"
+    lifecycle_subflavor: str = ""
+    fundamental_dimension_scores: Optional[Dict[str, float]] = None
     chart: Optional[ChartArtifact] = None
     audit_summaries: Optional[List[AuditResult]] = None
 
@@ -668,6 +668,7 @@ def summarize_veto_evidence_chunk(
     try:
         data = _invoke_json_chain(llm, system_prompt, payload)
     except Exception as exc:
+        logger.warning("LLM chunk summary failed for %s (theme %s): %s", name, theme, exc, exc_info=True)
         return {
             "chunk_verdict": "warn",
             "risk_findings": [],
@@ -733,6 +734,7 @@ def combine_veto_chunk_summaries(
     try:
         data = _invoke_json_chain(llm, system_prompt, payload)
     except Exception as exc:
+        logger.warning("LLM combine_chunk_summaries failed: %s", exc, exc_info=True)
         urls: List[str] = []
         for summary in summaries:
             for url in summary.get("source_urls", []) if isinstance(summary, dict) else []:
@@ -1484,18 +1486,21 @@ def run_python(code: str, context: Dict) -> str:
             try:
                 return head.to_markdown(index=False)
             except Exception:
+                logger.warning("to_markdown failed for DataFrame, falling back to to_string", exc_info=True)
                 return head.to_string(index=False)
         if isinstance(obj, pd.Series):
             head = obj.head(limit)
             try:
                 return head.to_frame(name="value").to_markdown()
             except Exception:
+                logger.warning("to_markdown failed for Series, falling back to to_string", exc_info=True)
                 return head.to_string()
         if isinstance(obj, (dict, list, tuple, set)):
             serializable = list(obj) if isinstance(obj, set) else obj
             try:
                 return truncate(json.dumps(serializable, ensure_ascii=False, default=str, indent=2), 2000)
             except Exception:
+                logger.warning("json.dumps failed in _normalize_python_obj, falling back to repr", exc_info=True)
                 return truncate(repr(obj), 2000)
         return truncate(repr(obj), 2000)
 
@@ -1583,7 +1588,7 @@ def run_python(code: str, context: Dict) -> str:
                 cutoff = date_series.max() - pd.Timedelta(days=max(1, int(days)))
                 df = df.loc[date_series >= cutoff].copy()
             except Exception:
-                pass
+                logger.warning("Date filtering failed in run_python tool, using full date range", exc_info=True)
         columns = [col for col in ["ts_code", "date", "open", "high", "low", "close", "volume", "turnover_rate", "amount"] if col in df.columns]
         if columns:
             df = df[columns]
@@ -1591,7 +1596,7 @@ def run_python(code: str, context: Dict) -> str:
             try:
                 df = df.sort_values("date", ascending=False)
             except Exception:
-                pass
+                logger.warning("sort_values('date') failed in run_python tool, returning unsorted", exc_info=True)
         return df.head(240)
 
     def show(obj: Any, limit: int = 8) -> str:
@@ -1948,6 +1953,7 @@ def run_duckdb_sql(sql: str, context: Dict[str, Any]) -> str:
         try:
             return head.to_markdown(index=False)
         except Exception:
+            logger.warning("DuckDB result to_markdown failed, falling back to to_string", exc_info=True)
             return head.to_string(index=False)
     except Exception as exc:
         logger.warning(f"DuckDB query failed: {exc}")
@@ -2193,7 +2199,7 @@ def phase1_market_intel(llm: BaseChatModel) -> List[ThemeItem]:
         [
             (
                 "system",
-                "你是A股游资策略师，遵循\"重势重质\"原则，提炼当前市场3-5个核心主线并给出关键词。",
+                "你是A股游资策略师，遵循\"重质\"原则，提炼当前市场3-5个核心主线并给出关键词。",
             ),
             (
                 "user",
@@ -2236,7 +2242,7 @@ def phase1_market_intel(llm: BaseChatModel) -> List[ThemeItem]:
                 [
                     (
                         "system",
-                        "你是A股游资策略师，遵循\"重势重质\"原则。你需要修正上一次题材抽取中的证据质量问题。",
+                        "你是A股游资策略师，遵循\"重质\"原则。你需要修正上一次题材抽取中的证据质量问题。",
                     ),
                     (
                         "user",
@@ -2384,8 +2390,8 @@ def phase2_quant_filter(themes: List[ThemeItem], config: Optional[StrategyConfig
         return pd.DataFrame()
     screen_df = ensure_valuation_columns(screen_df)
     theme_order_col = (
-        "momentum_score"
-        if "momentum_score" in screen_df.columns
+        "consolidation_score"
+        if "consolidation_score" in screen_df.columns
         else "composite_score"
         if "composite_score" in screen_df.columns
         else None
@@ -2512,13 +2518,15 @@ def phase2_quant_filter(themes: List[ThemeItem], config: Optional[StrategyConfig
                 valuation_stretch = theme_matched.get("valuation_stretch_score", pd.Series(50.0, index=theme_matched.index))
                 valuation_penalty = valuation_stretch / 100.0
                 trend_emergence = theme_matched.get("trend_emergence_score", pd.Series(0.0, index=theme_matched.index))
+                fundamental_quality = theme_matched.get("fundamental_quality_score", pd.Series(50.0, index=theme_matched.index))
                 theme_matched["alpha_rank_score"] = (
-                    theme_matched[momentum_col] * 0.30
+                    theme_matched[momentum_col] * 0.14
                     + theme_matched["theme_strength_score"] * 20.0
-                    + theme_matched[volume_col] * 0.15
-                    + theme_matched["composite_score"] * 0.10
-                    + trend_emergence * 0.10
-                    + valuation_quality * 0.20
+                    + theme_matched[volume_col] * 0.13
+                    + theme_matched["composite_score"] * 0.18
+                    + trend_emergence * 0.08
+                    + valuation_quality * 0.18
+                    + fundamental_quality * 0.13
                     - toplist_penalty * (config.toplist_penalty_weight * 10.0)
                     - valuation_penalty * 8.0
                 )
@@ -2739,6 +2747,9 @@ def _empty_business_quality_snapshot(summary: str, bullets: Optional[List[str]] 
         "business_quality_summary": summary,
         "business_quality_bullets": bullets or ["财务数据不足，暂无法完成12季度经营趋势分析。"],
         "financial_data_source": "none",
+        "lifecycle_stage": "unknown",
+        "lifecycle_subflavor": "",
+        "fundamental_dimension_scores": {},
     }
 
 
@@ -2831,7 +2842,13 @@ def load_financial_quarters_from_tushare(ts_code: str, max_quarters: int = 12) -
         (
             "fina_indicator",
             {
-                "fields": "ts_code,end_date,grossprofit_margin",
+                "fields": "ts_code,end_date,roe,roa,debt_to_assets,current_ratio,quick_ratio",
+            },
+        ),
+        (
+            "balancesheet",
+            {
+                "fields": "ts_code,end_date,total_assets,total_liab,total_hldr_eqy_exc_min_int",
             },
         ),
     ]
@@ -2951,119 +2968,50 @@ def analyze_business_quality_from_df(
     max_quarters: int = 12,
     source_note: Optional[str] = None,
     financial_data_source: str = "local",
+    industry: str = "",
 ) -> Dict[str, Any]:
-    """Analyze quarter financial data from a prepared DataFrame."""
+    """Analyze quarter financial data with lifecycle-aware fundamental quality scoring."""
     if df is None or df.empty:
         return _empty_business_quality_snapshot("未找到本地季度财报数据，业务质量分析保持中性。")
 
-    revenue = _select_metric(df, ["revenue", "total_revenue", "total_operat_income", "operating_revenue", "operate_income"])
-    gross_profit = _select_metric(df, ["gross_profit", "grossprofit", "gross_profit_total"])
-    gross_margin = _select_metric(df, ["gross_margin", "grossprofit_margin", "gross_margin_rate", "gp_margin"])
-    net_income = _select_metric(df, ["net_income", "n_income", "n_income_attr_p", "profit_to_gr", "netprofit"])
-    op_cashflow = _select_metric(df, ["operate_cashflow", "n_cashflow_act", "net_cash_flows_oper_act", "oper_cash_flow"])
+    # Delegate to lifecycle-aware fundamental quality module
+    try:
+        from fundamental_quality import classify_lifecycle, compute_fundamental_quality
 
-    if gross_margin.isna().all() and not gross_profit.isna().all() and not revenue.isna().all():
-        gross_margin = (gross_profit / revenue.replace(0, np.nan)) * 100.0
+        lifecycle = classify_lifecycle(df, industry)
+        result = compute_fundamental_quality(df, lifecycle)
 
-    quarter_count = int(len(df))
-    recent_n = max(2, min(4, quarter_count // 2 if quarter_count > 2 else quarter_count))
+        quarter_count = int(len(df))
+        bullets = list(result.get("bullets", []))
+        if quarter_count < max_quarters:
+            bullets.append(f"本次仅基于最近{quarter_count}个季度进行分析，可比历史不足{max_quarters}个季度。")
+        if source_note:
+            bullets.append(source_note)
 
-    def trend_delta(series: pd.Series) -> Optional[float]:
-        valid = pd.to_numeric(series, errors="coerce").dropna()
-        if len(valid) < 2:
-            return None
-        recent = float(valid.tail(recent_n).mean())
-        prior = float(valid.head(recent_n).mean())
-        scale = max(abs(prior), abs(recent), 1.0)
-        return (recent - prior) / scale
-
-    rev_delta = trend_delta(revenue)
-    margin_delta = trend_delta(gross_margin)
-    cash_delta = trend_delta(op_cashflow)
-    income_delta = trend_delta(net_income)
-
-    score = 50.0
-    bullets: List[str] = []
-    availability_notes: List[str] = []
-
-    if revenue.dropna().shape[0] >= 2 and rev_delta is not None:
-        score += max(-18.0, min(18.0, rev_delta * 35.0))
-        rev_label = "改善" if rev_delta > 0.05 else "走弱" if rev_delta < -0.05 else "平稳"
-        bullets.append(f"营收趋势{rev_label}，最近{recent_n}个季度相较早期样本变化{rev_delta * 100:.1f}%。")
-    else:
-        availability_notes.append("营收数据不足")
-
-    if gross_margin.dropna().shape[0] >= 2 and margin_delta is not None:
-        score += max(-10.0, min(10.0, margin_delta * 25.0))
-        margin_label = "改善" if margin_delta > 0.03 else "承压" if margin_delta < -0.03 else "平稳"
-        bullets.append(f"盈利质量{margin_label}，毛利率/毛利水平呈现{margin_label}趋势。")
-    else:
-        availability_notes.append("毛利质量指标有限")
-
-    if op_cashflow.dropna().shape[0] >= 2 and cash_delta is not None:
-        score += max(-12.0, min(12.0, cash_delta * 25.0))
-        cash_label = "改善" if cash_delta > 0.05 else "承压" if cash_delta < -0.05 else "平稳"
-        bullets.append(f"经营现金流{cash_label}，现金转化趋势可跟踪。")
-    else:
-        availability_notes.append("经营现金流数据不足")
-
-    if net_income.dropna().shape[0] >= 2 and income_delta is not None:
-        score += max(-10.0, min(10.0, income_delta * 22.0))
-        latest_income = float(net_income.dropna().iloc[-1])
-        early_income = float(net_income.dropna().iloc[0])
-        if latest_income < 0:
-            if latest_income > early_income:
-                bullets.append("公司仍可能处于亏损阶段，但亏损收窄或经营杠杆改善，不因未盈利直接否定。")
-                score += 6.0
-            else:
-                bullets.append("公司仍处亏损阶段，且亏损改善幅度有限，需要继续观察兑现路径。")
-                score -= 4.0
-        elif income_delta > 0.03:
-            bullets.append("净利润/归母利润呈改善趋势，利润兑现能力增强。")
-    else:
-        availability_notes.append("净利润趋势样本有限")
-
-    if rev_delta is not None and rev_delta < -0.08 and (margin_delta is not None and margin_delta < -0.04) and (cash_delta is not None and cash_delta < -0.08):
-        score -= 12.0
-        bullets.append("营收、盈利质量与经营现金流同步走弱，基本面趋势偏弱。")
-
-    score = max(0.0, min(100.0, score))
-    label = business_quality_label(score)
-    if quarter_count < max_quarters:
-        bullets.append(f"本次仅基于最近{quarter_count}个季度进行分析，可比历史不足12个季度。")
-    if source_note:
-        bullets.append(source_note)
-    if availability_notes:
-        bullets.append("部分指标缺失：" + "、".join(dict.fromkeys(availability_notes)) + "。")
-    bullets = bullets[:4] if bullets else ["季度财报可用字段有限，业务质量判断保持中性。"]
-
-    summary_bits = []
-    if rev_delta is not None:
-        summary_bits.append("营收改善" if rev_delta > 0.05 else "营收走弱" if rev_delta < -0.05 else "营收平稳")
-    if margin_delta is not None:
-        summary_bits.append("盈利质量改善" if margin_delta > 0.03 else "盈利质量承压" if margin_delta < -0.03 else "盈利质量平稳")
-    if cash_delta is not None:
-        summary_bits.append("现金流改善" if cash_delta > 0.05 else "现金流承压" if cash_delta < -0.05 else "现金流平稳")
-    summary = "；".join(summary_bits[:3]) if summary_bits else "财务字段有限，业务质量维持中性判断。"
-
-    return {
-        "quarters_analyzed": quarter_count,
-        "business_quality_score": round(score, 1),
-        "business_quality_label": label,
-        "business_quality_summary": summary,
-        "business_quality_bullets": bullets,
-        "financial_data_source": financial_data_source,
-    }
+        return {
+            "quarters_analyzed": quarter_count,
+            "business_quality_score": result["fundamental_quality_score"],
+            "business_quality_label": result["label"],
+            "business_quality_summary": result["summary"],
+            "business_quality_bullets": bullets[:5],
+            "financial_data_source": financial_data_source,
+            "lifecycle_stage": lifecycle.get("stage", "unknown"),
+            "lifecycle_subflavor": lifecycle.get("subflavor", ""),
+            "fundamental_dimension_scores": result.get("dimension_scores", {}),
+        }
+    except ImportError:
+        logger.warning("fundamental_quality module not available, using neutral business quality")
+        return _empty_business_quality_snapshot("基本面质量模块未加载，业务质量分析保持中性。")
 
 
-def analyze_business_quality_with_fallbacks(ts_code: str, name: str, max_quarters: int = 12) -> Dict[str, Any]:
+def analyze_business_quality_with_fallbacks(ts_code: str, name: str, max_quarters: int = 12, industry: str = "") -> Dict[str, Any]:
     """Analyze business quality using local data first, then Tushare, then web-search fallback."""
     local_df = load_financial_quarters(ts_code, max_quarters=max_quarters)
     if not local_df.empty:
-        return analyze_business_quality_from_df(local_df, max_quarters=max_quarters, financial_data_source="local")
+        return analyze_business_quality_from_df(local_df, max_quarters=max_quarters, financial_data_source="local", industry=industry)
     tushare_df = load_financial_quarters_from_tushare(ts_code, max_quarters=max_quarters)
     if not tushare_df.empty:
-        return analyze_business_quality_from_df(tushare_df, max_quarters=max_quarters, financial_data_source="tushare")
+        return analyze_business_quality_from_df(tushare_df, max_quarters=max_quarters, financial_data_source="tushare", industry=industry)
     web_df = load_financial_quarters_from_web(ts_code, name, max_quarters=max_quarters)
     if not web_df.empty:
         return analyze_business_quality_from_df(
@@ -3071,6 +3019,7 @@ def analyze_business_quality_with_fallbacks(ts_code: str, name: str, max_quarter
             max_quarters=max_quarters,
             source_note="季度数据来自巨潮资讯搜索结果抽取，精度低于本地结构化财报表。",
             financial_data_source="web",
+            industry=industry,
         )
     return _empty_business_quality_snapshot("本地、Tushare 与Web检索均未获得可用季度财报数据，业务质量分析保持中性。")
 
@@ -3085,6 +3034,9 @@ def aggregate_business_quality(stock_audits: List[AuditResult]) -> Dict[str, Any
             "business_quality_bullets": ["财务数据不足，暂无法完成12季度经营趋势分析。"],
             "quarters_analyzed": 0,
             "financial_data_source": "none",
+            "lifecycle_stage": "unknown",
+            "lifecycle_subflavor": "",
+            "fundamental_dimension_scores": {},
         }
     best = max(stock_audits, key=lambda a: (a.quarters_analyzed, a.business_quality_score))
     bullets: List[str] = []
@@ -3099,6 +3051,9 @@ def aggregate_business_quality(stock_audits: List[AuditResult]) -> Dict[str, Any
         "business_quality_bullets": bullets[:4] or ["财务数据不足，暂无法完成12季度经营趋势分析。"],
         "quarters_analyzed": int(best.quarters_analyzed),
         "financial_data_source": str(best.financial_data_source or "none"),
+        "lifecycle_stage": str(best.lifecycle_stage or "unknown"),
+        "lifecycle_subflavor": str(best.lifecycle_subflavor or ""),
+        "fundamental_dimension_scores": best.fundamental_dimension_scores or {},
     }
 
 
@@ -3241,9 +3196,13 @@ def rank_candidates_for_alpha(
         sig = signals.get(ts_code, {})
         af = audit_features(ts_code)
         timing_score = float(sig.get("timing_score", 0.0))
-        turnover_mult = float(sig.get("turnover_mult", row.get("volume_boost", 1.0)) or 1.0)
+        _raw_vol = sig.get("turnover_mult")
+        if _raw_vol is None:
+            _raw_vol = row.get("volume_boost")
+        turnover_mult = float(_raw_vol) if _raw_vol is not None else 1.0
         volume_quality = clamp01(1.0 - abs(turnover_mult - 1.8) / 1.8)
-        ma_spread = float(row.get("ma_spread", 0.3) or 0.3)
+        _raw_ma = row.get("ma_spread")
+        ma_spread = float(_raw_ma) if _raw_ma is not None else 0.3
         ma_comp = clamp01(1.0 - ma_spread / 0.30)
         theme_strength = clamp01(float(row.get("theme_strength_score", 0.0)))
         valuation_quality = clamp01(float(row.get("valuation_quality_score", 50.0)) / 100.0)
@@ -3259,7 +3218,10 @@ def rank_candidates_for_alpha(
 
         # IC-validated sub-scores: mean reversion dominates, consolidation wins
         atr_pct_sig = float(sig.get("atr_pct", 0.05))
-        low_vol_score = clamp01(1.0 - atr_pct_sig / 0.08)
+        if atr_pct_sig < 0.001:
+            low_vol_score = 0.5  # neutral for effectively zero ATR (dead ticker)
+        else:
+            low_vol_score = clamp01(1.0 - atr_pct_sig / 0.08)
         price_pos_sig = float(sig.get("price_position_60d", 0.5))
         mid_range_score = clamp01(1.0 - abs(price_pos_sig - 0.3) / 0.5)
         lps_pullback_sig = float(sig.get("lps_pullback", 0.0))
@@ -3275,11 +3237,11 @@ def rank_candidates_for_alpha(
 
         score_01 = (
             0.10 * consolidation_alpha +
-            0.17 * volume_quality +
-            0.16 * ma_comp +
-            0.15 * theme_strength +
+            0.15 * volume_quality +
+            0.14 * ma_comp +
+            0.14 * theme_strength +
             config.valuation_weight_alpha * valuation_quality +
-            0.08 * business_quality +
+            config.fundamental_weight_alpha * business_quality +
             0.10 * finding_score +
             0.07 * catalyst_score +
             0.06 * source_quality +
@@ -3423,7 +3385,8 @@ def phase3_deep_audit(
 
             # Get capital signal for this theme
             capital_signal = theme_capital_map.get(theme, "")
-            business_snapshot = analyze_business_quality_with_fallbacks(str(row["ts_code"]), name)
+            industry = str(row.get("industry", ""))
+            business_snapshot = analyze_business_quality_with_fallbacks(str(row["ts_code"]), name, industry=industry)
 
             # ============ PASS 1: Opportunity Discovery ============
             logger.debug(f"Opportunity discovery pass: stock={name}")
@@ -4040,6 +4003,9 @@ def phase3_deep_audit(
                     business_quality_bullets=list(business_snapshot["business_quality_bullets"]),
                     quarters_analyzed=int(business_snapshot["quarters_analyzed"]),
                     financial_data_source=str(business_snapshot.get("financial_data_source", "none")),
+                    lifecycle_stage=str(business_snapshot.get("lifecycle_stage", "unknown")),
+                    lifecycle_subflavor=str(business_snapshot.get("lifecycle_subflavor", "")),
+                    fundamental_dimension_scores=business_snapshot.get("fundamental_dimension_scores"),
                 )
             )
             logger.debug(f"Research done: stock={name} theme={theme} verdict={verdict} findings={len(positive_findings)}")
@@ -4403,7 +4369,7 @@ def compute_signals(candidates: pd.DataFrame) -> Dict[str, Dict[str, object]]:
         ma20_series = df["close"].rolling(20).mean()
         ma20_now = float(ma20_series.iloc[-1])
         ma20_5d_ago = float(ma20_series.iloc[-6]) if len(ma20_series) >= 6 else ma20_now
-        atr_val_now = float(atr_series.iloc[-1]) if atr_now is not None else (high_60d - low_60d) * 0.02
+        atr_val_now = float(atr_series.iloc[-1]) if atr_now is not None else (high_60d - low_60d) * 0.05
 
         # atr_pct: volatility as % of price (strongest negative IC)
         atr_pct = atr_val_now / (close_price + EPSILON) if atr_val_now > 0 else 0.0
@@ -4418,7 +4384,7 @@ def compute_signals(candidates: pd.DataFrame) -> Dict[str, Dict[str, object]]:
         bos_20d = False
         if len(df) >= 30:
             for i in range(max(0, len(df) - 21), len(df)):
-                if float(df["close"].iloc[i]) > float(df["high"].iloc[:i].max()):
+                if float(df["close"].iloc[i]) > float(df["high"].iloc[max(0, i - 60):i].max()):
                     bos_20d = True
                     break
 
@@ -4509,7 +4475,7 @@ def phase5_report(
         audit_map.setdefault(audit.ts_code, []).append(audit)
 
     lines = [
-        "# A股趋势跟踪研报",
+        "# A股均值回归研报",
         "",
         "## 【市场风向标】",
     ]
@@ -4868,7 +4834,7 @@ def build_core_table_rows(candidates: pd.DataFrame, audits: List[AuditResult], t
 
 
 _MARKET_OVERVIEW_SYSTEM_PROMPT = (
-    "你是资深A股投研团队负责人，遵循\"重势、通过滤、待时机\"理念。\n"
+    "你是资深A股投研团队负责人，遵循\"重质、通过滤、待回踩\"理念。\n"
     "只返回严格JSON，不要Markdown，不要代码块。\n"
     "输出格式："
     "{\"themes\":[{\"name\":\"主题名称\",\"validation_status\":\"confirmed|web_only|capital_only|weak\","
@@ -4878,7 +4844,7 @@ _MARKET_OVERVIEW_SYSTEM_PROMPT = (
 )
 
 _STOCK_SECTION_SYSTEM_PROMPT_TEMPLATE = (
-    "你是资深A股投研分析师，遵循\"重势、通过滤、待时机\"理念。\n"
+    "你是资深A股投研分析师，遵循\"重质、通过滤、待回踩\"理念。\n"
     "只返回严格JSON，不要Markdown，不要代码块。\n"
     "如需补充信息，可先返回工具调用："
     "{\"tool\":\"web_search|duckdb|python\",\"input\":\"...\"}\n"
@@ -4909,7 +4875,7 @@ _STOCK_SECTION_SYSTEM_PROMPT_TEMPLATE = (
     "\"technical_analysis\":[\"技术分析\"],\"capital_validation\":[\"资金验证\"],"
     "\"trade_plan\":[\"交易建议\"],\"risks\":[\"风险提示\"],"
     "\"source_urls\":[\"https://...\"],\"research_depth\":\"standard|deep\"}}\n"
-    "要求：真实URL；机会先于风险；突出箱体上沿、温和放量、均线收敛与资金验证。"
+    "要求：真实URL；机会先于风险；突出箱体中低位、回踩信号、温和放量与均线收敛。"
 )
 
 
@@ -4999,7 +4965,7 @@ def _normalize_recommendation(value: Any) -> tuple[str, str]:
     text = str(value or "").strip().lower()
     if text in {"strong_buy", "strongbuy", "强烈推荐"} or "强烈" in text:
         return "strong_buy", "强烈推荐"
-    if text in {"buy", "推荐"} or text == "pass":
+    if text in {"buy", "推荐"}:
         return "buy", "推荐"
     if text in {"avoid", "回避"} or text == "fail":
         return "avoid", "回避"
@@ -5149,6 +5115,10 @@ def _build_stock_context(
                 "business_quality_bullets": list(a.business_quality_bullets or []),
                 "quarters_analyzed": a.quarters_analyzed,
                 "financial_data_source": a.financial_data_source,
+                "lifecycle_stage": str(a.lifecycle_stage or "unknown"),
+                "lifecycle_subflavor": str(a.lifecycle_subflavor or ""),
+                "fundamental_dimension_scores": a.fundamental_dimension_scores or {},
+                "research_depth": a.research_depth,
                 "positive_findings": [
                     {
                         "category": f.category,
@@ -5291,16 +5261,16 @@ def _fallback_stock_section(
     verdicts = {normalize_verdict(a.verdict) for a in stock_audits}
     if "fail" in verdicts:
         recommendation, label = ("avoid", "回避")
-    elif bool(signal and signal.get("ready_to_break")):
+    elif bool(signal and (signal.get("lps_pullback") or 0) > 0 and float(signal.get("price_position_60d") or 0.5) < 0.5):
         recommendation, label = ("buy", "推荐")
     else:
         recommendation, label = ("watch", "观察")
     spike_note = "、".join(chart.spike_dates[:6]) if chart and chart.spike_dates else "未检测到明显量能异动"
     timing_names = {
-        "timing_bos": "突破结构 (BOS)", "timing_true_bos": "真突破确认 (True BOS)",
-        "timing_joc": "强势突破 (JOC)", "timing_poc": "筹码轴心 (POC)",
+        "timing_bos": "结构突破 (BOS)", "timing_true_bos": "二次突破确认 (True BOS)",
+        "timing_joc": "放量突破 (JOC)", "timing_poc": "筹码轴心 (POC)",
         "timing_poc_retest": "POC回踩确认", "timing_gap_hold": "缺口不回补",
-        "timing_lps": "最后支撑 (LPS)",
+        "timing_lps": "回踩支撑 (LPS)",
     }
     triggered_timing = [
         name for key, name in timing_names.items()
@@ -5327,6 +5297,13 @@ def _fallback_stock_section(
         positive_findings.extend(audit.positive_findings or [])
         growth_catalysts.extend(audit.growth_catalysts or [])
     business_quality = aggregate_business_quality(stock_audits)
+    lifecycle_labels = {"growth": "成长期", "mature": "成熟期", "cyclical": "周期型", "transitional": "转型期", "declining": "衰退期", "unknown": "未知"}
+    lifecycle_stage_str = str(business_quality.get("lifecycle_stage", ""))
+    lifecycle_line = f"生命周期：{lifecycle_labels.get(lifecycle_stage_str, lifecycle_stage_str)}" if lifecycle_stage_str else ""
+    dimension_scores = business_quality.get("fundamental_dimension_scores", {}) or {}
+    dim_labels = {"profitability": "盈利", "growth_quality": "成长", "financial_health": "财务健康", "earnings_quality": "盈利质量"}
+    dim_parts = [f"{dim_labels.get(k, k)}{int(v)}" for k, v in dimension_scores.items() if v]
+    dimension_line = f"质量维度：{' | '.join(dim_parts)}" if dim_parts else ""
     return ReportStockSection(
         ts_code=ts_code,
         name=name,
@@ -5337,15 +5314,17 @@ def _fallback_stock_section(
         summary=(stock_audits[0].rationale if stock_audits else "结构化回退内容，供HTML报告兜底渲染。"),
         investment_logic=[
             f"题材归属：{', '.join(matched[:3]) if matched else '技术形态入选'}",
-            f"量能与位置：放量倍数 {_coerce_float((signal or {}).get('turnover_mult'), 0.0):.2f}，ready_to_break={bool((signal or {}).get('ready_to_break'))}",
+            lifecycle_line,
+            dimension_line,
+            f"回踩深度：{_coerce_float((signal or {}).get('lps_pullback'), 0.0):.2f} ATR，箱体位置：{_coerce_float((signal or {}).get('price_position_60d'), 0.5) * 100:.0f}%",
         ],
         positive_findings=positive_findings[:5],
         growth_catalysts=growth_catalysts[:5],
         technical_analysis=technical_analysis,
         capital_validation=capital_validation,
         trade_plan=[
-            "等待箱体上沿附近的确认信号再考虑分批介入。",
-            "若放量失败或主线转弱，优先降低仓位。",
+            "在箱体中低位、回踩确认信号出现时考虑分批介入。",
+            "若价格回到箱体上沿或量能异常放大，考虑减仓。",
         ],
         risks=risks,
         business_quality_score=float(business_quality["business_quality_score"]),
@@ -5353,6 +5332,9 @@ def _fallback_stock_section(
         business_quality_summary=str(business_quality["business_quality_summary"]),
         business_quality_bullets=list(business_quality["business_quality_bullets"]),
         quarters_analyzed=int(business_quality["quarters_analyzed"]),
+        lifecycle_stage=str(business_quality.get("lifecycle_stage", "unknown")),
+        lifecycle_subflavor=str(business_quality.get("lifecycle_subflavor", "")),
+        fundamental_dimension_scores=business_quality.get("fundamental_dimension_scores", {}),
         source_urls=_normalize_source_urls([a.sources for a in stock_audits]),
         chart=chart,
         audit_summaries=list(stock_audits),
@@ -5405,6 +5387,9 @@ def _normalize_stock_section_payload(
         business_quality_summary=_clean_bullet_text(str(payload.get("business_quality_summary", business_quality["business_quality_summary"])).strip()) or str(business_quality["business_quality_summary"]),
         business_quality_bullets=_coerce_lines(payload.get("business_quality_bullets")) or list(business_quality["business_quality_bullets"]),
         quarters_analyzed=int(payload.get("quarters_analyzed", business_quality["quarters_analyzed"]) or 0),
+        lifecycle_stage=str(payload.get("lifecycle_stage")) if payload.get("lifecycle_stage") is not None else str(business_quality.get("lifecycle_stage", "unknown")),
+        lifecycle_subflavor=str(payload.get("lifecycle_subflavor")) if payload.get("lifecycle_subflavor") is not None else str(business_quality.get("lifecycle_subflavor", "")),
+        fundamental_dimension_scores=payload.get("fundamental_dimension_scores") if payload.get("fundamental_dimension_scores") is not None else business_quality.get("fundamental_dimension_scores", {}),
         source_urls=source_urls,
         chart=chart,
         audit_summaries=list(stock_audits),
@@ -5623,7 +5608,7 @@ def _build_report_model(
         tool_stats.get("python_after_duckdb_failure", 0),
     )
     return ReportModel(
-        title="A股趋势跟踪研报",
+        title="A股均值回归研报",
         generated_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         theme_overviews=overview_items,
         core_table_rows=core_rows,
@@ -6124,7 +6109,7 @@ def main() -> None:
     # Phase 4
     logger.info("Phase 4: Visualization...")
     chart_artifacts = phase4_plot_charts(candidates)
-    signals = compute_signals(candidates)
+    # signals already computed above — reused here
 
     # Phase 5
     logger.info("Phase 5: Report Generation...")

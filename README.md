@@ -77,11 +77,18 @@ flowchart TD
 
     subgraph "IC-Calibrated Alpha Score"
         CA["0.10 × 盘整Alpha<br/>低波动 + 区间中低位 + 回踩"]
-        VQ["0.17 × 量能质量"]
-        MC["0.16 × 均线粘合"]
-        TS["0.15 × 题材强度"]
+        VQ["0.15 × 量能质量"]
+        MC["0.14 × 均线粘合"]
+        TS["0.14 × 题材强度"]
+        FQ["0.14 × 基本面质量<br/>生命周期 + 四维度"]
         VA["0.10 × 估值"]
+        FS["0.10 × 机会发现"]
+        CS["0.07 × 催化剂"]
+        SQ["0.06 × 信源质量"]
+        AS["0.07 × 审计安全"]
         VP["-0.08 × 波动惩罚<br/>高ATR + 宽区间"]
+        OP["-0.12 × 拥挤惩罚"]
+        VS["-0.10~0.18 × 估值溢价"]
         PR["+0.05 × 回踩奖励<br/>BOS确认 + 回踩MA20"]
     end
 ```
@@ -140,11 +147,12 @@ queries = [
 
 | 成分 | 权重 | 验证来源 |
 |------|:---:|------|
-| **盘整质量** | **40%** | ✓ 低波动+窄区间 IC显著为正 |
+| **盘整质量** | **35%** | ✓ 低波动+窄区间 IC显著为正 |
 | 动量信号 | 15% | ⚠ 从25%下调，动量IC为负 |
 | 量能质量 | 18% | 温和放量 > 激进放量 |
 | 挤压准备 | 15% | 低波动挤压 → 变盘 |
-| 估值质量 | 12% | 低估值 → 正向 |
+| 估值质量 | 10% | 低估值 → 正向 |
+| 基本面质量 | 7% | 生命周期感知 + 四维度评分 |
 
 ### 动量评分修正
 
@@ -162,12 +170,8 @@ queries = [
 ```sql
 SELECT *
 FROM screen
-WHERE consolidation_score >= 70
-  AND ma_spread <= 0.15
-  AND ma_spread_std <= 0.03
-  AND volume_boost >= 1.2
-  AND volume_boost <= 3.0
-ORDER BY composite_score DESC
+WHERE consolidation_score >= 50
+ORDER BY technical_selection_score DESC
 ```
 
 ### Gemma 语义题材匹配
@@ -262,19 +266,19 @@ consolidation_alpha = (
 
 alpha_rank_score = (
     0.10 * consolidation_alpha   # 盘整Alpha（取代原timing_score）
-    + 0.17 * volume_quality
-    + 0.16 * ma_comp
-    + 0.15 * theme_strength
+    + 0.15 * volume_quality
+    + 0.14 * ma_comp
+    + 0.14 * theme_strength
     + 0.10 * valuation
-    + 0.08 * business_quality
+    + 0.14 * business_quality    # 生命周期感知基本面质量
     + 0.10 * finding_score
     + 0.07 * catalyst_score
     + 0.06 * source_quality
     + 0.07 * audit_safe
     - 0.12 * overcrowding_penalty
-    - 0.10 * valuation_stretch
-    - 0.08 * volatility_penalty    # 新增：高波动惩罚
-    + 0.05 * pullback_reward       # 新增：回踩奖励（仅BOS确认时）
+    - 0.10 * valuation_stretch   # (0.18 when valuation_allow_premium=false)
+    - 0.08 * volatility_penalty  # 高波动惩罚
+    + 0.05 * pullback_reward     # 回踩奖励（仅BOS确认时）
 )
 ```
 
@@ -364,6 +368,10 @@ REGULATORY_MAX_AGE_DAYS=730
 THEME_MATCH_POLICY=conservative
 MAX_NAMES_PER_THEME=4
 MAX_NAMES_PER_INDUSTRY=4
+FUNDAMENTAL_WEIGHT_ALPHA=0.14
+FUNDAMENTAL_PRE_SCREEN_ENABLED=1
+VALUATION_WEIGHT_ALPHA=0.10
+VALUATION_WEIGHT_SCREEN=0.12
 ```
 
 ---
@@ -442,6 +450,8 @@ python trend_agent.py
 | `screen_growth_stocks.py` | 股票筛选逻辑与IC校准技术分析 |
 | `deep_researcher.py` | AI研究引擎（Zhipu搜索 + 查询规划） |
 | `timing_models.py` | 7个威科夫/道氏择时检测器（防御性使用） |
+| `fundamental_quality.py` | 生命周期感知的基本面质量评分 |
+| `utils.py` | 共享工具（龙虎榜、JSON解析等） |
 | `zhihu_clean_analysis.py` | 清洗后IC分析（无前视偏差，多进程） |
 | `zhihu_leak_audit.py` | 8点前视偏差审计 |
 | `validation/cli.py` | 验证流水线CLI |

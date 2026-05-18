@@ -130,17 +130,17 @@ def test_obv_features_normalize_accumulation_and_detect_divergence():
 def test_momentum_uses_normalized_obv_not_raw_positive_sign():
     latest = pd.Series({"close": 10.0})
     weak = screen_growth_stocks.compute_momentum_score(
-        pd.DataFrame(), latest, 9.0, 8.0, 7.0, 6.0, 11.0, 9.0, 1.0,
+        latest, 9.0, 8.0, 7.0, 6.0, 11.0, 9.0, 1.0,
         adx=30.0, adx_slope=0.0, obv_slope=1000.0, vwap_ratio=1.0,
         obv_slope_norm=0.01,
     )
     strong = screen_growth_stocks.compute_momentum_score(
-        pd.DataFrame(), latest, 9.0, 8.0, 7.0, 6.0, 11.0, 9.0, 1.0,
+        latest, 9.0, 8.0, 7.0, 6.0, 11.0, 9.0, 1.0,
         adx=30.0, adx_slope=0.0, obv_slope=1000.0, vwap_ratio=1.0,
         obv_slope_norm=0.15,
     )
     negative = screen_growth_stocks.compute_momentum_score(
-        pd.DataFrame(), latest, 9.0, 8.0, 7.0, 6.0, 11.0, 9.0, 1.0,
+        latest, 9.0, 8.0, 7.0, 6.0, 11.0, 9.0, 1.0,
         adx=30.0, adx_slope=0.0, obv_slope=-1000.0, vwap_ratio=1.0,
         obv_slope_norm=-0.05,
     )
@@ -191,7 +191,7 @@ def test_trend_emergence_uses_prior_60d_high_excluding_today():
     assert features["near_breakout"] is True
 
 
-def test_trend_emergence_scores_active_setup_above_flat_stock():
+def test_trend_emergence_scores_consolidation_breakout_penalty():
     flat = _trend_feature_df([10.0] * 80, volumes=[1000.0] * 80)
     active_closes = [10.0] * 59 + [10.2, 10.3, 10.5, 10.8, 11.0, 11.2, 11.4, 11.5, 11.6, 11.7, 11.9, 12.0, 12.1, 12.2, 12.25, 12.3, 12.4, 12.45, 12.5, 12.55, 12.6]
     active_volumes = [1000.0] * 60 + [2400.0] * 20
@@ -199,11 +199,16 @@ def test_trend_emergence_scores_active_setup_above_flat_stock():
     active_highs[-1] = 12.7
     active = _trend_feature_df(active_closes, volumes=active_volumes, highs=active_highs)
 
-    flat_score = screen_growth_stocks.compute_trend_emergence_features(flat)["trend_emergence_score"]
-    active_score = screen_growth_stocks.compute_trend_emergence_features(active, obv_accumulation_score=80.0)["trend_emergence_score"]
+    flat_features = screen_growth_stocks.compute_trend_emergence_features(flat)
+    active_features = screen_growth_stocks.compute_trend_emergence_features(active, obv_accumulation_score=80.0)
 
-    assert active_score > flat_score
-    assert active_score >= 60.0
+    # Active stock with fresh_breakout gets 0 breakout points (already left the station)
+    assert active_features["fresh_breakout"] is True
+    assert active_features["trend_emergence_score"] < 60.0
+
+    # Flat consolidating stock near breakout gets some credit, reasonable mid-range score
+    assert flat_features["near_breakout"] is True
+    assert 5.0 <= flat_features["trend_emergence_score"] <= 30.0
 
 
 def test_trend_emergence_overextended_return_does_not_get_max_return_credit():
@@ -324,7 +329,7 @@ def test_screen_all_stocks_outputs_trend_emergence_columns(monkeypatch, tmp_path
         "technical_selection_score",
     ]:
         assert col in out.columns
-    assert row["technical_selection_score"] == row["composite_score"] * 0.70 + row["trend_emergence_score"] * 0.30
+    assert row["technical_selection_score"] == row["composite_score"] * 0.85 + row["trend_emergence_score"] * 0.15
 
 
 def test_compute_signals_merges_candidate_technical_context(monkeypatch):
@@ -2751,7 +2756,7 @@ def test_rank_candidates_for_alpha_prefers_reasonable_valuation():
 
 
 def test_phase3_deep_audit_feeds_opportunity_followup_results_back_to_llm(monkeypatch, tmp_path):
-    monkeypatch.setattr(trend_agent, "analyze_business_quality_with_fallbacks", lambda ts_code, name, max_quarters=12: {
+    monkeypatch.setattr(trend_agent, "analyze_business_quality_with_fallbacks", lambda ts_code, name, max_quarters=12, industry="": {
         "quarters_analyzed": 4,
         "business_quality_score": 58.0,
         "business_quality_label": "中性",
@@ -2854,7 +2859,7 @@ def test_phase3_deep_audit_feeds_opportunity_followup_results_back_to_llm(monkey
 
 
 def test_phase3_deep_audit_opportunity_llm_failure_falls_back_to_local_extraction(monkeypatch, tmp_path):
-    monkeypatch.setattr(trend_agent, "analyze_business_quality_with_fallbacks", lambda ts_code, name, max_quarters=12: {
+    monkeypatch.setattr(trend_agent, "analyze_business_quality_with_fallbacks", lambda ts_code, name, max_quarters=12, industry="": {
         "quarters_analyzed": 4,
         "business_quality_score": 58.0,
         "business_quality_label": "中性",
@@ -2915,7 +2920,7 @@ def test_phase3_deep_audit_opportunity_llm_failure_falls_back_to_local_extractio
 
 
 def test_phase3_rule_hard_veto_stays_fail_and_traces_trigger_only(monkeypatch, tmp_path):
-    monkeypatch.setattr(trend_agent, "analyze_business_quality_with_fallbacks", lambda ts_code, name, max_quarters=12: {
+    monkeypatch.setattr(trend_agent, "analyze_business_quality_with_fallbacks", lambda ts_code, name, max_quarters=12, industry="": {
         "quarters_analyzed": 4,
         "business_quality_score": 58.0,
         "business_quality_label": "中性",
@@ -3025,7 +3030,7 @@ def test_phase3_rule_hard_veto_stays_fail_and_traces_trigger_only(monkeypatch, t
 
 
 def test_phase3_unrelated_hard_veto_hit_remains_warn(monkeypatch, tmp_path):
-    monkeypatch.setattr(trend_agent, "analyze_business_quality_with_fallbacks", lambda ts_code, name, max_quarters=12: {
+    monkeypatch.setattr(trend_agent, "analyze_business_quality_with_fallbacks", lambda ts_code, name, max_quarters=12, industry="": {
         "quarters_analyzed": 4,
         "business_quality_score": 50.0,
         "business_quality_label": "中性",
@@ -3248,7 +3253,7 @@ def test_synthesize_veto_large_context_chunks_and_combines(monkeypatch, tmp_path
 
 
 def test_phase3_veto_plan_trace_includes_compact_evidence_metadata(monkeypatch, tmp_path):
-    monkeypatch.setattr(trend_agent, "analyze_business_quality_with_fallbacks", lambda ts_code, name, max_quarters=12: {
+    monkeypatch.setattr(trend_agent, "analyze_business_quality_with_fallbacks", lambda ts_code, name, max_quarters=12, industry="": {
         "quarters_analyzed": 6,
         "business_quality_score": 52.0,
         "business_quality_label": "中性",
@@ -3428,7 +3433,7 @@ def test_analyze_business_quality_improving_unprofitable_company(monkeypatch):
     snap = trend_agent.analyze_business_quality("000001.SZ")
     assert snap["quarters_analyzed"] == 8
     assert snap["business_quality_score"] > 60
-    assert snap["business_quality_label"] == "强"
+    assert snap["business_quality_label"] == "成长关注"
     assert any("亏损" in bullet or "营收" in bullet for bullet in snap["business_quality_bullets"])
 
 
@@ -3447,8 +3452,8 @@ def test_analyze_business_quality_deteriorating_business(monkeypatch):
         ),
     )
     snap = trend_agent.analyze_business_quality("000002.SZ")
-    assert snap["business_quality_score"] < 45
-    assert snap["business_quality_label"] == "偏弱"
+    assert snap["business_quality_score"] < 50
+    assert snap["business_quality_label"] == "周期风险"
 
 
 def test_analyze_business_quality_missing_data_is_neutral(monkeypatch):
@@ -3537,14 +3542,17 @@ def test_load_financial_quarters_from_tushare_throttles_between_calls(monkeypatc
             return pd.DataFrame({"ts_code": ["000001.SZ"], "end_date": ["20251231"], "n_cashflow_act": [12.0]})
 
         def fina_indicator(self, **kwargs):
-            return pd.DataFrame({"ts_code": ["000001.SZ"], "end_date": ["20251231"], "grossprofit_margin": [22.0]})
+            return pd.DataFrame({"ts_code": ["000001.SZ"], "end_date": ["20251231"], "roe": [15.0], "debt_to_assets": [35.0]})
+
+        def balancesheet(self, **kwargs):
+            return pd.DataFrame({"ts_code": ["000001.SZ"], "end_date": ["20251231"], "total_assets": [500.0]})
 
     monkeypatch.setattr(trend_agent, "_get_tushare_pro_client", lambda: FakePro())
     monkeypatch.setattr(trend_agent.time, "sleep", lambda seconds: sleeps.append(seconds))
 
     df = trend_agent.load_financial_quarters_from_tushare("000001.SZ", max_quarters=4)
     assert not df.empty
-    assert sleeps == [trend_agent.TUSHARE_CALL_INTERVAL_SEC, trend_agent.TUSHARE_CALL_INTERVAL_SEC]
+    assert sleeps == [trend_agent.TUSHARE_CALL_INTERVAL_SEC] * 3
 
 
 def test_build_tool_feedback_nudges_web_search_for_missing_external_evidence():
