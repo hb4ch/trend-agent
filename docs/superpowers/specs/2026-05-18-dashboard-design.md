@@ -382,7 +382,7 @@ vLLM's continuous batching means multiple prompts submitted concurrently are pro
 
 ### Fallback
 
-If Gemma is unreachable, all LLM-dependent panels show raw data without commentary. No blocking, no error banners — the commentary section simply doesn't render.
+If Gemma is unreachable, LLM-dependent panels show raw data without commentary, and a dismissible warning banner appears at the top: "Gemma LLM 不可用，AI 注释已暂停 — 检查 DGX Spark 服务状态". Panels continue functioning with raw data only.
 
 ---
 
