@@ -23,6 +23,7 @@ A web dashboard for the Contrarian Agent (trend-agent) project — an HTTP-based
 | Live fallback | Sina / Eastmoney public endpoints | Gaps where yfinance coverage is thin |
 | Styling | Tailwind CSS | Comes with shadcn/ui, rapid UI development |
 | Dev server | Vite | Standard React tooling |
+| LLM | Gemma 4 on DGX Spark (vLLM) | Dedicated local server, already configured in llm_provider.py. Batch prompts for low-latency narrative generation |
 
 ### Why not Streamlit/Dash
 
@@ -37,16 +38,18 @@ contrarian-dashboard/
 ├── backend/
 │   ├── main.py              # FastAPI app, CORS, lifespan
 │   ├── routes/
-│   │   ├── macro.py         # GET /api/macro (aggregated dashboard data)
+│   │   ├── macro.py         # GET /api/macro/*
 │   │   ├── stock.py         # GET /api/stock/{ts_code}
 │   │   ├── themes.py        # GET /api/themes
-│   │   └── screener.py      # GET /api/screener
+│   │   ├── screener.py      # GET /api/screener, POST /api/screener/nl
+│   │   └── llm.py           # POST /api/llm/commentary, POST /api/llm/briefing, etc.
 │   ├── services/
 │   │   ├── duckdb_service.py    # DuckDB connection pool, Parquet queries
 │   │   ├── yfinance_service.py  # yfinance batch fetch + cache
 │   │   ├── fallback_service.py  # Sina/Eastmoney scrape for missing tickers
 │   │   ├── compute_service.py   # Factor aggregation, sentiment calc, breadth
-│   │   └── pipeline_reader.py   # Read latest pipeline outputs (themes, candidates, audits)
+│   │   ├── pipeline_reader.py   # Read latest pipeline outputs (themes, candidates, audits)
+│   │   └── llm_service.py       # vLLM Gemma client, prompt batching, SSE streaming
 │   └── pyproject.toml
 ├── frontend/
 │   ├── src/
@@ -299,6 +302,88 @@ Candidate list with filtering. Query params: `?industry=电子&min_score=0.6&hor
 }
 ```
 
+### POST /api/screener/nl
+Natural language screening. Translates user query to filter params via LLM.
+
+Request: `{"query": "低估值小市值科技股，近期放量突破"}`
+Response:
+```json
+{
+  "filters": {"pe_max": 20, "total_mv_max": 100e8, "industry": ["电子", "计算机"], "vol_ratio_min": 1.5},
+  "explanation": "筛选PE<20、总市值<100亿的电子/计算机行业股票，且量比>1.5",
+  "candidates": [...]
+}
+```
+
+---
+
+## LLM Integration (Gemma 4 on DGX Spark)
+
+The dashboard embeds local LLM intelligence at five touchpoints. All calls go through backend → vLLM Gemma endpoint. Prompts are batched where possible (vLLM continuous batching handles concurrent requests natively). Never call LLM from the frontend.
+
+### POST /api/llm/briefing
+Daily market briefing. Generated once per data refresh, cached.
+
+Response:
+```json
+{
+  "text": "市场情绪偏中性(62分)，半导体板块持续走强，北上资金净流入12.3亿...",
+  "generated_at": "2026-05-18T09:35:00"
+}
+```
+
+### POST /api/llm/commentary/{ts_code}
+Per-stock analysis commentary. Cached per stock+date.
+
+Request: `{"horizon": 20}`
+Response:
+```json
+{
+  "text": "该股短期RSI中性(48)，距MA20偏离-2.8%处于盘整格局。但60日动量强劲(+12.1%)，中期均线多头排列，ADX=32显示趋势强度良好。关注MA20支撑确认后的入场时机。",
+  "generated_at": "2026-05-18T10:00:00"
+}
+```
+
+### POST /api/llm/themes
+Theme narratives (batched — all themes in one prompt). Cached per day.
+
+Response:
+```json
+{
+  "narratives": [
+    {"theme": "半导体自主可控", "text": "资金持续流入，游资主导但趋势加速，关注外部制裁催化与国产替代订单落地。"},
+    ...
+  ],
+  "generated_at": "2026-05-18T09:35:00"
+}
+```
+
+### POST /api/llm/signals
+Signal alert interpretations (batched). Cached per signal run.
+
+Response:
+```json
+{
+  "interpretations": [
+    {"ts_code": "688256.SH", "text": "盘整突破+放量确认+半导体板块共振，短期动能充足"},
+    ...
+  ],
+  "generated_at": "2026-05-18T09:35:00"
+}
+```
+
+### Batching Strategy
+
+vLLM's continuous batching means multiple prompts submitted concurrently are processed together. The backend exploits this:
+
+- **At data refresh time** (e.g., 9:35 after T+1 data lands): fire briefing + themes + signals in one concurrent batch. All three complete in ~3s total, not 9s sequentially.
+- **On stock page load**: commentary is a single-prompt call (~2s). If the user navigates between stocks quickly, concurrent requests batch naturally.
+- **NL screener**: single-prompt call (~1.5s), not batched — it's user-initiated and needs immediate response.
+
+### Fallback
+
+If Gemma is unreachable, all LLM-dependent panels show raw data without commentary. No blocking, no error banners — the commentary section simply doesn't render.
+
 ---
 
 ## Frontend Design
@@ -323,7 +408,10 @@ Top navbar, 4 routes. No sidebar (saves horizontal space for the dense grid).
 ### Macro Dashboard Layout (8-Panel Grid)
 
 ```
-┌──────────────────────┬──────────────────┐
+┌──────────────────────────────────────────────┐
+│  Market Briefing (LLM, cached)               │
+│  市场情绪偏中性，半导体板块持续走强...          │
+├──────────────────────┬──────────────────┐
 │  Market Snapshot     │  Hot Themes      │
 │  (indices + change%) │  (ranked sectors)│
 ├──────────────────────┼──────────────────┤
@@ -339,6 +427,8 @@ Top navbar, 4 routes. No sidebar (saves horizontal space for the dense grid).
 │  (today's entries)   │                  │
 └──────────────────────┴──────────────────┘
 ```
+
+The briefing banner spans the full width at top. It's generated once per data refresh and cached — not re-generated on every page load. Below it, the original 8-panel grid.
 
 The grid uses CSS Grid with `grid-template-columns: 2fr 1fr` for the main row split, with the Breadth chart spanning full width. On smaller screens, panels stack vertically.
 
@@ -367,6 +457,9 @@ Each panel fetches its own data independently:
 │ RSI 48   │ ADX 32   │Dist→MA20 │BBW 0.12 │
 │          │          │  -2.8%   │         │
 ├──────────┴──────────┴──────────┴─────────┤
+│  📝 LLM Analysis: 该股短期RSI中性(48)...    │
+│  (cached per stock+date, fades if stale)   │
+├──────────────────────────────────────────┤
 │  Audit: ✅ PASS  Confidence: 0.78        │
 │  Catalysts: tech_breakthrough ×1, ...    │
 │  Dragon Tiger: 3 recent appearances      │
@@ -385,6 +478,8 @@ Sector heatmap → click a sector → drill-down view:
 ### Stock Screener Page
 
 Filterable table with columns: ts_code, name, industry, composite_score, consolidation, momentum, volume_boost, audit_verdict. Sortable by any column. Click row → navigate to `/stock/:code`.
+
+Natural language search bar at top: "低估值小市值科技股，近期放量突破" → LLM translates to filter params → filters apply automatically. The LLM also returns a human-readable explanation so the user sees what filters were applied and can adjust them manually.
 
 ---
 
@@ -421,7 +516,7 @@ Font: Inter (UI), JetBrains Mono (data/codes). Financial data colors: green = up
 ## Out of Scope
 
 - Real-time WebSocket streaming (yfinance 15min delay makes this unnecessary)
-- LLM integration (the dashboard displays pipeline outputs; it doesn't call DeepSeek/Gemma)
+- Floating chat assistant (other LLM integrations included, but free-form chat is deferred)
 - Portfolio tracking / watchlist management
 - Mobile responsive (desktop-first, Chrome-focused)
 - User authentication / multi-user
