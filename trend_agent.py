@@ -645,6 +645,7 @@ def summarize_veto_evidence_chunk(
         "你是A股尽调证据压缩员。只基于给定证据块输出JSON，不要编造。"
         "输出字段：risk_findings, positive_findings, source_urls, hard_fail_candidates, "
         "missing_evidence, chunk_verdict。chunk_verdict只能是pass/warn/fail。"
+        "仅当出现明确、来源可查的风险证据时才给warn/fail；证据块只有正面信息或中性信息时应给pass。"
     )
     payload = {
         "stock": name,
@@ -690,6 +691,7 @@ def combine_veto_chunk_summaries(
     system_prompt = (
         "你是A股尽调员。基于分块证据摘要合成最终审计结论。"
         "缺少证据不等于fail；只有明确、来源支撑的一票否决证据才fail。"
+        "当正面证据存在且无风险信号时，应返回pass而非warn。warn仅用于存在疑虑但未达一票否决的情况。"
         "输出JSON：{\"verdict\":\"pass|warn|fail\",\"rationale\":\"\",\"sources\":[\"url\"]}。"
     )
     payload = {
