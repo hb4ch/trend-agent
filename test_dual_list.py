@@ -43,7 +43,6 @@ def make_screen_df(stocks: list[dict]) -> pd.DataFrame:
     defaults = {
         "consolidation_score": 60.0,
         "volume_boost": 1.5,
-        "momentum_score": 50.0,
         "composite_score": 50.0,
         "ma_spread": 0.10,
         "ma_spread_std": 0.02,

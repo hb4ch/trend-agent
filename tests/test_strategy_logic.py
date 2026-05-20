@@ -127,27 +127,6 @@ def test_obv_features_normalize_accumulation_and_detect_divergence():
     assert features["obv_divergence"] is True
 
 
-def test_momentum_uses_normalized_obv_not_raw_positive_sign():
-    latest = pd.Series({"close": 10.0})
-    weak = screen_growth_stocks.compute_momentum_score(
-        latest, 9.0, 8.0, 7.0, 6.0, 11.0, 9.0, 1.0,
-        adx=30.0, adx_slope=0.0, obv_slope=1000.0, vwap_ratio=1.0,
-        obv_slope_norm=0.01,
-    )
-    strong = screen_growth_stocks.compute_momentum_score(
-        latest, 9.0, 8.0, 7.0, 6.0, 11.0, 9.0, 1.0,
-        adx=30.0, adx_slope=0.0, obv_slope=1000.0, vwap_ratio=1.0,
-        obv_slope_norm=0.15,
-    )
-    negative = screen_growth_stocks.compute_momentum_score(
-        latest, 9.0, 8.0, 7.0, 6.0, 11.0, 9.0, 1.0,
-        adx=30.0, adx_slope=0.0, obv_slope=-1000.0, vwap_ratio=1.0,
-        obv_slope_norm=-0.05,
-    )
-
-    assert strong > weak
-    assert negative < weak
-
 
 def _trend_feature_df(
     closes,
@@ -340,7 +319,6 @@ def test_compute_signals_merges_candidate_technical_context(monkeypatch):
                 "ts_code": "A",
                 "name": "A",
                 "ema20": 9.7,
-                "momentum_score": 66.0,
                 "volume_quality_score": 71.0,
                 "obv_slope_norm": 0.12,
                 "obv_accumulation_score": 88.0,
@@ -362,7 +340,6 @@ def test_compute_signals_merges_candidate_technical_context(monkeypatch):
 
     assert signals["A"]["ready_to_break"] is True
     assert signals["A"]["ema20"] == 9.7
-    assert signals["A"]["momentum_score"] == 66.0
     assert signals["A"]["volume_quality_score"] == 71.0
     assert signals["A"]["obv_slope_norm"] == 0.12
     assert signals["A"]["obv_accumulation_score"] == 88.0
@@ -863,7 +840,7 @@ def test_upsert_core_table_replaces_sparse_llm_core_section():
     )
     table = trend_agent.build_deterministic_core_table(candidates, audits=[], top_n=2)
     merged = trend_agent.upsert_core_table_in_report(report, table)
-    assert merged.count("## 【核心金股 - 技术形态精选】") == 1
+    assert merged.count("## 【技术回踩标的】") == 1
     assert "| A(000001.SZ) |" in merged
     assert "| B(000002.SZ) |" in merged
 
@@ -1249,7 +1226,7 @@ def test_render_report_html_is_self_contained():
             )
         ],
         core_table_rows=[
-            {"股票": "测试股(000001.SZ)", "所属主线": "AI应用", "形态特征": "横盘分70", "置信度": "0.80", "推荐理由": "alpha评分高"}
+            {"股票": "测试股(000001.SZ)", "所属主线": "AI应用", "形态特征": "横盘分70", "置信度": "0.80", "入选逻辑": "alpha评分高"}
         ],
         theme_table_rows=[],
         stock_sections=[
@@ -2579,7 +2556,6 @@ def test_phase2_theme_ranking_penalizes_expensive_matches(monkeypatch):
                     "business_scope": "AI软件",
                     "introduction": "AI软件",
                     "consolidation_score": 72,
-                    "momentum_score": 75,
                     "volume_quality_score": 70,
                     "volume_boost": 1.5,
                     "composite_score": 78.0,
@@ -2595,7 +2571,6 @@ def test_phase2_theme_ranking_penalizes_expensive_matches(monkeypatch):
                     "business_scope": "AI软件",
                     "introduction": "AI软件",
                     "consolidation_score": 72,
-                    "momentum_score": 75,
                     "volume_quality_score": 70,
                     "volume_boost": 1.5,
                     "composite_score": 78.0,
@@ -2638,7 +2613,6 @@ def test_phase2_theme_pre_audit_cap_expands_to_20_and_keeps_technical(monkeypatc
                 "business_scope": "AI软件",
                 "introduction": "AI软件",
                 "consolidation_score": 70 + (i % 5),
-                "momentum_score": 80 - i * 0.5,
                 "volume_quality_score": 68.0,
                 "volume_boost": 1.4,
                 "composite_score": 85.0 - i,
@@ -3385,7 +3359,6 @@ def test_deterministic_tables_include_valuation_column():
                 "matched_themes": ["AI"],
                 "off_theme": False,
                 "theme_strength_score": 1.0,
-                "momentum_score": 75.0,
                 "alpha_rank_score": 88.0,
                 "consolidation_score": 70,
                 "volume_boost": 1.5,
@@ -3410,8 +3383,8 @@ def test_deterministic_tables_include_valuation_column():
     theme_table = trend_agent.build_deterministic_theme_table(candidates, audits=[], top_n=1)
     core_table = trend_agent.build_deterministic_core_table(candidates, audits=[], top_n=1)
 
-    assert "| 股票 | 匹配题材 | 题材强度 | 估值 | 动量评分 | Alpha评分 |" in theme_table
-    assert "| 股票 | 所属主线 | 估值 | 形态特征 | 置信度 | 推荐理由 |" in core_table
+    assert "| 股票 | 匹配题材 | 题材强度 | 估值 | 质量评分 | Alpha评分 |" in theme_table
+    assert "| 股票 | 所属主线 | 估值 | 箱体位置 | 形态特征 | 置信度 | 入选逻辑 |" in core_table
     assert "适中溢价" in theme_table
     assert "合理" in core_table
 

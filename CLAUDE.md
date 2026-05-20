@@ -20,11 +20,11 @@ python screen_growth_stocks.py
 python check_setup.py
 
 # Run tests
-python -m unittest tests/test_zhipu_search.py
+python -m pytest tests/ -x -q -k "not live_llm"
 
 # Enable debug logging
 export DEBUG_DEEPSEEK=1
-export DEBUG_ZHIPU_SEARCH=1
+export DEBUG_BRAVE_SEARCH=1
 export FORCE_LLM_LOGGING=1  # Print all LLM I/O to screen
 ```
 
@@ -51,7 +51,7 @@ export FORCE_LLM_LOGGING=1  # Print all LLM I/O to screen
 | `trend_agent.py` | Main pipeline orchestrator (all 5 phases) |
 | `llm_provider.py` | Two-tier LLM provider: official DeepSeek heavy tier + local Gemma light tier |
 | `screen_growth_stocks.py` | Stock screening logic & technical analysis |
-| `deep_researcher.py` | AI research engine (Zhipu search + query planning) |
+| `deep_researcher.py` | AI research engine (Brave + Exa search + query planning) |
 | `fundamental_quality.py` | Lifecycle-aware fundamental quality scoring (4 dimensions) |
 | `timing_models.py` | 7 Wyckoff/Dow structure detectors (defensive filters, NOT alpha factors) |
 | `utils.py` | Shared utilities (Dragon Tiger List, JSON parsing, etc.) |
@@ -100,15 +100,14 @@ VOLATILITY_THRESHOLD = 0.50 # 50% max amplitude (relaxed from 35%)
 
 **Composite Score Weights (IC-Calibrated):**
 - Consolidation: 35%
-- Momentum: 15%
 - Volume Quality: 18%
 - Squeeze Readiness: 15%
 - Valuation Quality: 10%
-- Fundamental Quality: 7%
+- Fundamental Quality: 22%
 
 ### `deep_researcher.py` - Search Functions
 
-- `zhipu_search(query)`: Web search with `site:domain.com` support
+- `search_backend(query)`: Brave Search API (primary) + Exa.ai (backup)
 - `deepseek_plan_queries(...)`: Dynamic query planning for multi-pass research
 - `generate_opportunity_queries(name, theme)`: Generate opportunity discovery queries (without site: restrictions)
 - `extract_positive_findings(results, name, category)`: Extract positive findings with confidence scoring
@@ -151,8 +150,9 @@ VOLATILITY_THRESHOLD = 0.50 # 50% max amplitude (relaxed from 35%)
 ### Required `.env` Variables
 
 ```env
-# Zhipu AI (Web Search)
-ZHIPUAI_API_KEY=xxx
+# Brave Search API (Web Search)
+BRAVE_API_KEY=xxx
+EXA_API_KEY=xxx
 
 # Two LLM tiers: official DeepSeek heavy tier + local Gemma light tier
 DEEPSEEK_BASE_URL=https://api.deepseek.com
@@ -164,7 +164,7 @@ GEMMA_API_KEY=dummy
 
 # Debug Flags
 DEBUG_DEEPSEEK=0
-DEBUG_ZHIPU_SEARCH=0
+DEBUG_BRAVE_SEARCH=0
 FORCE_LLM_LOGGING=0  # Print all LLM I/O to screen
 ```
 
@@ -302,12 +302,12 @@ Report generation supports tool calling:
 
 Check that the generated `report_*.html` file is opened in a browser with JavaScript enabled.
 
-### Zhipu Search Not Working
+### Brave Search Not Working
 
 ```bash
 # Check API key and enable debug
-export ZHIPUAI_API_KEY=xxx
-export DEBUG_ZHIPU_SEARCH=1
+export BRAVE_API_KEY=xxx
+export DEBUG_BRAVE_SEARCH=1
 ```
 
 ### Data Files Missing

@@ -21,7 +21,6 @@ class SignalConfig:
         "alpha_rank_score",
         "composite_score",
         "technical_selection_score",
-        "momentum_score",
         "volume_quality_score",
         "valuation_quality_score",
     )

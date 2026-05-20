@@ -2383,7 +2383,7 @@ def extract_theme_named_stocks(
     return result
 
 
-def phase2_quant_filter(themes: List[ThemeItem], config: Optional[StrategyConfig] = None) -> pd.DataFrame:
+def phase2_quant_filter(themes: List[ThemeItem], config: Optional[StrategyConfig] = None, relaxation_round: int = 0, exclude_codes: Optional[set] = None) -> pd.DataFrame:
     """
     Phase 2: Dual-list stock selection.
 
@@ -2400,7 +2400,16 @@ def phase2_quant_filter(themes: List[ThemeItem], config: Optional[StrategyConfig
     logger.info("Starting Phase 2: Dual-List Stock Selection")
     config = config or StrategyConfig.from_env()
     TOTAL_CAP = 10
+    if relaxation_round >= 1:
+        TOTAL_CAP = 15
+    if relaxation_round >= 2:
+        TOTAL_CAP = 20
     THEME_PRE_AUDIT_CAP = config.theme_pre_audit_cap
+
+    exclude_clause = ""
+    if exclude_codes:
+        codes_str = ", ".join(f"'{c}'" for c in exclude_codes)
+        exclude_clause = f" AND ts_code NOT IN ({codes_str})"
 
     def normalize_match_columns(df: pd.DataFrame) -> pd.DataFrame:
         out = df.copy()
@@ -2483,7 +2492,14 @@ def phase2_quant_filter(themes: List[ThemeItem], config: Optional[StrategyConfig
         named_codes = set(named_stocks.keys())
         logger.info(f"Found {len(named_codes)} stocks named in theme evidence")
 
-        # A2: Minimal filter from screen_df — only volume_boost >= 0.5
+        # A2: Minimal filter from screen_df — only volume_boost >= threshold
+        vol_threshold = 0.5
+        pool_limit = 100
+        if relaxation_round >= 1:
+            vol_threshold = 0.3
+        if relaxation_round >= 2:
+            vol_threshold = 0.0
+            pool_limit = 200
         if theme_order_col:
             con_a = duckdb.connect()
             try:
@@ -2492,9 +2508,10 @@ def phase2_quant_filter(themes: List[ThemeItem], config: Optional[StrategyConfig
                     f"""
                     SELECT *
                     FROM screen
-                    WHERE volume_boost >= 0.5
+                    WHERE volume_boost >= {vol_threshold}
+                    {exclude_clause}
                     ORDER BY {theme_order_col} DESC
-                    LIMIT 100
+                    LIMIT {pool_limit}
                     """
                 ).df()
             finally:
@@ -2502,9 +2519,9 @@ def phase2_quant_filter(themes: List[ThemeItem], config: Optional[StrategyConfig
         else:
             logger.warning("Theme pool ranking columns missing; falling back to volume filter without explicit ordering")
             if "volume_boost" in screen_df.columns:
-                theme_pool = screen_df[screen_df["volume_boost"] >= 0.5].head(100).copy()
+                theme_pool = screen_df[screen_df["volume_boost"] >= vol_threshold].head(pool_limit).copy()
             else:
-                theme_pool = screen_df.head(100).copy()
+                theme_pool = screen_df.head(pool_limit).copy()
 
         # Ensure named stocks are in the pool even if they didn't make top-100 momentum
         if named_codes:
@@ -2563,11 +2580,10 @@ def phase2_quant_filter(themes: List[ThemeItem], config: Optional[StrategyConfig
             theme_matched = theme_pool[matched_mask].copy()
 
             if not theme_matched.empty:
-                # A6: Score with momentum-weighted formula
+                # A6: Score with quality-weighted formula
                 theme_matched["theme_strength_score"] = theme_matched["matched_themes"].map(
                     lambda arr: max([theme_strength_map.get(str(t), 0.5) for t in arr], default=0.0)
                 )
-                momentum_col = "momentum_score" if "momentum_score" in theme_matched.columns else "composite_score"
                 volume_col = "volume_quality_score" if "volume_quality_score" in theme_matched.columns else "volume_boost"
                 toplist_penalty = theme_matched.get("toplist_recency_score", pd.Series(0.0, index=theme_matched.index))
                 valuation_quality = theme_matched.get("valuation_quality_score", pd.Series(50.0, index=theme_matched.index))
@@ -2576,13 +2592,12 @@ def phase2_quant_filter(themes: List[ThemeItem], config: Optional[StrategyConfig
                 trend_emergence = theme_matched.get("trend_emergence_score", pd.Series(0.0, index=theme_matched.index))
                 fundamental_quality = theme_matched.get("fundamental_quality_score", pd.Series(50.0, index=theme_matched.index))
                 theme_matched["alpha_rank_score"] = (
-                    theme_matched[momentum_col] * 0.14
-                    + theme_matched["theme_strength_score"] * 20.0
+                    theme_matched["theme_strength_score"] * 20.0
                     + theme_matched[volume_col] * 0.13
                     + theme_matched["composite_score"] * 0.18
                     + trend_emergence * 0.08
                     + valuation_quality * 0.18
-                    + fundamental_quality * 0.13
+                    + fundamental_quality * 0.27
                     - toplist_penalty * (config.toplist_penalty_weight * 10.0)
                     - valuation_penalty * 8.0
                 )
@@ -2600,7 +2615,12 @@ def phase2_quant_filter(themes: List[ThemeItem], config: Optional[StrategyConfig
 
     # ============ Step B: Build Technical Alpha List (kept complementary pre-audit) ============
     tech_budget = TOTAL_CAP
-    logger.info(f"Step B: Building technical alpha list (pre-audit budget={tech_budget})...")
+    cons_threshold = 50
+    if relaxation_round >= 1:
+        cons_threshold = 35
+    if relaxation_round >= 2:
+        cons_threshold = 20
+    logger.info(f"Step B: Building technical alpha list (pre-audit budget={tech_budget}, cons>={cons_threshold})...")
     technical_order_col = "technical_selection_score" if "technical_selection_score" in screen_df.columns else "composite_score"
 
     con_b = duckdb.connect()
@@ -2608,7 +2628,8 @@ def phase2_quant_filter(themes: List[ThemeItem], config: Optional[StrategyConfig
     tech_pool = con_b.execute(f"""
         SELECT *
         FROM screen
-        WHERE consolidation_score >= 50
+        WHERE consolidation_score >= {cons_threshold}
+        {exclude_clause}
         ORDER BY {technical_order_col} DESC
     """).df()
     con_b.close()
@@ -3289,7 +3310,41 @@ def rank_candidates_for_alpha(
 
         bos_recent = bool(sig.get("timing_bos", False)) or bool(sig.get("bos_20d", False))
         in_pullback_zone = 0.5 <= lps_pullback_sig <= 4.0
-        pullback_reward = clamp01(lps_pullback_sig / 3.0) if (bos_recent and in_pullback_zone) else 0.0
+        base_pullback = clamp01(lps_pullback_sig / 3.0) if (bos_recent and in_pullback_zone) else 0.0
+
+        regime = str(sig.get("market_regime", "range") or "range")
+        regime_conf = float(sig.get("regime_confidence", 0.5) or 0.5)
+        pos_sig = float(sig.get("close_position", 0.5) or 0.5)
+
+        # Regime-conditional pullback reward
+        if regime == 'uptrend':
+            pullback_reward = base_pullback * 0.12
+        elif regime == 'range' and pos_sig < 0.4:
+            pullback_reward = base_pullback * 0.05
+        else:
+            pullback_reward = 0.0
+
+        # Regime-conditional mid-range bonus: only in range-bound, near box bottom
+        if regime == 'range':
+            mid_range_bonus = clamp01(1.0 - abs(pos_sig - 0.3) / 0.4) * 0.08 * regime_conf
+        else:
+            mid_range_bonus = 0.0
+
+        # Breakout zone penalty: chasing near box top
+        if regime == 'breakout_zone':
+            breakout_penalty = -0.08 * regime_conf
+        elif pos_sig > 0.90:
+            breakout_penalty = -0.05
+        else:
+            breakout_penalty = 0.0
+
+        # Downtrend/bottom_fishing penalty
+        if regime == 'downtrend':
+            regime_penalty = -0.06 * regime_conf
+        elif regime == 'bottom_fishing':
+            regime_penalty = -0.03 * regime_conf
+        else:
+            regime_penalty = 0.0
 
         score_01 = (
             0.10 * consolidation_alpha +
@@ -3305,7 +3360,10 @@ def rank_candidates_for_alpha(
             - 0.12 * overcrowding_penalty
             - (0.10 if config.valuation_allow_premium else 0.18) * valuation_stretch
             - 0.08 * volatility_penalty
-            + 0.05 * pullback_reward
+            + pullback_reward
+            + mid_range_bonus
+            + breakout_penalty
+            + regime_penalty
         )
         score_01 = clamp01(score_01)
         alpha_rows.append(
@@ -4303,6 +4361,48 @@ def phase4_plot_charts(candidates: pd.DataFrame) -> Dict[str, ChartArtifact]:
     return chart_artifacts
 
 
+def classify_regime(signals: Dict[str, object]) -> tuple:
+    """Classify market regime from computed signals.
+
+    Returns (regime_label, regime_confidence).
+
+    Five regimes:
+      - 'uptrend': MA bullish + ADX > 30 + BOS confirmed → pullback entries
+      - 'breakout_zone': pos > 0.85 + ignition + near box top → prohibit chasing
+      - 'range': low ADX + mid-box, MA converging → box-bottom entries
+      - 'bottom_fishing': pos < 0.2 + MA bearish or OBV divergence → caution
+      - 'downtrend': MA bearish + price below MAs + ADX elevated → avoid
+    """
+    adx = float(signals.get('adx_value', 20) or 20)
+    adx_slope = float(signals.get('adx_slope', 0) or 0)
+    ma = str(signals.get('ma_trend', 'neutral') or 'neutral')
+    pos = float(signals.get('close_position', 0.5) or 0.5)
+    bos_20d = bool(signals.get('bos_20d', False))
+    ignition = bool(signals.get('ignition', False))
+    obv_div = bool(signals.get('obv_divergence', False))
+    timing_score = float(signals.get('timing_score', 0) or 0)
+    dist_top = float(signals.get('dist_to_box_top', 0.10) or 0.10)
+
+    if ma == 'bearish' and pos < 0.5 and adx > 25:
+        return ('downtrend', min(0.9, adx / 50))
+
+    if pos < 0.2 and (ma == 'bearish' or obv_div):
+        return ('bottom_fishing', 0.7 if ma == 'bearish' else 0.55)
+
+    if pos > 0.85 and ignition and dist_top < 0.05:
+        return ('breakout_zone', 0.85)
+    if pos > 0.80 and adx > 30 and adx_slope > 0:
+        return ('breakout_zone', 0.6)
+
+    if ma == 'bullish' and adx > 30 and bos_20d:
+        conf = 0.5 + 0.1 * min(5.0, timing_score)
+        return ('uptrend', min(0.9, conf))
+    if ma == 'bullish' and adx > 22:
+        return ('uptrend', 0.5)
+
+    return ('range', 0.75 if adx < 18 else 0.5)
+
+
 def compute_signals(candidates: pd.DataFrame) -> Dict[str, Dict[str, object]]:
     signals: Dict[str, Dict[str, object]] = {}
     for _, row in candidates.iterrows():
@@ -4470,7 +4570,7 @@ def compute_signals(candidates: pd.DataFrame) -> Dict[str, Dict[str, object]]:
             "lps_pullback": lps_pullback,
         }
         passthrough_cols = [
-            "ema20", "ma60", "ma120", "ma250", "ma_trend", "momentum_score",
+            "ema20", "ma60", "ma120", "ma250", "ma_trend",
             "volume_quality_score", "obv_slope", "obv_slope_norm",
             "obv_accumulation_score", "obv_divergence", "adx", "adx_slope",
             "bbw_percentile", "vwap_ratio", "price_change_20d",
@@ -4484,6 +4584,9 @@ def compute_signals(candidates: pd.DataFrame) -> Dict[str, Dict[str, object]]:
                 if isinstance(value, np.generic):
                     value = value.item()
                 signal[col] = value
+        regime_label, regime_conf = classify_regime(signal)
+        signal["market_regime"] = regime_label
+        signal["regime_confidence"] = regime_conf
         signals[ts_code] = signal
     return signals
 
@@ -4520,9 +4623,9 @@ def phase5_report(
     lines.extend(
         [
             "",
-            "## 【核心金股】",
+            "## 【质量标的池】",
             "",
-            "| 股票 | 所属主线 | 估值 | 形态特征 | 推荐理由 |",
+            "| 股票 | 所属主线 | 估值 | 形态特征 | 入选逻辑 |",
             "| --- | --- | --- | --- | --- |",
         ]
     )
@@ -4582,8 +4685,8 @@ def build_deterministic_theme_table(candidates: pd.DataFrame, audits: List[Audit
     if not rows:
         return ""
     return _build_markdown_table(
-        "## 【核心金股 - 题材驱动精选】",
-        ["股票", "匹配题材", "题材强度", "估值", "动量评分", "Alpha评分"],
+        "## 【题材质量标的】",
+        ["股票", "匹配题材", "题材强度", "估值", "质量评分", "Alpha评分"],
         rows,
     )
 
@@ -4593,13 +4696,13 @@ def build_deterministic_core_table(candidates: pd.DataFrame, audits: List[AuditR
     rows = build_core_table_rows(candidates, audits, top_n=top_n)
     if not rows:
         return (
-            "## 【核心金股 - 技术形态精选】\n\n"
-            "| 股票 | 所属主线 | 估值 | 形态特征 | 置信度 | 推荐理由 |\n"
-            "| --- | --- | --- | --- | --- | --- |\n"
+            "## 【技术回踩标的】\n\n"
+            "| 股票 | 所属主线 | 估值 | 箱体位置 | 形态特征 | 置信度 | 入选逻辑 |\n"
+            "| --- | --- | --- | --- | --- | --- | --- |\n"
         )
     return _build_markdown_table(
-        "## 【核心金股 - 技术形态精选】",
-        ["股票", "所属主线", "估值", "形态特征", "置信度", "推荐理由"],
+        "## 【技术回踩标的】",
+        ["股票", "所属主线", "估值", "箱体位置", "形态特征", "置信度", "入选逻辑"],
         rows,
     )
 
@@ -4610,9 +4713,10 @@ def upsert_core_table_in_report(report_md: str, table_sections_md: str) -> str:
         return table_sections_md
     # Remove any existing core table sections (both old and new format)
     for pattern in [
-        r"##\s*【核心金股 - 技术形态精选】[\s\S]*?(?=\n##\s*【|\Z)",
-        r"##\s*【核心金股 - 题材驱动精选】[\s\S]*?(?=\n##\s*【|\Z)",
-        r"##\s*【核心金股】[\s\S]*?(?=\n##\s*【|\Z)",
+        r"##\s*【技术回踩标的】[\s\S]*?(?=\n##\s*【|\Z)",
+        r"##\s*【题材质量标的】[\s\S]*?(?=\n##\s*【|\Z)",
+        r"##\s*【质量标的池】[\s\S]*?(?=\n##\s*【|\Z)",
+        r"##\s*【核心金股[^】]*】[\s\S]*?(?=\n##\s*【|\Z)",
     ]:
         report_md = re.sub(pattern, "", report_md)
     insert_after = re.search(r"##\s*【市场风向标】[\s\S]*?(?=\n##\s*【|\Z)", report_md)
@@ -4812,14 +4916,14 @@ def build_theme_table_rows(candidates: pd.DataFrame, audits: List[AuditResult], 
                 "匹配题材": ", ".join(matched[:2]) if matched else "待确认",
                 "题材强度": f"{_coerce_float(row.get('theme_strength_score', 0.0)):.2f}",
                 "估值": str(row.get("valuation_label", "估值待补充")),
-                "动量评分": f"{_coerce_float(row.get('momentum_score', row.get('composite_score', 0.0))):.1f}",
+                "质量评分": f"{_coerce_float(row.get('fundamental_quality_score', 50.0)):.1f}",
                 "Alpha评分": f"{_coerce_float(row.get('alpha_rank_score', 0.0)):.1f}",
             }
         )
     return rows
 
 
-def build_core_table_rows(candidates: pd.DataFrame, audits: List[AuditResult], top_n: int = 8) -> List[Dict[str, str]]:
+def build_core_table_rows(candidates: pd.DataFrame, audits: List[AuditResult], top_n: int = 8, signals: Optional[Dict[str, Dict[str, object]]] = None) -> List[Dict[str, str]]:
     """Build deterministic technical-alpha stock table rows."""
     if candidates is None:
         return []
@@ -4842,6 +4946,14 @@ def build_core_table_rows(candidates: pd.DataFrame, audits: List[AuditResult], t
             shape_parts.append(f"横盘分{_coerce_float(row.get('consolidation_score', 0.0)):.0f}")
         if "volume_boost" in row:
             shape_parts.append(f"量能{_coerce_float(row.get('volume_boost', 0.0)):.2f}")
+        # Box position from signals
+        box_pos_str = "—"
+        if signals:
+            sig = signals.get(ts_code, {})
+            cp = sig.get("close_position")
+            if cp is not None and isinstance(cp, (int, float)) and not pd.isna(cp):
+                pct = cp * 100.0
+                box_pos_str = f"{pct:.0f}%分位"
         reason_parts = []
         if "alpha_rank_score" in row:
             reason_parts.append(f"alpha评分{_coerce_float(row.get('alpha_rank_score', 0.0)):.1f}")
@@ -4853,9 +4965,10 @@ def build_core_table_rows(candidates: pd.DataFrame, audits: List[AuditResult], t
                 "股票": f"{name}({ts_code})",
                 "所属主线": "技术形态入选" if off_theme else (", ".join(matched[:2]) if matched else "待确认"),
                 "估值": str(row.get("valuation_label", "估值待补充")),
+                "箱体位置": box_pos_str,
                 "形态特征": "，".join(shape_parts) if shape_parts else "技术形态待补充",
                 "置信度": f"{(float(np.mean(conf_list)) if conf_list else 0.5):.2f}",
-                "推荐理由": "；".join(reason_parts) if reason_parts else "综合评分靠前",
+                "入选逻辑": "；".join(reason_parts) if reason_parts else "综合评分靠前",
             }
         )
     return rows
@@ -4863,17 +4976,50 @@ def build_core_table_rows(candidates: pd.DataFrame, audits: List[AuditResult], t
 
 _MARKET_OVERVIEW_SYSTEM_PROMPT = (
     "你是资深A股投研团队负责人，遵循\"重质、通过滤、待回踩\"理念。\n"
+    "核心信条：不追涨、不接飞刀、只等回踩确认后的低吸机会。\n"
     "只返回严格JSON，不要Markdown，不要代码块。\n"
     "输出格式："
     "{\"themes\":[{\"name\":\"主题名称\",\"validation_status\":\"confirmed|web_only|capital_only|weak\","
     "\"logic\":[\"主题逻辑要点\"],\"capital_validation\":[\"资金验证要点\"],"
     "\"watch_items\":[\"持续观察点\"],\"source_urls\":[\"https://...\"]}]}\n"
-    "要求：对confirmed主题必须写出龙虎榜/资金验证；引用真实URL；数组为空时返回空数组。"
+    "要求：\n"
+    "1. 对每个主题评估所处的周期阶段（发酵期/主升期/高潮期/退潮期），并在logic中明确标注。\n"
+    "2. 明确指出该主题是否已过热（交易拥挤、龙头加速赶顶、游资占比过高），过热主题必须提示退潮风险。\n"
+    "3. 资金验证必须区分\"机构中长线从容建仓\"和\"游资短线突击\"，两者含义完全不同。\n"
+    "4. 持续观察点必须包括\"等待回踩后的低吸时机\"，而非\"关注突破追涨机会\"。\n"
+    "5. 对confirmed主题必须写出龙虎榜/资金验证；引用真实URL；数组为空时返回空数组。\n"
+    "禁止：使用\"强烈看好\"\"主升浪\"\"加速上涨\"\"趋势确认\"等追涨语言。"
 )
 
 _STOCK_SECTION_SYSTEM_PROMPT_TEMPLATE = (
     "你是资深A股投研分析师，遵循\"重质、通过滤、待回踩\"理念。\n"
+    "核心信条：不追涨、不接飞刀、只等回踩确认后的低吸机会。\n"
     "只返回严格JSON，不要Markdown，不要代码块。\n"
+    "\n"
+    "【核心原则 - 必须遵守】\n"
+    "1. 箱体位置是首要判断依据。请从signal_row中读取close_position（0-1，表示股价在120日箱体中的分位）：\n"
+    "   - close_position > 0.80（箱体高位）：必须明确指出\"不具备追高性价比\"，trade_plan的第一条必须是\"等待回踩至XX支撑位\"\n"
+    "   - close_position < 0.30（箱体低位）：必须分析是否存在基本面恶化导致的\"低位陷阱\"，不能盲目看多\n"
+    "   - close_position 0.30-0.60（箱体中低位）：回踩充分时可重点关注，这是最佳配置区间\n"
+    "2. 投资逻辑排序：先讲周期位置（箱体位置+回踩信号），再讲基本面质量，最后讲题材催化。禁止以\"推荐买入\"开头。\n"
+    "3. 交易建议必须以\"等待回踩至XX位置\"为主要建议。禁止出现\"现价买入\"\"追涨\"\"突破买入\"等建议。\n"
+    "4. 摘要（summary）第一句必须是当前位置判断，格式如：\"箱体X%分位，回踩/高位/中位整理，...\"。禁止以\"推荐\"\"看好\"开头。\n"
+    "5. recommendation 值域（严格按以下标准，默认 watch）：\n"
+    "   - strong_buy：仅用于\"箱体低位(≤35%分位)+回踩信号确认+基本面质量≥60\"三重共振，极其罕见\n"
+    "   - buy：箱体中低位(≤60%分位)+回踩信号+LPS/均线支撑确认\n"
+    "   - watch：箱体中高位(>60%分位)或趋势未明，等待回踩（默认值，适用于大多数情况）\n"
+    "   - avoid：基本面硬伤(fail verdict)或箱顶(>90%分位)放量滞涨\n"
+    "\n"
+    "【状态感知写作规则 — 从 cycle_position.market_regime 读取市场状态】\n"
+    "6. regime='uptrend'（趋势上行）：强调\"趋势结构完好(BOS确认)，当前回踩X ATR，关注均线支撑\"\n"
+    "   交易建议：以\"回踩至XX均线不破+缩量企稳\"为入场点，不追高\n"
+    "7. regime='range'（箱体震荡）：强调\"箱体X%分位，距下沿X%空间，等待缩量企稳\"\n"
+    "   交易建议：以\"接近箱体下沿+缩量+OBV未创新低\"为入场信号\n"
+    "8. regime='breakout_zone'（箱顶试探）：摘要首句必须包含\"【高位】\"\n"
+    "   必须明确列出\"追高风险\"和\"需要等待的确认信号\"。禁止任何买入倾向。\n"
+    "9. regime='downtrend'（下行趋势）或 regime='bottom_fishing'（箱底陷阱）：\n"
+    "   摘要首句必须包含\"【风险】\"警示。必须分析结构性风险，不能仅凭低位建议配置。\n"
+    "\n"
     "如需补充信息，可先返回工具调用："
     "{\"tool\":\"web_search|duckdb|python\",\"input\":\"...\"}\n"
     "优先顺序：1) 直接使用上下文；2) 用python做检查、衍生指标、证据汇总、数据变换；3) 缺少原始历史行时再用duckdb；4) 缺少外部信息时用web_search。\n"
@@ -4891,8 +5037,8 @@ _STOCK_SECTION_SYSTEM_PROMPT_TEMPLATE = (
     "__DUCKDB_SCHEMA__\n"
     "最终输出格式："
     "{\"stock\":{\"ts_code\":\"000001.SZ\",\"name\":\"示例\","
-    "\"recommendation\":\"strong_buy|buy|watch|avoid\",\"summary\":\"一句话摘要\","
-    "\"investment_logic\":[\"投资逻辑\"],"
+    "\"recommendation\":\"strong_buy|buy|watch|avoid\",\"summary\":\"一句话摘要（首句必须是位置判断）\","
+    "\"investment_logic\":[\"投资逻辑（位置质量优先，题材催化最后）\"],"
     "\"positive_findings\":[{\"category\":\"policy\",\"description\":\"...\",\"evidence\":\"...\","
     "\"confidence\":0.7,\"source_url\":\"https://...\",\"date\":\"2026-01-01\"}],"
     "\"growth_catalysts\":[{\"catalyst_type\":\"policy\",\"description\":\"...\","
@@ -4900,10 +5046,11 @@ _STOCK_SECTION_SYSTEM_PROMPT_TEMPLATE = (
     "\"business_quality_score\":65.0,\"business_quality_label\":\"强|中性|偏弱\","
     "\"business_quality_summary\":\"12季度经营趋势一句话总结\","
     "\"business_quality_bullets\":[\"要点1\",\"要点2\"],\"quarters_analyzed\":12,"
-    "\"technical_analysis\":[\"技术分析\"],\"capital_validation\":[\"资金验证\"],"
-    "\"trade_plan\":[\"交易建议\"],\"risks\":[\"风险提示\"],"
+    "\"technical_analysis\":[\"技术分析（首条必写箱体位置和回踩状态）\"],\"capital_validation\":[\"资金验证\"],"
+    "\"trade_plan\":[\"交易建议（首条必为等待回踩，禁止现价买入）\"],\"risks\":[\"风险提示\"],"
     "\"source_urls\":[\"https://...\"],\"research_depth\":\"standard|deep\"}}\n"
-    "要求：真实URL；机会先于风险；突出箱体中低位、回踩信号、温和放量与均线收敛。"
+    "要求：真实URL；位置先于机会；第一条technical_analysis必须写箱体位置与回踩状态；第一条trade_plan必须写等待回踩价位。\n"
+    "禁止：使用\"强烈看好\"\"主升浪\"\"加速上涨\"\"趋势确认\"\"突破买入\"\"现价可买\"等追涨语言。"
 )
 
 
@@ -4991,13 +5138,13 @@ def _normalize_validation_status(value: Any) -> str:
 
 def _normalize_recommendation(value: Any) -> tuple[str, str]:
     text = str(value or "").strip().lower()
-    if text in {"strong_buy", "strongbuy", "强烈推荐"} or "强烈" in text:
-        return "strong_buy", "强烈推荐"
-    if text in {"buy", "推荐"}:
-        return "buy", "推荐"
+    if text in {"strong_buy", "strongbuy"} or "强烈" in text:
+        return "strong_buy", "可配置"
+    if text in {"buy"}:
+        return "buy", "可配置"
     if text in {"avoid", "回避"} or text == "fail":
         return "avoid", "回避"
-    return "watch", "观察"
+    return "watch", "等回踩"
 
 
 def _domain_label(url: str) -> str:
@@ -5172,6 +5319,40 @@ def _build_stock_context(
         ],
         "chart_notes": chart.spike_dates if chart else [],
         "signals": signals.get(ts_code, {}),
+        "cycle_position": _build_cycle_position_summary(signals.get(ts_code, {})),
+    }
+
+
+def _get_close_position(ts_code: str, signals: Dict[str, Dict[str, object]]) -> float:
+    """Get close_position for a stock from signals, default 0.5 (mid-box) if missing."""
+    sig = signals.get(ts_code, {})
+    cp = sig.get("close_position")
+    if cp is not None and not (isinstance(cp, float) and np.isnan(cp)):
+        return float(cp)
+    return 0.5
+
+
+def _build_cycle_position_summary(sig: Dict[str, object]) -> Dict[str, object]:
+    """Extract key cycle-position fields for LLM consumption, including regime."""
+    cp = sig.get("close_position")
+    dist = sig.get("dist_to_box_top")
+    lps = sig.get("lps_pullback")
+    ts = sig.get("timing_score")
+    pp60 = sig.get("price_position_60d")
+    return {
+        "close_position": round(float(cp), 3) if cp is not None and not (isinstance(cp, float) and np.isnan(cp)) else None,
+        "close_position_pct": f"{float(cp)*100:.0f}%" if cp is not None and not (isinstance(cp, float) and np.isnan(cp)) else "N/A",
+        "dist_to_box_top_pct": f"{float(dist)*100:.1f}%" if dist is not None and not (isinstance(dist, float) and np.isnan(dist)) else "N/A",
+        "lps_pullback_atr": round(float(lps), 2) if lps is not None and not (isinstance(lps, float) and np.isnan(lps)) else None,
+        "timing_score": round(float(ts), 2) if ts is not None and not (isinstance(ts, float) and np.isnan(ts)) else None,
+        "timing_bos": bool(sig.get("timing_bos")),
+        "timing_poc_retest": bool(sig.get("timing_poc_retest")),
+        "timing_lps": bool(sig.get("timing_lps")),
+        "timing_joc": bool(sig.get("timing_joc")),
+        "timing_gap_hold": bool(sig.get("timing_gap_hold")),
+        "price_position_60d": round(float(pp60), 3) if pp60 is not None and not (isinstance(pp60, float) and np.isnan(pp60)) else None,
+        "market_regime": str(sig.get("market_regime", "range") or "range"),
+        "regime_confidence": round(float(sig.get("regime_confidence", 0.5) or 0.5), 2),
     }
 
 
@@ -5289,10 +5470,21 @@ def _fallback_stock_section(
     verdicts = {normalize_verdict(a.verdict) for a in stock_audits}
     if "fail" in verdicts:
         recommendation, label = ("avoid", "回避")
-    elif bool(signal and (signal.get("lps_pullback") or 0) > 0 and float(signal.get("price_position_60d") or 0.5) < 0.5):
-        recommendation, label = ("buy", "推荐")
     else:
-        recommendation, label = ("watch", "观察")
+        regime = str((signal or {}).get("market_regime", "range") or "range")
+        pos = float((signal or {}).get("close_position", 0.5) or 0.5)
+        lps_ok = bool((signal or {}).get("lps_pullback") or 0) > 0
+        timing_ok = float((signal or {}).get("timing_score") or 0) >= 0.29
+        if regime == 'uptrend' and lps_ok and pos < 0.7:
+            recommendation, label = ("strong_buy", "可配置")
+        elif regime == 'range' and pos < 0.4 and lps_ok:
+            recommendation, label = ("buy", "可配置")
+        elif regime == 'breakout_zone' or regime == 'downtrend':
+            recommendation, label = ("watch", "等回踩")
+        elif regime == 'bottom_fishing':
+            recommendation, label = ("avoid", "回避")
+        else:
+            recommendation, label = ("watch", "等回踩")
     spike_note = "、".join(chart.spike_dates[:6]) if chart and chart.spike_dates else "未检测到明显量能异动"
     timing_names = {
         "timing_bos": "结构突破 (BOS)", "timing_true_bos": "二次突破确认 (True BOS)",
@@ -5369,6 +5561,21 @@ def _fallback_stock_section(
     )
 
 
+def _enforce_summary_position_tag(summary: str, signal: Optional[Dict[str, object]]) -> str:
+    """Prepend 【高位】tag if close_position > 70% and summary lacks position keywords."""
+    if not summary or not signal:
+        return summary
+    cp = signal.get("close_position")
+    if cp is None or (isinstance(cp, float) and np.isnan(cp)):
+        return summary
+    pos_pct = float(cp) * 100
+    position_keywords = ["箱体", "分位", "回踩", "高位", "低位", "中位", "追高", "低吸"]
+    has_position = any(kw in summary for kw in position_keywords)
+    if pos_pct > 70 and not has_position:
+        return f"【高位 {pos_pct:.0f}%分位】{summary}"
+    return summary
+
+
 def _normalize_stock_section_payload(
     payload: dict,
     row: dict,
@@ -5395,6 +5602,9 @@ def _normalize_stock_section_payload(
     if allowed_source_urls is not None:
         source_urls = filter_urls_to_allowed(source_urls, allowed_source_urls)
     source_urls = source_urls or fallback.source_urls
+    # post-process summary: add position tag if missing
+    summary = _clean_bullet_text(str(payload.get("summary", fallback.summary)).strip()) or fallback.summary
+    summary = _enforce_summary_position_tag(summary, signal)
     return ReportStockSection(
         ts_code=str(payload.get("ts_code") or row.get("ts_code", "")),
         name=str(payload.get("name") or row.get("name", "")),
@@ -5402,7 +5612,7 @@ def _normalize_stock_section_payload(
         recommendation=recommendation,
         recommendation_label=label,
         research_depth=str(payload.get("research_depth", fallback.research_depth)).strip() or fallback.research_depth,
-        summary=_clean_bullet_text(str(payload.get("summary", fallback.summary)).strip()) or fallback.summary,
+        summary=summary,
         investment_logic=_coerce_lines(payload.get("investment_logic")) or fallback.investment_logic,
         positive_findings=positive_findings,
         growth_catalysts=growth_catalysts,
@@ -5611,7 +5821,7 @@ def _build_report_model(
     ]
     logger.info("Phase 5: generating market overview data...")
     overview_items = _generate_market_overview(theme_summary, trace_path, themes)
-    core_rows = build_core_table_rows(candidates_with_flag, audits, top_n=min(10, len(candidates_with_flag)))
+    core_rows = build_core_table_rows(candidates_with_flag, audits, top_n=min(10, len(candidates_with_flag)), signals=signals)
     theme_rows = build_theme_table_rows(candidates_with_flag, audits, top_n=5)
     theme_context = "; ".join(f"{t.name}({t.validation_status})" for t in themes)
     stock_sections: List[ReportStockSection] = []
@@ -5635,6 +5845,8 @@ def _build_report_model(
         tool_stats.get("per_tool", {}).get("web_search", {}),
         tool_stats.get("python_after_duckdb_failure", 0),
     )
+    # Sort stock sections by box position ascending (low-position stocks first)
+    stock_sections.sort(key=lambda s: _get_close_position(s.ts_code, signals))
     return ReportModel(
         title="A股均值回归研报",
         generated_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -5666,20 +5878,20 @@ def render_report_markdown_debug(report: ReportModel) -> str:
         lines.append("")
     lines.append(
         _build_markdown_table(
-            "## 【核心金股 - 技术形态精选】",
-            ["股票", "所属主线", "估值", "形态特征", "置信度", "推荐理由"],
+            "## 【技术回踩标的】",
+            ["股票", "所属主线", "估值", "箱体位置", "形态特征", "置信度", "入选逻辑"],
             report.core_table_rows,
         )
         if report.core_table_rows
-        else "## 【核心金股 - 技术形态精选】\n\n（无数据）"
+        else "## 【技术回踩标的】\n\n（无数据）"
     )
     if report.theme_table_rows:
         lines.extend(
             [
                 "",
                 _build_markdown_table(
-                    "## 【核心金股 - 题材驱动精选】",
-                    ["股票", "匹配题材", "题材强度", "估值", "动量评分", "Alpha评分"],
+                    "## 【题材质量标的】",
+                    ["股票", "匹配题材", "题材强度", "估值", "质量评分", "Alpha评分"],
                     report.theme_table_rows,
                 ),
             ]
@@ -5716,14 +5928,44 @@ def render_report_markdown_debug(report: ReportModel) -> str:
     return "\n".join(lines)
 
 
-def _render_html_table(title: str, rows: List[Dict[str, str]]) -> str:
+def _box_position_formatters() -> Dict[str, Callable[[str], str]]:
+    """Color-code box position cells by risk level."""
+    def _fmt_box_pos(raw: str) -> str:
+        if not raw or raw == "—":
+            return html_escape(raw)
+        import re
+        m = re.match(r"(\d+)%分位", raw)
+        if not m:
+            return html_escape(raw)
+        pct = int(m.group(1))
+        if pct <= 30:
+            css_class = "box-low"
+        elif pct <= 60:
+            css_class = "box-mid"
+        elif pct <= 80:
+            css_class = "box-high"
+        else:
+            css_class = "box-top"
+        return f'<span class="box-pos {css_class}">{html_escape(raw)}</span>'
+    return {"箱体位置": _fmt_box_pos}
+
+
+def _render_html_table(title: str, rows: List[Dict[str, str]], cell_formatters: Optional[Dict[str, Callable[[str], str]]] = None) -> str:
     if not rows:
         return ""
     headers = list(rows[0].keys())
     thead = "".join(f"<th>{html_escape(header)}</th>" for header in headers)
+    fmt = cell_formatters or {}
     body_rows = []
     for row in rows:
-        body_rows.append("<tr>" + "".join(f"<td>{html_escape(str(row.get(header, '')))}</td>" for header in headers) + "</tr>")
+        cells = []
+        for header in headers:
+            raw = str(row.get(header, ""))
+            if header in fmt:
+                cells.append(f"<td>{fmt[header](raw)}</td>")
+            else:
+                cells.append(f"<td>{html_escape(raw)}</td>")
+        body_rows.append("<tr>" + "".join(cells) + "</tr>")
     return (
         f"<section class=\"table-section\"><h2>{html_escape(title)}</h2><div class=\"table-shell\">"
         f"<table><thead><tr>{thead}</tr></thead><tbody>{''.join(body_rows)}</tbody></table></div></section>"
@@ -5844,10 +6086,15 @@ def render_report_html(report: ReportModel) -> str:
         border: 1px solid var(--line);
         background: rgba(255, 255, 255, 0.6);
     }
-    .status.confirmed, .status.rec-strong_buy { background: rgba(1, 135, 134, 0.13); color: #005d63; }
-    .status.web_only, .status.rec-buy { background: rgba(196, 84, 43, 0.13); color: #8b3a1d; }
-    .status.capital_only, .status.rec-watch { background: rgba(58, 91, 166, 0.13); color: #28498c; }
+    .status.confirmed { background: rgba(1, 135, 134, 0.13); color: #005d63; }
+    .status.web_only { background: rgba(196, 84, 43, 0.13); color: #8b3a1d; }
+    .status.rec-strong_buy, .status.rec-buy { background: rgba(21, 128, 61, 0.13); color: #166534; }
+    .status.capital_only, .status.rec-watch { background: rgba(180, 83, 9, 0.13); color: #92400e; }
     .status.weak, .status.rec-avoid { background: rgba(120, 53, 15, 0.12); color: #6d3d17; }
+    .box-pos.box-low  { color: #166534; font-weight: 600; }
+    .box-pos.box-mid  { color: #28498c; }
+    .box-pos.box-high { color: #92400e; font-weight: 600; }
+    .box-pos.box-top  { color: #991b1b; font-weight: 700; }
     .nav {
         position: sticky;
         top: 0;
@@ -6049,8 +6296,8 @@ def render_report_html(report: ReportModel) -> str:
       <h2>【市场风向标】</h2>
       <div class="theme-grid">{''.join(overview_cards)}</div>
     </section>
-    <section id="core-table">{_render_html_table("【核心金股 - 技术形态精选】", report.core_table_rows)}</section>
-    <section id="theme-table">{_render_html_table("【核心金股 - 题材驱动精选】", report.theme_table_rows)}</section>
+    <section id="core-table">{_render_html_table("【技术回踩标的】", report.core_table_rows, cell_formatters=_box_position_formatters())}</section>
+    <section id="theme-table">{_render_html_table("【题材质量标的】", report.theme_table_rows)}</section>
     <section id="stocks">
       <h2>【深度图解】</h2>
       {''.join(stock_cards)}
@@ -6122,8 +6369,40 @@ def main() -> None:
     logger.debug(f"Audit trace: {audit_trace}")
     audits = phase3_deep_audit(llm, candidates, trace_path=audit_trace, themes=themes, config=config)
     candidates, audits = apply_audit_filter(candidates, audits)
+    pass_count = len(candidates)
+    logger.info(f"Initial pass count: {pass_count}")
+
+    MIN_PASS_COUNT = int(os.environ.get("MIN_PASS_COUNT", "5"))
+    MAX_REFILL_ROUNDS = int(os.environ.get("MAX_REFILL_ROUNDS", "2"))
+    audited_codes = set(a.ts_code for a in audits)
+    refill_round = 0
+
+    while pass_count < MIN_PASS_COUNT and refill_round < MAX_REFILL_ROUNDS:
+        refill_round += 1
+        logger.info(f"Refill round {refill_round}: pass_count={pass_count} < {MIN_PASS_COUNT}")
+
+        new_candidates = phase2_quant_filter(
+            themes, config=config,
+            relaxation_round=refill_round,
+            exclude_codes=audited_codes,
+        )
+        if new_candidates.empty:
+            logger.warning(f"No new candidates in refill round {refill_round}")
+            break
+
+        logger.info(f"Refill round {refill_round}: {len(new_candidates)} new candidates for audit")
+        new_audits = phase3_deep_audit(llm, new_candidates, trace_path=audit_trace, themes=themes, config=config)
+
+        candidates = pd.concat([candidates, new_candidates], ignore_index=True)
+        audits.extend(new_audits)
+        audited_codes.update(a.ts_code for a in new_audits)
+
+        candidates, audits = apply_audit_filter(candidates, audits)
+        pass_count = len(candidates)
+        logger.info(f"After refill round {refill_round}: pass_count={pass_count}")
+
     if candidates.empty:
-        logger.warning("No candidates passed audit filter")
+        logger.warning("No candidates passed audit filter after all refill rounds")
         return
 
     # Alpha ranking before visualization/reporting

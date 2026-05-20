@@ -620,99 +620,8 @@ def analyze_stock_technical(df, current_date=None):
         ma_trend = "bearish"
     scores['ma_trend'] = ma_trend
 
-    # 6. Momentum scoring (enhanced with new indicators)
-    momentum_score = compute_momentum_score(
-        latest, ema20, ma60, ma120, ma250,
-        recent_high, recent_low, volume_boost,
-        adx_now, adx_slope, obv_slope, vwap_ratio,
-        obv_slope_norm=obv_slope_norm,
-        obv_divergence=obv_divergence,
-    )
-    scores['momentum_score'] = momentum_score
-
     return scores
 
-
-def compute_momentum_score(
-    latest: pd.Series,
-    ema20: float,
-    ma60: float,
-    ma120: float,
-    ma250: float,
-    box_top: float,
-    box_bottom: float,
-    volume_boost: float,
-    adx: float = 20.0,
-    adx_slope: float = 0.0,
-    obv_slope: float = 0.0,
-    vwap_ratio: float = 1.0,
-    obv_slope_norm: Optional[float] = None,
-    obv_accumulation_score: Optional[float] = None,
-    obv_divergence: bool = False,
-    box_position: Optional[float] = None,
-) -> float:
-    """
-    Compute momentum score for a stock (enhanced with continuous scoring).
-
-    Components:
-    - MA Alignment (EMA20 > MA60 > MA120): 0-25 points
-    - ADX Inflection (rising from < 25):    0-20 points
-    - Box Position (0.6-0.95 ideal):        0-15 points
-    - OBV Accumulation/Divergence:          0-20 points
-    - Volume Confirmation (1.2-3.0x):       0-10 points
-    - VWAP Confirmation (close near/above): 0-10 points
-
-    Returns:
-        Momentum score from 0-100
-    """
-    close = finite_float(latest.get('close', latest.get('current_price', 0.0)))
-    score = 0.0
-
-    # 1. MA Alignment Score (0-25 points) - continuous
-    alignment = 0.0
-    if close > ema20:
-        alignment += 8.0
-    if ema20 > ma60:
-        alignment += 8.0
-    if ma60 > ma120:
-        alignment += 5.0
-    if ma120 > ma250:
-        alignment += 4.0
-    score += alignment
-
-    # 2. ADX Inflection Score (0-20 points) - ADX rising from below 25
-    if adx < 25 and adx_slope > 0:
-        score += linear_score(adx_slope, 0.0, 3.0, 20.0)
-    elif adx < 20:
-        score += 5.0  # Low ADX about to inflect
-
-    # 3. Box Position Score (0-15 points) - continuous taper
-    position = box_position
-    if position is None:
-        box_range = box_top - box_bottom
-        position = (close - box_bottom) / box_range if box_range > EPSILON else None
-    if position is not None:
-        score += range_score(position, 0.25, 0.65, 15.0)
-
-    # 4. OBV Accumulation/Divergence Score (0-20 points)
-    if obv_accumulation_score is not None:
-        score += linear_score(finite_float(obv_accumulation_score), 0.0, 100.0, 15.0)
-        if obv_divergence:
-            score += 5.0
-    else:
-        norm = obv_slope_norm if obv_slope_norm is not None else (0.0 if obv_slope <= 0 else None)
-        if norm is not None:
-            score += linear_score(finite_float(norm), 0.0, 0.20, 20.0)
-        elif obv_slope > 0:
-            score += 5.0
-
-    # 5. Volume Confirmation Score (0-10 points) - continuous
-    score += range_score(volume_boost, 1.2, 3.0, 10.0)
-
-    # 6. VWAP Confirmation Score (0-10 points) - close near/above VWAP
-    score += gaussian_score(vwap_ratio, 1.02, 0.05, 10.0)
-
-    return min(100.0, score)
 
 
 def fundamental_quick_screen(results_df: pd.DataFrame) -> pd.DataFrame:
@@ -943,27 +852,6 @@ def screen_all_stocks() -> pd.DataFrame:
         ),
         axis=1,
     )
-    results_df["momentum_score"] = results_df.apply(
-        lambda row: compute_momentum_score(
-            row,
-            finite_float(row.get("ema20")),
-            finite_float(row.get("ma60")),
-            finite_float(row.get("ma120")),
-            finite_float(row.get("ma250")),
-            0.0,
-            0.0,
-            row.get("volume_boost", 1.0),
-            row.get("adx", 20.0),
-            row.get("adx_slope", 0.0),
-            row.get("obv_slope", 0.0),
-            row.get("vwap_ratio", 1.0),
-            obv_slope_norm=row.get("obv_slope_norm", 0.0),
-            obv_accumulation_score=row.get("obv_accumulation_score", 0.0),
-            obv_divergence=bool(row.get("obv_divergence", False)),
-            box_position=row.get("price_position", None),
-        ),
-        axis=1,
-    )
     results_df["trend_emergence_score"] = results_df.apply(
         lambda row: compute_trend_emergence_score(
             row.get("return_5d", 0.0),
@@ -982,11 +870,10 @@ def screen_all_stocks() -> pd.DataFrame:
     fundamental_q = results_df.get("fundamental_quality_score", pd.Series(50.0, index=results_df.index))
     results_df['composite_score'] = (
         results_df['consolidation_score'] * 0.35 +
-        results_df['momentum_score'] * 0.15 +
         results_df['volume_quality_score'] * 0.18 +
         results_df['squeeze_readiness'] * 0.15 +
         results_df['valuation_quality_score'] * 0.10 +
-        fundamental_q * 0.07
+        fundamental_q * 0.22
     )
     results_df["technical_selection_score"] = (
         results_df["composite_score"] * 0.85 +
@@ -995,7 +882,7 @@ def screen_all_stocks() -> pd.DataFrame:
     results_df = results_df.sort_values('composite_score', ascending=False)
 
     # Distribution logging for calibration
-    for col in ['composite_score', 'consolidation_score', 'momentum_score', 'squeeze_readiness', 'volume_quality_score', 'trend_emergence_score']:
+    for col in ['composite_score', 'consolidation_score', 'squeeze_readiness', 'volume_quality_score', 'trend_emergence_score']:
         if col in results_df.columns:
             vals = results_df[col].dropna()
             if len(vals) > 0:
