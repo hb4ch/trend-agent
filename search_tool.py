@@ -1,8 +1,8 @@
-from deep_researcher import zhipu_search
+from deep_researcher import search_backend
 
 
 def search(query: str) -> str:
-    return zhipu_search(query)
+    return search_backend(query)
 
 
 __all__ = ["search"]

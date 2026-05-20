@@ -38,7 +38,7 @@ from langchain_core.language_models import BaseChatModel
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
 
-from deep_researcher import deepseek_chat, deepseek_plan_queries, zhipu_search
+from deep_researcher import deepseek_chat, deepseek_plan_queries, search_backend
 from screen_growth_stocks import (
     screen_all_stocks,
     compute_atr,
@@ -108,7 +108,7 @@ class StrategyConfig:
     hard_fail_require_recency: bool = True
     hard_fail_max_age_days: int = REGULATORY_MAX_AGE_DAYS
     hard_fail_reduce_materiality_threshold: float = 0.03
-    theme_match_policy: str = "conservative"  # conservative|balanced|aggressive
+    theme_match_policy: str = "balanced"  # conservative|balanced|aggressive
     theme_pre_audit_cap: int = 30
     theme_post_audit_cap: int = 5
     max_names_per_theme: int = 4
@@ -132,7 +132,7 @@ class StrategyConfig:
     @classmethod
     def from_env(cls) -> "StrategyConfig":
         """Build configuration from environment variables."""
-        theme_match_policy = os.environ.get("THEME_MATCH_POLICY", "conservative").strip().lower()
+        theme_match_policy = os.environ.get("THEME_MATCH_POLICY", "balanced").strip().lower()
         if theme_match_policy not in {"conservative", "balanced", "aggressive"}:
             logger.warning(f"Invalid THEME_MATCH_POLICY='{theme_match_policy}', fallback to conservative")
             theme_match_policy = "conservative"
@@ -319,20 +319,8 @@ class ReportArtifacts:
 
 
 def run_search(query: str, engine: str = "") -> str:
-    """Execute web search using Zhipu AI.
-
-    Args:
-        query: Search query string
-        engine: Override search engine (e.g. "search_std"). Empty = use ZHIPU_SEARCH_ENGINE default.
-    """
-    if engine:
-        from deep_researcher import ZhipuSearchTool
-        return ZhipuSearchTool().search(query, engine=engine)
-    if hasattr(zhipu_search, "invoke"):
-        return zhipu_search.invoke(query)
-    if callable(zhipu_search):
-        return zhipu_search(query)
-    return "❌ Search tool unavailable."
+    """Execute web search using Brave (primary) or Exa.ai (backup)."""
+    return search_backend(query)
 
 
 def parse_search_payload(raw: Any) -> Dict[str, Any]:
@@ -1246,6 +1234,65 @@ def heuristic_match_themes(
             if not toks:
                 continue
             if any(tok and tok in text for tok in toks):
+                picked.append(theme_name)
+            if len(picked) >= 2:
+                break
+        matched_values.append(picked)
+    out[existing_col] = matched_values
+    return out
+
+
+def _industry_match_themes(
+    themes: List[ThemeItem],
+    candidates: pd.DataFrame,
+    existing_col: str = "matched_themes",
+) -> pd.DataFrame:
+    """
+    Assign themes based on industry label overlap with theme keywords.
+
+    Unlike heuristic_match_themes (which scans all text fields),
+    this only uses the standardized Tushare industry field, which is
+    reliable and not inflated by business_scope boilerplate.
+    """
+    if candidates.empty or not themes:
+        return candidates
+    out = candidates.copy()
+
+    def _tokens(text: str) -> set[str]:
+        cleaned = re.sub(r"[^\w\u4e00-\u9fff]+", " ", str(text or ""))
+        return {tok for tok in cleaned.split() if len(tok) >= 2}
+
+    theme_features = []
+    for t in themes:
+        if not t.name:
+            continue
+        tokens = set()
+        for kw in (t.keywords or []):
+            tokens |= _tokens(kw)
+        tokens |= _tokens(t.name)
+        tokens -= {"主题", "板块", "产业", "行业", "概念", "方向"}
+        if tokens:
+            theme_features.append((t.name, tokens))
+
+    if not theme_features:
+        return out
+
+    matched_values = []
+    for _, row in out.iterrows():
+        base = row.get(existing_col, [])
+        base = base if isinstance(base, list) else []
+        if base:
+            matched_values.append(base)
+            continue
+        industry = str(row.get("industry", ""))
+        if not industry:
+            matched_values.append([])
+            continue
+        picked = []
+        for theme_name, toks in theme_features:
+            # Substring match (same as heuristic_match_themes) — Chinese
+            # text has no whitespace, so exact-token intersection fails.
+            if any(tok and tok in industry for tok in toks):
                 picked.append(theme_name)
             if len(picked) >= 2:
                 break
@@ -2501,6 +2548,13 @@ def phase2_quant_filter(themes: List[ThemeItem], config: Optional[StrategyConfig
             theme_pool = normalize_match_columns(theme_pool)
             gemma_matches = theme_pool["matched_themes"].apply(bool).sum()
             logger.info(f"Theme pool after Gemma + named stock merge: {gemma_matches} stocks with theme matches")
+
+            # Industry-based fallback: catch stocks whose Tushare industry matches theme keywords
+            if gemma_matches < len(theme_pool):
+                theme_pool = _industry_match_themes(expanded_themes or confirmed_themes or themes, theme_pool)
+                theme_pool = normalize_match_columns(theme_pool)
+                industry_matches = theme_pool["matched_themes"].apply(bool).sum()
+                logger.info(f"Theme pool after industry fallback: {industry_matches} stocks with theme matches")
 
             # A5: Filter to only matched stocks
             matched_mask = theme_pool["matched_themes"].apply(lambda x: isinstance(x, list) and len(x) > 0)

@@ -75,6 +75,9 @@ def classify_lifecycle(
                                        "gross_margin_rate", "gp_margin"])
     op_cashflow = _pick_metric(df, ["operate_cashflow", "n_cashflow_act",
                                       "net_cash_flows_oper_act", "oper_cash_flow"])
+    or_yoy = _pick_metric(df, ["or_yoy"])
+    eps = _pick_metric(df, ["eps"])
+    operate_profit = _pick_metric(df, ["operate_profit"])
 
     signals: Dict[str, Any] = {
         "quarter_count": quarter_count,
@@ -104,6 +107,21 @@ def classify_lifecycle(
     # Gross margin trend
     gm_trend = _trend_delta(gross_margin)
     signals["gross_margin_trend"] = gm_trend
+
+    # Direct YoY revenue growth (more reliable than quarterly CAGR)
+    or_yoy_vals = or_yoy.dropna()
+    if len(or_yoy_vals) >= 2:
+        signals["revenue_yoy"] = float(or_yoy_vals.tail(4).mean())
+
+    # EPS trend — profitability quality from per-share perspective
+    eps_trend = _trend_delta(eps)
+    if eps_trend is not None:
+        signals["eps_trend"] = eps_trend
+
+    # Operating profit trend — core business earnings
+    op_trend = _trend_delta(operate_profit)
+    if op_trend is not None:
+        signals["operate_profit_trend"] = op_trend
 
     # Revenue volatility (coefficient of variation over quarters)
     rev_vol = _volatility(revenue)
@@ -147,6 +165,21 @@ def classify_lifecycle(
     # Decline/cyclical signals
     is_declining = rev_cagr is not None and rev_cagr < -0.03
     is_volatile = rev_vol is not None and rev_vol > 0.30
+
+    # Augment with direct YoY revenue data when available
+    rev_yoy = signals.get("revenue_yoy")
+    if rev_yoy is not None:
+        # Strong YoY growth can upgrade classification confidence
+        if rev_yoy > 30 and is_pre_profit:
+            is_hypergrowth = True
+            confidence = min(1.0, confidence + 0.05)
+        elif rev_yoy > 20 and not is_cash_cow and not is_steady:
+            is_expansion = True
+        # Negative YoY contradicts growth classification
+        if rev_yoy < -5 and (is_expansion or is_early_stage):
+            is_expansion = False
+            is_early_stage = False
+            is_declining = True
 
     # ── Classification ──
     if is_hypergrowth and is_pre_profit:
@@ -223,12 +256,23 @@ def compute_fundamental_quality(
     total_liab = _pick_metric(df, ["total_liab", "total_liability"])
     equity = _pick_metric(df, ["total_hldr_eqy", "total_hldr_eqy_exc_min_int",
                                  "total_equity"])
+    operate_profit = _pick_metric(df, ["operate_profit"])
+    ebit = _pick_metric(df, ["ebit"])
+    eps = _pick_metric(df, ["eps"])
+    bps = _pick_metric(df, ["bps"])
+    or_yoy = _pick_metric(df, ["or_yoy"])
+    op_yoy = _pick_metric(df, ["op_yoy"])
+    profit_dedt = _pick_metric(df, ["profit_dedt"])
+    money_cap = _pick_metric(df, ["money_cap"])
+    accounts_receiv = _pick_metric(df, ["accounts_receiv"])
 
     # Compute derived metrics when direct columns are missing
     if debt_ratio.isna().all() and not total_liab.isna().all() and not total_assets.isna().all():
         debt_ratio = (total_liab / total_assets.replace(0, np.nan)) * 100.0
     if roe.isna().all() and not net_income.isna().all() and not equity.isna().all():
         roe = (net_income / equity.replace(0, np.nan)) * 100.0
+    # profit_dedt is 扣非净利润 (absolute), compute real profit/debt ratio for health scorers
+    profit_to_debt = (profit_dedt / total_liab.replace(0, np.nan)) * 100.0
 
     # Data completeness
     metric_count = sum(1 for s in [revenue, net_income, gross_margin, op_cashflow,
@@ -238,31 +282,31 @@ def compute_fundamental_quality(
 
     # Score each dimension
     if stage == "growth":
-        profit_score = _score_profitability_growth(lifecycle, net_income, gross_margin)
-        growth_score = _score_growth_quality_growth(df, lifecycle, revenue, net_income, op_cashflow)
-        health_score = _score_financial_health_growth(lifecycle, op_cashflow, debt_ratio, total_assets)
-        earnings_score = _score_earnings_quality_universal(net_income, op_cashflow, total_assets)
+        profit_score = _score_profitability_growth(lifecycle, net_income, gross_margin, or_yoy)
+        growth_score = _score_growth_quality_growth(df, lifecycle, revenue, net_income, op_cashflow, or_yoy)
+        health_score = _score_financial_health_growth(lifecycle, op_cashflow, debt_ratio, total_assets, money_cap, profit_to_debt)
+        earnings_score = _score_earnings_quality_universal(net_income, op_cashflow, total_assets, accounts_receiv, operate_profit, profit_dedt)
         weights = {"profitability": 0.05, "growth_quality": 0.50,
                    "financial_health": 0.30, "earnings_quality": 0.15}
     elif stage == "mature":
-        profit_score = _score_profitability_mature(roe, gross_margin, net_income)
-        growth_score = _score_growth_quality_mature(revenue)
-        health_score = _score_financial_health_mature(debt_ratio, current_ratio, op_cashflow)
-        earnings_score = _score_earnings_quality_universal(net_income, op_cashflow, total_assets)
+        profit_score = _score_profitability_mature(roe, gross_margin, net_income, operate_profit, or_yoy, op_yoy, eps)
+        growth_score = _score_growth_quality_mature(revenue, or_yoy, operate_profit)
+        health_score = _score_financial_health_mature(debt_ratio, current_ratio, op_cashflow, ebit, profit_to_debt, money_cap)
+        earnings_score = _score_earnings_quality_universal(net_income, op_cashflow, total_assets, accounts_receiv, operate_profit, profit_dedt)
         weights = {"profitability": 0.30, "growth_quality": 0.20,
                    "financial_health": 0.30, "earnings_quality": 0.20}
     elif stage in ("cyclical", "declining"):
-        profit_score = _score_profitability_mature(roe, gross_margin, net_income)
-        growth_score = _score_growth_quality_mature(revenue)
-        health_score = _score_financial_health_mature(debt_ratio, current_ratio, op_cashflow)
-        earnings_score = _score_earnings_quality_universal(net_income, op_cashflow, total_assets)
+        profit_score = _score_profitability_mature(roe, gross_margin, net_income, operate_profit, or_yoy, op_yoy, eps)
+        growth_score = _score_growth_quality_mature(revenue, or_yoy, operate_profit)
+        health_score = _score_financial_health_mature(debt_ratio, current_ratio, op_cashflow, ebit, profit_to_debt, money_cap)
+        earnings_score = _score_earnings_quality_universal(net_income, op_cashflow, total_assets, accounts_receiv, operate_profit, profit_dedt)
         weights = {"profitability": 0.15, "growth_quality": 0.15,
                    "financial_health": 0.40, "earnings_quality": 0.30}
     else:  # transitional, unknown
-        profit_score = _score_profitability_mature(roe, gross_margin, net_income)
-        growth_score = _score_growth_quality_mature(revenue)
-        health_score = _score_financial_health_mature(debt_ratio, current_ratio, op_cashflow)
-        earnings_score = _score_earnings_quality_universal(net_income, op_cashflow, total_assets)
+        profit_score = _score_profitability_mature(roe, gross_margin, net_income, operate_profit, or_yoy, op_yoy, eps)
+        growth_score = _score_growth_quality_mature(revenue, or_yoy, operate_profit)
+        health_score = _score_financial_health_mature(debt_ratio, current_ratio, op_cashflow, ebit, profit_to_debt, money_cap)
+        earnings_score = _score_earnings_quality_universal(net_income, op_cashflow, total_assets, accounts_receiv, operate_profit, profit_dedt)
         weights = {"profitability": 0.25, "growth_quality": 0.25,
                    "financial_health": 0.25, "earnings_quality": 0.25}
 
@@ -292,10 +336,11 @@ def compute_fundamental_quality(
 
     # Bullets
     bullets = _build_bullets(lifecycle, dimension_scores, revenue, net_income,
-                              gross_margin, op_cashflow, roe, debt_ratio, data_completeness)
+                              gross_margin, op_cashflow, roe, debt_ratio,
+                              or_yoy, op_yoy, operate_profit, profit_to_debt, data_completeness)
 
     # One-line summary
-    summary = _build_summary(stage, score, revenue, net_income, op_cashflow)
+    summary = _build_summary(stage, score, revenue, net_income, op_cashflow, or_yoy, op_yoy)
 
     return {
         "fundamental_quality_score": round(score, 1),
@@ -310,17 +355,22 @@ def compute_fundamental_quality(
 # ── Dimension scorers: Mature stage ───────────────────────────────────────
 
 def _score_profitability_mature(
-    roe: pd.Series, gross_margin: pd.Series, net_income: pd.Series
+    roe: pd.Series, gross_margin: pd.Series, net_income: pd.Series,
+    operate_profit: pd.Series, or_yoy: pd.Series, op_yoy: pd.Series,
+    eps: pd.Series,
 ) -> float:
     """Score 0-100 for mature-stage profitability."""
     score = 50.0
     available = 0
 
-    # ROE: map 0%-25% to 0-60 points
+    # ROE: soft floor at 5 (not zero) for negative ROE — prevents cyclical
+    # downturn stocks from scoring 0 profitability.
+    # 0% ROE → 30, 10% → 42, 25% → 60 (capped).
     roe_vals = roe.dropna()
     if len(roe_vals) >= 2:
         avg_roe = float(roe_vals.tail(4).mean())
-        roe_score = min(60.0, max(0.0, avg_roe / 25.0 * 60.0))
+        roe_score = 30.0 + avg_roe / 25.0 * 30.0
+        roe_score = min(60.0, max(5.0, roe_score))
         roe_trend = _trend_delta(roe)
         if roe_trend is not None and roe_trend > 0:
             roe_score = min(60.0, roe_score + 10.0)
@@ -344,13 +394,29 @@ def _score_profitability_mature(
         ni_bonus = max(-10.0, min(10.0, ni_trend * 20.0))
         score = min(100.0, max(0.0, score + ni_bonus))
 
+    # Operating profit YoY — direct earnings momentum
+    op_yoy_vals = op_yoy.dropna()
+    if len(op_yoy_vals) >= 2:
+        avg_op_yoy = float(op_yoy_vals.tail(4).mean())
+        # Map: -20% → -5, 0% → 0, +20% → +10, capped at ±10
+        op_yoy_bonus = max(-10.0, min(10.0, avg_op_yoy * 50.0))
+        score = min(100.0, max(0.0, score + op_yoy_bonus))
+
+    # EPS trend — per-share profitability quality
+    eps_trend = _trend_delta(eps)
+    if eps_trend is not None:
+        eps_bonus = max(-5.0, min(8.0, eps_trend * 15.0))
+        score = min(100.0, max(0.0, score + eps_bonus))
+
     if available == 0:
         return 50.0
     return min(100.0, max(0.0, score))
 
 
 def _score_growth_quality_mature(
-    revenue: pd.Series
+    revenue: pd.Series,
+    or_yoy: pd.Series,
+    operate_profit: pd.Series,
 ) -> float:
     """Score 0-100 for mature-stage growth quality."""
     score = 50.0
@@ -370,11 +436,31 @@ def _score_growth_quality_mature(
         score = max(10.0, min(90.0, growth_score))
         available += 1
 
+    # Direct YoY revenue growth — more reliable than quarterly CAGR
+    or_yoy_vals = or_yoy.dropna()
+    if len(or_yoy_vals) >= 2:
+        avg_or_yoy = float(or_yoy_vals.tail(4).mean())
+        if avg_or_yoy > 15:
+            yoy_bonus = min(12.0, (avg_or_yoy - 15) * 0.4)
+        elif avg_or_yoy > 5:
+            yoy_bonus = 0.0
+        elif avg_or_yoy > -5:
+            yoy_bonus = max(-8.0, avg_or_yoy * 1.0)
+        else:
+            yoy_bonus = max(-15.0, avg_or_yoy * 0.8)
+        score = min(100.0, max(0.0, score + yoy_bonus))
+
     # Revenue acceleration / deceleration
     rev_accel = _acceleration(revenue)
     if rev_accel is not None:
         accel_bonus = max(-8.0, min(8.0, rev_accel * 15.0))
         score = min(100.0, max(0.0, score + accel_bonus))
+
+    # Operating profit trend — operating leverage signal
+    op_trend = _trend_delta(operate_profit)
+    if op_trend is not None:
+        op_bonus = max(-6.0, min(8.0, op_trend * 12.0))
+        score = min(100.0, max(0.0, score + op_bonus))
 
     if available == 0:
         return 50.0
@@ -383,7 +469,8 @@ def _score_growth_quality_mature(
 
 def _score_financial_health_mature(
     debt_ratio: pd.Series, current_ratio: pd.Series,
-    op_cashflow: pd.Series
+    op_cashflow: pd.Series, ebit: pd.Series,
+    profit_to_debt: pd.Series, money_cap: pd.Series,
 ) -> float:
     """Score 0-100 for mature-stage financial health."""
     score = 50.0
@@ -420,6 +507,31 @@ def _score_financial_health_mature(
         score = min(100.0, score + cf_score)
         available += 1
 
+    # Profit-to-debt ratio — direct debt servicing capacity (%)
+    pd_vals = profit_to_debt.dropna()
+    if len(pd_vals) >= 2:
+        avg_pd = float(pd_vals.tail(4).mean())
+        # Higher = better. <2% → 0, 5% → 8, 10% → 15, 20%+ → 20
+        if avg_pd > 20:
+            pd_score = 20.0
+        elif avg_pd > 10:
+            pd_score = 15.0 + (avg_pd - 10) * 0.5
+        elif avg_pd > 2:
+            pd_score = avg_pd * 1.0
+        else:
+            pd_score = max(0.0, avg_pd * 0.5)
+        score = min(100.0, score + pd_score)
+
+    # Cash adequacy — money_cap / total_assets proxy
+    mc_vals = money_cap.dropna()
+    if len(mc_vals) >= 2:
+        mc_trend = _trend_delta(money_cap)
+        if mc_trend is not None:
+            if mc_trend > 0.1:
+                score = min(100.0, score + 5.0)  # growing cash reserves
+            elif mc_trend < -0.15:
+                score = max(0.0, score - 5.0)  # depleting cash
+
     if available == 0:
         return 50.0
     return min(100.0, max(0.0, score))
@@ -429,7 +541,8 @@ def _score_financial_health_mature(
 
 def _score_profitability_growth(
     lifecycle: Dict[str, Any],
-    net_income: pd.Series, gross_margin: pd.Series
+    net_income: pd.Series, gross_margin: pd.Series,
+    or_yoy: pd.Series,
 ) -> float:
     """Score 0-100 for growth-stage profitability. Does NOT penalize losses."""
     subflavor = lifecycle.get("subflavor", "")
@@ -445,6 +558,15 @@ def _score_profitability_growth(
     if gm_trend is not None and gm_trend > 0:
         score += min(10.0, gm_trend * 20.0)
 
+    # Revenue YoY growth — validates growth trajectory
+    or_yoy_vals = or_yoy.dropna()
+    if len(or_yoy_vals) >= 2:
+        avg_or_yoy = float(or_yoy_vals.tail(4).mean())
+        if avg_or_yoy > 20:
+            score += min(12.0, (avg_or_yoy - 20) * 0.3)
+        elif avg_or_yoy < 0:
+            score -= min(10.0, abs(avg_or_yoy) * 0.2)
+
     # Pre-revenue: only margin trend matters
     if subflavor == "pre_revenue":
         score = min(70.0, max(35.0, score))
@@ -454,7 +576,8 @@ def _score_profitability_growth(
 
 def _score_growth_quality_growth(
     df: pd.DataFrame, lifecycle: Dict[str, Any],
-    revenue: pd.Series, net_income: pd.Series, op_cashflow: pd.Series
+    revenue: pd.Series, net_income: pd.Series, op_cashflow: pd.Series,
+    or_yoy: pd.Series,
 ) -> float:
     """Score 0-100 for growth-stage trajectory quality."""
     subflavor = lifecycle.get("subflavor", "")
@@ -474,6 +597,17 @@ def _score_growth_quality_growth(
             growth_score = 50.0 + min(40.0, rev_cagr * 160.0)
         score = max(20.0, min(95.0, growth_score))
         available += 1
+
+    # Direct YoY revenue growth — validates CAGR estimate
+    or_yoy_vals = or_yoy.dropna()
+    if len(or_yoy_vals) >= 2:
+        avg_or_yoy = float(or_yoy_vals.tail(4).mean())
+        if subflavor == "hypergrowth" and avg_or_yoy > 30:
+            score = min(100.0, score + 10.0)
+        elif avg_or_yoy > 15:
+            score = min(100.0, score + 5.0)
+        elif avg_or_yoy < -10:
+            score = max(0.0, score - 10.0)
 
     # Revenue acceleration
     rev_accel = _acceleration(revenue)
@@ -499,7 +633,8 @@ def _score_growth_quality_growth(
 def _score_financial_health_growth(
     lifecycle: Dict[str, Any],
     op_cashflow: pd.Series, debt_ratio: pd.Series,
-    total_assets: pd.Series
+    total_assets: pd.Series, money_cap: pd.Series,
+    profit_to_debt: pd.Series,
 ) -> float:
     """Score 0-100 for growth-stage financial health. Focuses on cash runway."""
     subflavor = lifecycle.get("subflavor", "")
@@ -511,13 +646,16 @@ def _score_financial_health_growth(
     if len(cf_vals) >= 3 and subflavor in ("pre_revenue", "hypergrowth"):
         avg_burn = float(cf_vals.tail(4).mean())
         if avg_burn < 0:  # burning cash
-            # Estimate cash from assets (very rough proxy)
-            asset_vals = total_assets.dropna()
-            if len(asset_vals) >= 1:
-                latest_assets = float(asset_vals.iloc[-1])
-                cash_proxy = latest_assets * 0.15  # assume ~15% of assets = cash
+            # Use money_cap if available, fall back to 15% of total_assets
+            mc_vals = money_cap.dropna()
+            if len(mc_vals) >= 1:
+                cash_estimate = float(mc_vals.iloc[-1])
+            else:
+                asset_vals = total_assets.dropna()
+                cash_estimate = float(asset_vals.iloc[-1]) * 0.15 if len(asset_vals) >= 1 else 0.0
+            if cash_estimate > 0:
                 burn_rate = abs(avg_burn)
-                runway_quarters = cash_proxy / max(burn_rate, 1.0)
+                runway_quarters = cash_estimate / max(burn_rate, 1.0)
                 runway_score = min(40.0, runway_quarters / 4.0 * 10.0)  # 0 at 0Q, 40 at 16Q+
                 score = score * 0.5 + runway_score * 0.5
                 available += 1
@@ -542,6 +680,17 @@ def _score_financial_health_growth(
         score = score * 0.6 + dr_score * 0.4
         available += 1
 
+    # Profit-to-debt ratio — even for growth, debt service capacity matters
+    pd_vals = profit_to_debt.dropna()
+    if len(pd_vals) >= 2:
+        avg_pd = float(pd_vals.tail(4).mean())
+        if avg_pd > 15:
+            score = min(100.0, score + 8.0)
+        elif avg_pd > 5:
+            score = min(100.0, score + 3.0)
+        elif avg_pd < 0:
+            score = max(0.0, score - 8.0)
+
     if available == 0:
         return 50.0
     return min(100.0, max(0.0, score))
@@ -551,7 +700,9 @@ def _score_financial_health_growth(
 
 def _score_earnings_quality_universal(
     net_income: pd.Series,
-    op_cashflow: pd.Series, total_assets: pd.Series
+    op_cashflow: pd.Series, total_assets: pd.Series,
+    accounts_receiv: pd.Series, operate_profit: pd.Series,
+    profit_dedt: pd.Series,
 ) -> float:
     """Score 0-100 for earnings quality. Works for all lifecycle stages."""
     score = 50.0
@@ -602,6 +753,52 @@ def _score_earnings_quality_universal(
                     accrual_score += 5.0  # accruals declining = good
                 score = min(100.0, score + accrual_score)
                 available += 1
+
+    # AR / Revenue trend — ballooning AR = aggressive revenue recognition
+    ar_vals = accounts_receiv.dropna()
+    if len(ar_vals) >= 3:
+        ar_trend = _trend_delta(accounts_receiv)
+        if ar_trend is not None:
+            if ar_trend > 0.2:
+                score = max(0.0, score - 10.0)  # AR growing much faster = red flag
+            elif ar_trend > 0.1:
+                score = max(0.0, score - 5.0)
+            elif ar_trend < -0.05:
+                score = min(100.0, score + 5.0)  # AR shrinking = good
+
+    # Operating profit vs net income divergence
+    op_vals = operate_profit.dropna()
+    if len(op_vals) >= 3 and len(ni_vals) >= 3:
+        op_common = op_vals.loc[op_vals.index.intersection(ni_vals.index)]
+        ni_common2 = ni_vals.loc[ni_vals.index.intersection(op_vals.index)]
+        if len(op_common) >= 2:
+            op_ratio = op_common / ni_common2.replace(0, np.nan)
+            op_ratio = op_ratio.replace([np.inf, -np.inf], np.nan).dropna()
+            if len(op_ratio) >= 2:
+                avg_op_ratio = float(op_ratio.tail(4).mean())
+                # If op profit << net income, non-operating items inflate earnings
+                if avg_op_ratio < 0.5:
+                    score = max(0.0, score - 10.0)
+                elif avg_op_ratio > 0.8:
+                    score = min(100.0, score + 5.0)
+
+    # Non-recurring profit dependency: profit_dedt (扣非净利润) vs net_income
+    pd_vals = profit_dedt.dropna()
+    if len(pd_vals) >= 3 and len(ni_vals) >= 3:
+        pd_common = pd_vals.loc[pd_vals.index.intersection(ni_vals.index)]
+        ni_common3 = ni_vals.loc[ni_vals.index.intersection(pd_vals.index)]
+        if len(pd_common) >= 2:
+            pd_ratio = pd_common / ni_common3.replace(0, np.nan)
+            pd_ratio = pd_ratio.replace([np.inf, -np.inf], np.nan).dropna()
+            if len(pd_ratio) >= 2:
+                avg_pd_ratio = float(pd_ratio.tail(4).mean())
+                # If 扣非 < 70% of NI, earnings are propped up by one-offs
+                if avg_pd_ratio < 0.5:
+                    score = max(0.0, score - 12.0)
+                elif avg_pd_ratio < 0.7:
+                    score = max(0.0, score - 6.0)
+                elif avg_pd_ratio > 0.9:
+                    score = min(100.0, score + 3.0)
 
     if available == 0:
         return 50.0
@@ -712,6 +909,8 @@ def _build_bullets(
     revenue: pd.Series, net_income: pd.Series,
     gross_margin: pd.Series, op_cashflow: pd.Series,
     roe: pd.Series, debt_ratio: pd.Series,
+    or_yoy: pd.Series, op_yoy: pd.Series,
+    operate_profit: pd.Series, profit_to_debt: pd.Series,
     data_completeness: float,
 ) -> List[str]:
     """Build Chinese bullet points for the quality report."""
@@ -760,6 +959,29 @@ def _build_bullets(
         elif avg_dr < 30:
             bullets.append(f"资产负债率低（{avg_dr:.0f}%），财务结构稳健。")
 
+    # Direct YoY growth — more reliable than CAGR from quarterly data
+    or_yoy_vals = or_yoy.dropna()
+    if len(or_yoy_vals) >= 2:
+        avg_or_yoy = float(or_yoy_vals.tail(4).mean())
+        direction = "高增长" if avg_or_yoy > 20 else "稳健增长" if avg_or_yoy > 10 else "低速增长" if avg_or_yoy > 0 else "下滑"
+        bullets.append(f"营收同比{direction}（近四季均值{avg_or_yoy:.1f}%）。")
+
+    # Operating profit momentum
+    op_yoy_vals = op_yoy.dropna()
+    if len(op_yoy_vals) >= 2:
+        avg_op_yoy = float(op_yoy_vals.tail(4).mean())
+        if avg_op_yoy > 0:
+            bullets.append(f"营业利润同比增长{avg_op_yoy:.1f}%，主业盈利改善。")
+        elif avg_op_yoy < -10:
+            bullets.append(f"营业利润同比下滑{avg_op_yoy:.1f}%，关注主业承压。")
+
+    # Debt servicing capacity
+    pd_vals = profit_to_debt.dropna()
+    if len(pd_vals) >= 2 and len(dr_vals) >= 2 and float(dr_vals.tail(4).mean()) > 40:
+        avg_pd = float(pd_vals.tail(4).mean())
+        if avg_pd < 3:
+            bullets.append(f"利润对债务覆盖不足（利润/负债={avg_pd:.1f}%），关注偿债能力。")
+
     # Lifecycle note
     if stage == "growth" and subflavor == "pre_revenue":
         bullets.append("企业处于早期成长阶段，评分侧重成长潜力和现金可持续性，不因当前未盈利而直接否定。")
@@ -773,7 +995,8 @@ def _build_bullets(
 
 def _build_summary(
     stage: str, score: float,
-    revenue: pd.Series, net_income: pd.Series, op_cashflow: pd.Series
+    revenue: pd.Series, net_income: pd.Series, op_cashflow: pd.Series,
+    or_yoy: pd.Series, op_yoy: pd.Series,
 ) -> str:
     """One-line Chinese summary of fundamental quality."""
     stage_labels = {
@@ -783,8 +1006,14 @@ def _build_summary(
     }
     stage_cn = stage_labels.get(stage, stage)
 
-    rev_cagr = _quarterly_cagr(revenue)
-    rev_str = f"营收CAGR {rev_cagr*100:.1f}%" if rev_cagr is not None else "营收趋势未知"
+    # Prefer direct YoY when available, fall back to quarterly CAGR
+    or_yoy_vals = or_yoy.dropna()
+    if len(or_yoy_vals) >= 2:
+        avg_or_yoy = float(or_yoy_vals.tail(4).mean())
+        rev_str = f"营收同比{avg_or_yoy:+.1f}%"
+    else:
+        rev_cagr = _quarterly_cagr(revenue)
+        rev_str = f"营收CAGR {rev_cagr*100:.1f}%" if rev_cagr is not None else "营收趋势未知"
 
     ni_trend = _trend_delta(net_income)
     ni_str = "盈利改善" if (ni_trend is not None and ni_trend > 0) else "盈利承压" if (ni_trend is not None and ni_trend <= 0) else "盈利趋势未知"

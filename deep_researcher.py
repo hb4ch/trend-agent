@@ -4,13 +4,12 @@ import os
 import urllib.request
 import re
 import time
-import dataclasses
 from typing import List, Optional
 from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
-from zai import ZhipuAiClient
+import requests
 from langchain_core.tools import Tool
 
 try:
@@ -44,19 +43,12 @@ GEMMA_TOP_P = 0.95
 GEMMA_TOP_K = 64
 
 DEBUG_DEEPSEEK = os.environ.get("DEBUG_DEEPSEEK", "").strip() in {"1", "true", "True", "YES", "yes"}
-DEBUG_ZHIPU_SEARCH = os.environ.get("DEBUG_ZHIPU_SEARCH", "").strip() in {"1", "true", "True", "YES", "yes"}
 DEBUG_OPENAI_COMPAT = (
     os.environ.get("DEBUG_OPENAI_COMPAT", "")
     .strip()
     in {"1", "true", "True", "YES", "yes"}
 )
 
-ZHIPU_SEARCH_ENGINE = os.environ.get("ZHIPU_SEARCH_ENGINE", "search_std")
-ZHIPU_SEARCH_COUNT = int(os.environ.get("ZHIPU_SEARCH_COUNT", "15"))
-ZHIPU_SEARCH_CONTENT_SIZE = os.environ.get("ZHIPU_SEARCH_CONTENT_SIZE", "high")
-ZHIPU_SEARCH_RECENCY_FILTER = os.environ.get("ZHIPU_SEARCH_RECENCY_FILTER", "oneMonth")
-ZHIPU_SEARCH_TIMEOUT_S = int(os.environ.get("ZHIPU_SEARCH_TIMEOUT_S", "60"))
-ZHIPU_SEARCH_RETRIES = int(os.environ.get("ZHIPU_SEARCH_RETRIES", "3"))
 
 
 def _truncate(text: str, limit: int = 8000) -> str:
@@ -82,63 +74,6 @@ def _debug_print(prefix: str, payload: object) -> None:
         print(f"[DeepSeek] {prefix}:\n{_truncate(_pretty(payload), 6000)}")
     except Exception:
         print(f"[DeepSeek] {prefix}:\n{_truncate(str(payload), 6000)}")
-
-
-def _debug_zhipu(prefix: str, payload: object) -> None:
-    if not DEBUG_ZHIPU_SEARCH:
-        return
-    try:
-        print(f"[ZhipuSearch] {prefix}:\n{_truncate(_pretty(payload), 6000)}")
-    except Exception:
-        print(f"[ZhipuSearch] {prefix}:\n{_truncate(str(payload), 6000)}")
-
-
-def _to_dict(obj: object) -> object:
-    def deep_convert(value: object) -> object:
-        if isinstance(value, dict):
-            return {str(k): deep_convert(v) for k, v in value.items()}
-        if isinstance(value, list):
-            return [deep_convert(v) for v in value]
-        if isinstance(value, tuple):
-            return [deep_convert(v) for v in value]
-
-        if dataclasses.is_dataclass(value):
-            try:
-                return deep_convert(dataclasses.asdict(value))
-            except Exception:
-                pass
-
-        # Try __dict__ FIRST for Pydantic models to avoid serialization warnings
-        # This bypasses Pydantic's type validation during dump
-        if hasattr(value, "__dict__"):
-            try:
-                raw = {
-                    k: v
-                    for k, v in value.__dict__.items()  # type: ignore[attr-defined]
-                    if not str(k).startswith("_")
-                }
-                return deep_convert(raw)
-            except Exception:
-                pass
-
-        if hasattr(value, "model_dump"):
-            try:
-                # Use warnings=False to suppress Pydantic serialization warnings
-                # This happens when zai models have type mismatches (list vs single object)
-                import warnings as pydantic_warnings
-                with pydantic_warnings.catch_warnings():
-                    pydantic_warnings.simplefilter("ignore")
-                    return deep_convert(value.model_dump())  # type: ignore[attr-defined]
-            except Exception:
-                pass
-        if hasattr(value, "dict"):
-            try:
-                return deep_convert(value.dict())  # type: ignore[attr-defined]
-            except Exception:
-                pass
-        return value
-
-    return deep_convert(obj)
 
 
 def _walk(obj: object):
@@ -189,7 +124,9 @@ def _extract_web_results(payload: object) -> List[dict]:
             snippet = (
                 node.get("snippet")
                 if isinstance(node.get("snippet"), str)
-                else node.get("content") if isinstance(node.get("content"), str) else ""
+                else node.get("description") if isinstance(node.get("description"), str)
+                else node.get("content") if isinstance(node.get("content"), str)
+                else ""
             )
             date = ""
             for dk in (
@@ -206,7 +143,7 @@ def _extract_web_results(payload: object) -> List[dict]:
                     date = dv.strip()
                     break
             results.append({"title": title, "url": url, "snippet": snippet, "date": date})
-            if len(results) >= 10:
+            if len(results) >= 15:
                 return results
 
     for node in _walk(payload):
@@ -227,7 +164,7 @@ def _extract_web_results(payload: object) -> List[dict]:
         )
         date = node.get("date") if isinstance(node.get("date"), str) else ""
         results.append({"title": title, "url": url, "snippet": snippet, "date": date})
-    return results[:10]
+    return results[:15]
 
 
 def _safe_json_from_text(text: str) -> Optional[dict]:
@@ -420,86 +357,148 @@ def deepseek_plan_queries(name: str, theme: str, evidence: str, pass_id: int) ->
     _debug_print("plan_queries_parse_error", {"raw": _truncate(content, 2000)})
     return None
 
-# 确保你的 .env 文件里是 ZHIPUAI_API_KEY
-# 格式通常是: vector_... 或其他 (取决于你的 key 类型)
 
-class ZhipuSearchTool:
+# ============ Brave Search Tool (Primary) ============
+
+class BraveSearchTool:
     def __init__(self):
-        # 显式初始化，确保读取环境变量
-        api_key = os.environ.get("ZHIPUAI_API_KEY")
-        if not api_key:
-            raise ValueError("❌ 未找到 ZHIPUAI_API_KEY，请检查 .env 文件")
-        self.client = ZhipuAiClient(api_key=api_key)
+        self.api_key = os.environ.get("BRAVE_API_KEY")
+        self.count = int(os.environ.get("BRAVE_SEARCH_COUNT", "15"))
+        self.timeout = int(os.environ.get("BRAVE_SEARCH_TIMEOUT_S", "30"))
+        self.max_retries = int(os.environ.get("BRAVE_SEARCH_RETRIES", "3"))
+        self.rate_limit_qps = float(os.environ.get("BRAVE_RATE_LIMIT_QPS", "1.0"))
+        self._last_request_time = 0.0
 
-    def search(self, query: str, engine: str = "") -> str:
-        """
-        调用智谱 ZAI 原生 web_search 接口（更 raw、更稳定地拿到链接）
+    def search(self, query: str) -> str:
+        # Rate limit
+        elapsed = time.time() - self._last_request_time
+        min_interval = 1.0 / self.rate_limit_qps
+        if elapsed < min_interval:
+            time.sleep(min_interval - elapsed)
 
-        Args:
-            query: Search query string
-            engine: Override search engine (e.g. "search_std"). Empty = use default.
-        """
-        print(f"📡 Zhipu/Zai Searching: {query}...")
-        try:
-            # Support "site:domain" shortcut by mapping it to domain filter.
-            domain_filter = None
-            cleaned_query = query
-            m = re.search(r"site:([^\s]+)", query)
-            if m:
-                domain_filter = m.group(1).strip()
-                cleaned_query = re.sub(r"site:[^\s]+", "", query).strip()
+        recency = os.environ.get("BRAVE_SEARCH_RECENCY_FILTER", "oneMonth")
+        RECENCY_MAP = {"oneDay": "pd", "oneWeek": "pw", "oneMonth": "pm", "oneYear": "py"}
+        params = {
+            "q": query,
+            "count": min(self.count, 20),
+        }
+        if recency in RECENCY_MAP:
+            params["freshness"] = RECENCY_MAP[recency]
 
-            search_engine = engine or ZHIPU_SEARCH_ENGINE
-            kwargs = {
-                "search_engine": search_engine,
-                "search_query": cleaned_query,
-                "count": max(1, min(50, ZHIPU_SEARCH_COUNT)),
-                "search_recency_filter": ZHIPU_SEARCH_RECENCY_FILTER,
-                "content_size": ZHIPU_SEARCH_CONTENT_SIZE,
-            }
-            if domain_filter:
-                kwargs["search_domain_filter"] = domain_filter
+        headers = {
+            "Accept": "application/json",
+            "Accept-Encoding": "gzip",
+            "X-Subscription-Token": self.api_key,
+        }
 
-            last_error = None
-            resp_obj = None
-            for attempt in range(1, max(1, ZHIPU_SEARCH_RETRIES) + 1):
-                try:
-                    response = self.client.web_search.web_search(**kwargs)
-                    resp_obj = _to_dict(response)
-                    break
-                except Exception as e:
-                    last_error = str(e)
-                    if attempt < ZHIPU_SEARCH_RETRIES:
-                        time.sleep(0.5 * attempt)
+        print(f"🔍 Brave Searching: {query}...")
+        for attempt in range(1, self.max_retries + 1):
+            try:
+                resp = requests.get(
+                    "https://api.search.brave.com/res/v1/web/search",
+                    params=params, headers=headers, timeout=self.timeout
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                break
+            except Exception as e:
+                if attempt >= self.max_retries:
+                    self._last_request_time = time.time()
+                    return json.dumps({"results": [], "summary": f"Brave error: {e}", "meta": {}}, ensure_ascii=False)
+                time.sleep(0.5 * attempt)
 
-            if resp_obj is None:
-                normalized = {
-                    "results": [],
-                    "summary": "检索失败（连接/接口错误），请稍后重试。",
-                    "error": last_error or "unknown_error",
-                    "meta": {"query": cleaned_query, "domain_filter": domain_filter, **kwargs},
-                }
-                _debug_zhipu("normalized", normalized)
-                return json.dumps(normalized, ensure_ascii=False)
+        results = []
+        for r in data.get("web", {}).get("results", []):
+            results.append({
+                "title": r.get("title", ""),
+                "url": r.get("url", ""),
+                "snippet": r.get("description", ""),
+                "date": r.get("age", ""),
+            })
 
-            _debug_zhipu("raw_response", resp_obj)
+        self._last_request_time = time.time()
+        return json.dumps({"results": results, "summary": "", "meta": {}}, ensure_ascii=False)
 
-            results = _extract_web_results(resp_obj)
-            summary = "未找到相关链接。" if not results else ""
 
-            normalized = {
-                "results": results,
-                "summary": summary,
-                "meta": {"query": cleaned_query, "domain_filter": domain_filter, **kwargs},
-            }
-            _debug_zhipu("normalized", normalized)
-            return json.dumps(normalized, ensure_ascii=False)
-        except Exception as e:
-            normalized = {"results": [], "summary": "检索异常。", "error": str(e)}
-            _debug_zhipu("normalized", normalized)
-            return json.dumps(normalized, ensure_ascii=False)
+# ============ Exa.ai Search Tool (Backup) ============
 
-# 实例化工具
+class ExaSearchTool:
+    def __init__(self):
+        self.api_key = os.environ.get("EXA_API_KEY")
+        self.count = int(os.environ.get("EXA_SEARCH_COUNT", "15"))
+        self.timeout = int(os.environ.get("EXA_SEARCH_TIMEOUT_S", "60"))
+        self.max_retries = int(os.environ.get("EXA_SEARCH_RETRIES", "2"))
+
+    def search(self, query: str) -> str:
+        payload = {
+            "query": query,
+            "numResults": min(self.count, 20),
+            "type": "auto",
+            "contents": {"text": {"maxCharacters": 500}},
+        }
+        headers = {
+            "Content-Type": "application/json",
+            "x-api-key": self.api_key,
+        }
+
+        print(f"🔍 Exa Searching: {query}...")
+        for attempt in range(1, self.max_retries + 1):
+            try:
+                resp = requests.post(
+                    "https://api.exa.ai/search",
+                    json=payload, headers=headers, timeout=self.timeout
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                break
+            except Exception as e:
+                if attempt >= self.max_retries:
+                    return json.dumps({"results": [], "summary": f"Exa error: {e}", "meta": {}}, ensure_ascii=False)
+                time.sleep(1.0 * attempt)
+
+        results = []
+        for r in data.get("results", []):
+            results.append({
+                "title": r.get("title", ""),
+                "url": r.get("url", ""),
+                "snippet": (r.get("text") or "")[:500],
+                "date": r.get("publishedDate", ""),
+            })
+
+        return json.dumps({"results": results, "summary": "", "meta": {}}, ensure_ascii=False)
+
+
+# ============ Unified Search Backend ============
+
+_brave_tool = None
+_exa_tool = None
+
+
+def _get_brave():
+    global _brave_tool
+    if _brave_tool is None and os.environ.get("BRAVE_API_KEY"):
+        _brave_tool = BraveSearchTool()
+    return _brave_tool
+
+
+def _get_exa():
+    global _exa_tool
+    if _exa_tool is None and os.environ.get("EXA_API_KEY"):
+        _exa_tool = ExaSearchTool()
+    return _exa_tool
+
+
+def search_backend(query: str, engine: str = "") -> str:
+    """Unified search: Brave primary, Exa fallback."""
+    brave = _get_brave()
+    if brave:
+        return brave.search(query)
+    exa = _get_exa()
+    if exa:
+        return exa.search(query)
+    return json.dumps({"results": [], "summary": "No search backend configured.", "meta": {}}, ensure_ascii=False)
+
+
 # ============ Opportunity Query Templates (without site: restrictions for broader search) ============
 # These templates are used for opportunity discovery - finding positive catalysts
 # Each category has 2 queries (10 total for deep mode)
@@ -785,15 +784,20 @@ def extract_positive_findings(
 
 
 try:
-    zhipu_tool = ZhipuSearchTool()
-    zhipu_search = Tool(
-        name="zhipu_search",
-        func=zhipu_tool.search,
-        description="Search tool powered by Zhipu AI (GLM-4) for real-time A-share news.",
+    search_tool = Tool(
+        name="web_search",
+        func=search_backend,
+        description="Web search tool for real-time A-share news and regulatory filings.",
     )
-    print("✅ 智谱搜索工具 (ZhipuAI) 加载成功")
+    brave_ok = os.environ.get("BRAVE_API_KEY")
+    exa_ok = os.environ.get("EXA_API_KEY")
+    if brave_ok:
+        print("✅ Brave Search API loaded (primary)")
+    elif exa_ok:
+        print("✅ Exa.ai Search API loaded (backup)")
+    else:
+        print("⚠️ No search backend configured — set BRAVE_API_KEY or EXA_API_KEY")
 except Exception as e:
-    print(f"⚠️ 智谱工具加载失败: {e}")
-
-    def zhipu_search(query: str) -> str:
-        return json.dumps({"error": "Zhipu API key not configured", "results": []}, ensure_ascii=False)
+    print(f"⚠️ Search tool init failed: {e}")
+    def search_tool(query: str) -> str:
+        return json.dumps({"error": "Search backend unavailable", "results": []}, ensure_ascii=False)
