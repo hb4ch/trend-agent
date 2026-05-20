@@ -794,8 +794,8 @@ def test_end_to_end_fixture_ranking_and_audit_distribution():
         ),
     ]
     filtered, filtered_audits = trend_agent.apply_audit_filter(candidates, audits)
-    assert set(filtered["ts_code"].tolist()) == {"000001.SZ", "000002.SZ"}
-    assert set(a.verdict for a in filtered_audits) == {"pass", "warn"}
+    assert set(filtered["ts_code"].tolist()) == {"000001.SZ"}
+    assert set(a.verdict for a in filtered_audits) == {"pass"}
 
     signals = {
         "000001.SZ": {"breakout_window_ok": True, "already_breakout": False, "extended_breakout": False, "turnover_mult": 1.6},

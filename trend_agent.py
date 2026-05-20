@@ -110,7 +110,7 @@ class StrategyConfig:
     hard_fail_reduce_materiality_threshold: float = 0.03
     theme_match_policy: str = "balanced"  # conservative|balanced|aggressive
     theme_pre_audit_cap: int = 30
-    theme_post_audit_cap: int = 5
+    theme_post_audit_cap: int = 8
     max_names_per_theme: int = 4
     max_names_per_industry: int = 4
     gemma_batch_size: int = 4
@@ -147,7 +147,7 @@ class StrategyConfig:
             hard_fail_reduce_materiality_threshold=float(os.environ.get("HARD_FAIL_REDUCE_MATERIALITY_THRESHOLD", "0.03")),
             theme_match_policy=theme_match_policy,
             theme_pre_audit_cap=max(1, int(os.environ.get("THEME_PRE_AUDIT_CAP", "30"))),
-            theme_post_audit_cap=max(1, int(os.environ.get("THEME_POST_AUDIT_CAP", "5"))),
+            theme_post_audit_cap=max(1, int(os.environ.get("THEME_POST_AUDIT_CAP", "8"))),
             max_names_per_theme=int(os.environ.get("MAX_NAMES_PER_THEME", "4")),
             max_names_per_industry=int(os.environ.get("MAX_NAMES_PER_INDUSTRY", "4")),
             gemma_batch_size=max(1, int(os.environ.get("GEMMA_BATCH_SIZE", "4"))),
@@ -2709,7 +2709,7 @@ def apply_audit_filter(
         counts = candidates["audit_verdict"].value_counts().to_dict()
         logger.info(f"Audit verdict distribution: {counts}")
 
-    filtered = candidates[candidates["audit_verdict"] != "fail"]
+    filtered = candidates[candidates["audit_verdict"] == "pass"]
     allowed_codes = set(filtered["ts_code"])
     filtered_audits = [audit for audit in audits if audit.ts_code in allowed_codes]
 
@@ -3346,7 +3346,7 @@ def rank_candidates_for_alpha(
     ranked = trim_post_audit_theme_candidates(
         ranked.reset_index(drop=True),
         theme_post_audit_cap=config.theme_post_audit_cap,
-        total_cap=max(10, config.theme_post_audit_cap),
+        total_cap=max(15, config.theme_post_audit_cap),
     )
     ranked = apply_diversification_constraints(
         ranked,
@@ -3710,10 +3710,6 @@ def phase3_deep_audit(
             minor_regulatory_patterns = [
                 re.compile(r"(监管函|问询函|关注函|责令改正|监管措施决定书)"),
             ]
-            positive_terms = [
-                "订单", "中标", "客户", "签约", "签署", "签订",
-                "合同", "协议", "合作", "供货", "落地", "框架协议",
-            ]
 
             executed_passes = 0
             for pass_id in range(1, 4):
@@ -3980,37 +3976,13 @@ def phase3_deep_audit(
                         flat_urls.append(url)
             primary_urls = [u for u in flat_urls if any(dom in u for dom in PRIMARY_SOURCE_DOMAINS)]
 
-            # Check if we found positive evidence from opportunity pass
-            # Lower threshold: any finding or evidence snippet counts
-            has_positive_from_opportunity = len(positive_findings) >= 1 or len(opportunity_evidence) >= 2
-            has_positive = any(term in final_text for term in positive_terms) or has_positive_from_opportunity
-
             # Override LLM verdict if we have opportunity findings (LLM may be too harsh)
-            if verdict == "fail" and has_positive_from_opportunity and not deterministic_hard_veto:
+            if verdict == "fail" and (len(positive_findings) >= 1 or len(opportunity_evidence) >= 2) and not deterministic_hard_veto:
                 verdict = "warn"
                 rationale = (rationale + "；LLM判定失败但发现正面催化信息，降级为存疑。").strip("；")
 
-            if verdict != "fail" and not has_positive:
-                if not flat_urls and not opportunity_urls:
-                    verdict = "warn"
-                    rationale = (rationale + "；检索未返回可核验URL，无法完成审计式验真，暂按存疑处理。").strip("；")
-                elif executed_passes >= 2 or len(used_queries) >= 4:
-                    # More lenient: only fail if we have zero opportunity evidence
-                    if len(positive_findings) >= 1 or len(opportunity_evidence) >= 1:
-                        verdict = "warn"
-                        rationale = (rationale + "；官方源证据不足，但发现部分正面信息，暂按存疑处理。").strip("；")
-                    else:
-                        verdict = "warn"  # Changed from fail - let research phase be more lenient
-                        rationale = (rationale + "；未找到明确硬证据，暂按存疑处理（需进一步验证）。").strip("；")
-                else:
-                    verdict = "warn"
-                    rationale = (rationale + "；当前检索未找到明确订单/客户/中标等硬证据，暂按存疑处理。").strip("；")
-
             if verdict != "fail" and recent_minor_reg:
                 rationale = (rationale + f"；检索到近{config.hard_fail_max_age_days}天内监管函/问询函等事项，需额外关注。").strip("；")
-            if verdict == "pass" and not primary_urls:
-                verdict = "warn"
-                rationale = (rationale + "；缺少交易所/巨潮等一手来源链接，按审计口径降级。").strip("；")
 
             # Combine sources from both passes. Deterministic hard vetoes keep only trigger evidence.
             if deterministic_hard_veto and sources:
@@ -5344,7 +5316,7 @@ def _fallback_stock_section(
         f"{a.theme}: {a.rationale}"
         for a in stock_audits
         if normalize_verdict(a.verdict) in {"warn", "fail"}
-    ] or ["题材轮动快，需关注市场主线是否持续。"]
+    ] or ["通过审计筛选，需持续跟踪题材轮动与市场主线变化。"]
     positive_findings: List[PositiveFinding] = []
     growth_catalysts: List[GrowthCatalyst] = []
     for audit in stock_audits:

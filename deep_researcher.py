@@ -143,7 +143,7 @@ def _extract_web_results(payload: object) -> List[dict]:
                     date = dv.strip()
                     break
             results.append({"title": title, "url": url, "snippet": snippet, "date": date})
-            if len(results) >= 15:
+            if len(results) >= 20:
                 return results
 
     for node in _walk(payload):
@@ -164,7 +164,7 @@ def _extract_web_results(payload: object) -> List[dict]:
         )
         date = node.get("date") if isinstance(node.get("date"), str) else ""
         results.append({"title": title, "url": url, "snippet": snippet, "date": date})
-    return results[:15]
+    return results[:20]
 
 
 def _safe_json_from_text(text: str) -> Optional[dict]:
@@ -363,7 +363,7 @@ def deepseek_plan_queries(name: str, theme: str, evidence: str, pass_id: int) ->
 class BraveSearchTool:
     def __init__(self):
         self.api_key = os.environ.get("BRAVE_API_KEY")
-        self.count = int(os.environ.get("BRAVE_SEARCH_COUNT", "15"))
+        self.count = int(os.environ.get("BRAVE_SEARCH_COUNT", "20"))
         self.timeout = int(os.environ.get("BRAVE_SEARCH_TIMEOUT_S", "30"))
         self.max_retries = int(os.environ.get("BRAVE_SEARCH_RETRIES", "3"))
         self.rate_limit_qps = float(os.environ.get("BRAVE_RATE_LIMIT_QPS", "1.0"))
@@ -425,7 +425,7 @@ class BraveSearchTool:
 class ExaSearchTool:
     def __init__(self):
         self.api_key = os.environ.get("EXA_API_KEY")
-        self.count = int(os.environ.get("EXA_SEARCH_COUNT", "15"))
+        self.count = int(os.environ.get("EXA_SEARCH_COUNT", "20"))
         self.timeout = int(os.environ.get("EXA_SEARCH_TIMEOUT_S", "60"))
         self.max_retries = int(os.environ.get("EXA_SEARCH_RETRIES", "2"))
 
