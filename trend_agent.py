@@ -5020,12 +5020,19 @@ _STOCK_SECTION_SYSTEM_PROMPT_TEMPLATE = (
     "9. regime='downtrend'（下行趋势）或 regime='bottom_fishing'（箱底陷阱）：\n"
     "   摘要首句必须包含\"【风险】\"警示。必须分析结构性风险，不能仅凭低位建议配置。\n"
     "\n"
-    "如需补充信息，可先返回工具调用："
-    "{\"tool\":\"web_search|duckdb|python\",\"input\":\"...\"}\n"
-    "优先顺序：1) 直接使用上下文；2) 用python做检查、衍生指标、证据汇总、数据变换；3) 缺少原始历史行时再用duckdb；4) 缺少外部信息时用web_search。\n"
-    "结构化财务事实优先直接使用上下文中的本地/内部财务数据，不要为了重复验证财务数值而额外发起web_search。\n"
-    "当你缺少近期外部证据时，必须优先通过web_search补证，而不是凭常识推断。尤其是以下场景：最新进展、政策催化、监管动态、客户/订单验证、诉讼调查、产业链合作、市场传闻核验。\n"
-    "如果财务信息已经足够，请把web_search集中用于非财务外部证据，例如公告、新闻、政策、客户、订单、监管和公司事件。\n"
+    "【强制工具调用 — 必须遵守】\n"
+    "你必须先执行至少一次web_search来获取该股票的最新外部信息，然后再输出最终JSON。\n"
+    "第一次响应必须返回工具调用，格式：{\"tool\":\"web_search\",\"input\":\"<股票名称> 最新公告 新闻 2026\"}\n"
+    "web_search必须搜索以下内容（至少覆盖3类）：\n"
+    "  - 最新公告/新闻（近30天）\n"
+    "  - 监管/诉讼/问询动态\n"
+    "  - 客户/订单/合同最新进展\n"
+    "  - 产业链/行业政策变化\n"
+    "收到搜索结果后，可选择性地再用python做数据验证或duckdb查历史行情，然后输出最终JSON。\n"
+    "禁止跳过web_search直接输出stock JSON——跳过搜索是严重的分析失误，等同于制造幻觉。\n"
+    "工具调用格式：{\"tool\":\"web_search|duckdb|python\",\"input\":\"...\"}\n"
+    "优先顺序：1) web_search获取最新外部信息（必须第一步）；2) 用python做检查、衍生指标、证据汇总；3) 缺少原始历史行时再用duckdb。\n"
+    "结构化财务事实优先使用上下文中的本地/内部财务数据，不要为了重复验证财务数值而额外发起web_search。\n"
     "Python工具保持开放式，不限制写法。可用变量：stock_profile(dict), signal_row(dict), audit_rows(list[dict]), chart_notes(list), candidates_df(DataFrame), pd, np, duckdb, json, math, datetime, re。\n"
     "Python中额外提供可选工具：show(obj, limit), to_df(obj), current_stock_df(), recent_prices(ts_code=None, days=60), audit_summary()。它们只是方便函数，你也可以自由写任意Python代码。\n"
     "DuckDB主要用于原始历史行检索。signal_row 和 stock_profile 都是单行当前股票上下文，不是完整股票表，不要按 name/ts_code 再过滤它们。\n"
@@ -5661,6 +5668,9 @@ def _generate_stock_section(
     last_failure_tool = None
     repeated_failure_count = 0
     max_iterations = 5
+    tool_calls_made = 0
+    web_search_made = False
+    enforcement_sent = False
     missing_sources_feedback_sent = False
     allowed_source_urls = build_allowed_stock_source_set(stock_audits)
     trace_append(trace_path, "stock_section_request", {"ts_code": ts_code, "name": name})
@@ -5671,7 +5681,14 @@ def _generate_stock_section(
         trace_append(trace_path, "stock_section_response", {"ts_code": ts_code, "content": truncate(content, 8000)})
         parsed = safe_json_loads(content)
         tool = parsed.get("tool") if isinstance(parsed, dict) else None
+        if not tool and tool_calls_made == 0 and not enforcement_sent and isinstance(parsed, dict) and (parsed.get("stock") or parsed.get("stock_section")):
+            enforcement_sent = True
+            messages.append({"role": "user", "content": "必须先执行web_search获取最新外部信息，再输出stock JSON。请返回工具调用：{\"tool\":\"web_search\",\"input\":\"<股票名称> <股票代码> 最新公告 新闻 2026\"}"})
+            continue
         if tool:
+            tool_calls_made += 1
+            if tool == "web_search":
+                web_search_made = True
             tool_input = parsed.get("input", "")
             start = time.perf_counter()
             result = _execute_agent_tool(tool, tool_input, tool_context)
@@ -5826,7 +5843,7 @@ def _build_report_model(
     theme_context = "; ".join(f"{t.name}({t.validation_status})" for t in themes)
     stock_sections: List[ReportStockSection] = []
     stock_limit = min(10, len(candidates_with_flag))
-    tool_stats: Dict[str, Any] = {"total_calls": 0, "per_tool": {}, "python_after_duckdb_failure": 0}
+    tool_stats: Dict[str, Any] = {"total_calls": 0, "per_tool": {}, "python_after_duckdb_failure": 0, "stocks_with_web_search": 0, "stocks_total": 0}
     for idx, (_, row) in enumerate(candidates_with_flag.head(stock_limit).iterrows()):
         ts_code = str(row["ts_code"])
         name = row.get("name", ts_code)
@@ -5834,11 +5851,18 @@ def _build_report_model(
         chart = chart_artifacts.get(ts_code)
         ctx = _build_stock_context(row.to_dict(), stock_audits, chart_artifacts, signals, theme_context)
         logger.info(f"Phase 5: generating stock section {idx + 1}/{stock_limit} for {name}({ts_code})...")
+        ws_before = tool_stats.get("per_tool", {}).get("web_search", {}).get("success", 0)
         stock_sections.append(
             _generate_stock_section(ctx, trace_path, candidates_with_flag, row.to_dict(), stock_audits, chart, tool_stats=tool_stats)
         )
+        tool_stats["stocks_total"] = int(tool_stats.get("stocks_total", 0)) + 1
+        ws_after = tool_stats.get("per_tool", {}).get("web_search", {}).get("success", 0)
+        if ws_after > ws_before:
+            tool_stats["stocks_with_web_search"] = int(tool_stats.get("stocks_with_web_search", 0)) + 1
     logger.info(
-        "Phase 5 tool summary: total_calls=%s python=%s duckdb=%s web_search=%s python_after_duckdb_failure=%s",
+        "Phase 5 tool summary: stocks_with_web_search=%s/%s total_calls=%s python=%s duckdb=%s web_search=%s python_after_duckdb_failure=%s",
+        tool_stats.get("stocks_with_web_search", 0),
+        tool_stats.get("stocks_total", 0),
         tool_stats.get("total_calls", 0),
         tool_stats.get("per_tool", {}).get("python", {}),
         tool_stats.get("per_tool", {}).get("duckdb", {}),

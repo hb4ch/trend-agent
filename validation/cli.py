@@ -6,7 +6,7 @@ from pathlib import Path
 
 from validation.factor_eval import evaluate_from_labels_path
 from validation.label_builder import LabelConfig, build_forward_labels
-from validation.portfolio_backtest import BacktestConfig, _weekly_signal_dates, run_backtest
+from playground.common.portfolio_backtest import BacktestConfig, _weekly_signal_dates, run_backtest
 from validation.report import write_backtest_report, write_factor_report
 from validation.signal_store import SignalConfig, load_candidates, read_table, snapshot_candidates
 

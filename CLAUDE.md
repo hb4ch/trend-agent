@@ -99,8 +99,8 @@ VOLATILITY_THRESHOLD = 0.50 # 50% max amplitude (relaxed from 35%)
 ```
 
 **Composite Score Weights (IC-Calibrated):**
-- Consolidation: 35%
-- Volume Quality: 18%
+- Consolidation: 48%
+- Volume Quality: 5% (down-weighted from 18% — pullback entries favor contraction, not expansion)
 - Squeeze Readiness: 15%
 - Valuation Quality: 10%
 - Fundamental Quality: 22%

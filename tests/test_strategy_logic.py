@@ -2,6 +2,7 @@ import json
 from pathlib import Path
 
 import pandas as pd
+import pytest
 from langchain_core.runnables import RunnableLambda
 
 import deep_researcher
@@ -1444,8 +1445,10 @@ def test_build_stock_section_system_prompt_includes_duckdb_schema():
     assert "candidates_df(ts_code, name)" in prompt
     assert "stock_profile(dict)" in prompt
     assert "signal_row(dict)" in prompt
-    assert "优先顺序：1) 直接使用上下文；2) 用python做检查" in prompt
-    assert "缺少近期外部证据时，必须优先通过web_search补证" in prompt
+    assert "强制工具调用" in prompt
+    assert "必须先执行至少一次web_search" in prompt
+    assert "禁止跳过web_search直接输出stock JSON" in prompt
+    assert "最新公告/新闻（近30天）" in prompt
     assert "不要为了重复验证财务数值而额外发起web_search" in prompt
 
 
@@ -2122,7 +2125,7 @@ def test_generate_stock_section_requests_web_search_when_sources_are_weak(monkey
     )
     assert section.summary == "补完来源后的结论"
     assert section.source_urls == ["https://www.cninfo.com.cn/a", "https://www.cninfo.com.cn/b"]
-    assert any("请先调用 web_search 补充近期、可点击、可核验的外部来源" in msg for msg in user_messages)
+    assert any("必须先执行web_search获取最新外部信息" in msg for msg in user_messages)
 
 
 def test_generate_stock_section_accepts_payload_with_strong_sources(monkeypatch, tmp_path):
@@ -2173,7 +2176,122 @@ def test_generate_stock_section_accepts_payload_with_strong_sources(monkeypatch,
         None,
     )
     assert section.summary == "来源充足"
-    assert calls["n"] == 1
+    # enforcement fires once (1st response has no tool call) → LLM retries → accepted on 2nd pass
+    assert calls["n"] == 2
+
+
+def test_mandatory_web_search_enforcement_with_real_candidate_data(monkeypatch, tmp_path):
+    """从昨晚真实CSV取一只候选股，验证首次跳工具会被强制拉回。
+
+    复现场景：deepseek_chat第一次直接返回stock JSON（昨晚的实际行为），
+    新代码应该拦截并注入\"必须先执行web_search\"指令。
+    """
+    import csv as _csv
+    import io
+
+    # 从昨晚真实candidates CSV中取维信诺的数据
+    csv_path = Path(__file__).parent.parent / "reports" / "candidates_20260521_225127.csv"
+    if not csv_path.exists():
+        pytest.skip("candidates CSV not found (run pipeline first)")
+
+    rows = []
+    with open(csv_path, encoding="utf-8-sig") as f:
+        for r in _csv.DictReader(f):
+            if r.get("ts_code") == "002387.SZ":
+                rows.append(r)
+                break
+    if not rows:
+        pytest.skip("维信诺(002387.SZ) not found in candidates CSV")
+
+    real_row = rows[0]
+    real_row["matched_themes"] = real_row.get("matched_themes", "[]")
+
+    calls = {"n": 0}
+    user_messages = []
+
+    def fake_deepseek_chat(messages):
+        calls["n"] += 1
+        # 第1次：模拟昨晚行为 — 直接返回stock JSON，不走工具调用
+        if calls["n"] == 1:
+            return json.dumps(
+                {
+                    "stock": {
+                        "ts_code": "002387.SZ",
+                        "name": "维信诺",
+                        "recommendation": "watch",
+                        "summary": "箱体57%分位，中位整理",
+                        "investment_logic": ["周期位置：中位"],
+                        "positive_findings": [],
+                        "technical_analysis": ["技术A"],
+                        "capital_validation": ["资金A"],
+                        "trade_plan": ["等回踩"],
+                        "risks": ["风险A"],
+                        "source_urls": [],
+                        "research_depth": "standard",
+                    }
+                },
+                ensure_ascii=False,
+            )
+        # 第2次：收到强制web_search指令后，返回工具调用
+        if calls["n"] == 2:
+            user_messages.append(messages[-1]["content"])
+            return json.dumps(
+                {"tool": "web_search", "input": "维信诺 002387 OLED ViP技术 最新公告 2026"},
+                ensure_ascii=False,
+            )
+        # 第3次：返回补充来源后的最终JSON
+        user_messages.append(messages[-1]["content"])
+        return json.dumps(
+            {
+                "stock": {
+                    "ts_code": "002387.SZ",
+                    "name": "维信诺",
+                    "recommendation": "watch",
+                    "summary": "箱体57%分位，中位整理，web_search确认无新增风险",
+                    "investment_logic": ["周期位置：中位"],
+                    "positive_findings": [],
+                    "technical_analysis": ["技术A"],
+                    "capital_validation": ["资金A"],
+                    "trade_plan": ["等回踩"],
+                    "risks": ["风险A"],
+                    "source_urls": ["https://www.cninfo.com.cn/real-announcement"],
+                    "research_depth": "standard",
+                }
+            },
+            ensure_ascii=False,
+        )
+
+    monkeypatch.setattr(trend_agent, "deepseek_chat", fake_deepseek_chat)
+    monkeypatch.setattr(
+        trend_agent,
+        "_execute_agent_tool",
+        lambda tool, tool_input, tool_context: json.dumps(
+            {"summary": "web_search ok: found 3 recent announcements", "urls": ["https://www.cninfo.com.cn/real-announcement"]},
+            ensure_ascii=False,
+        ),
+    )
+
+    ctx = trend_agent._build_stock_context(real_row, [], {}, {}, {"market_regime": "range"})
+
+    section = trend_agent._generate_stock_section(
+        ctx,
+        tmp_path / "trace.jsonl",
+        pd.DataFrame([real_row]),
+        real_row,
+        [],
+        None,
+    )
+
+    # 验证：强制指令确实被注入
+    assert len(user_messages) >= 1
+    enforcement_msg = user_messages[0]
+    assert "必须先执行web_search获取最新外部信息" in enforcement_msg, (
+        f"Expected mandatory web_search enforcement, got: {enforcement_msg[:200]}"
+    )
+    # 验证：LLM被拉回后完成了工具调用+最终输出
+    assert "web_search ok" in section.summary or section.source_urls
+    # 验证：总共调用了3次（stock→enforce→tool→final），不是1次直达
+    assert calls["n"] >= 3, f"Expected >=3 calls (enforcement triggered), got {calls['n']}"
 
 
 def test_normalize_stock_section_filters_unproven_urls_and_finding_sources():

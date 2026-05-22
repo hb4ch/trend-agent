@@ -9,7 +9,7 @@ import pandas as pd
 
 from validation.factor_eval import FactorEvalResult, evaluate_from_labels_path
 from validation.label_builder import DEFAULT_LABEL_PATH
-from validation.portfolio_backtest import BacktestConfig, BacktestResult, run_backtest
+from playground.common.portfolio_backtest import BacktestConfig, BacktestResult, run_backtest
 
 
 REPORT_ROOT = Path("data/validation_reports")

@@ -5,7 +5,7 @@ import pytest
 
 from validation.label_builder import LabelConfig, build_forward_labels
 from validation.metrics import calculate_ic, calculate_rank_ic, select_top_n
-from validation.portfolio_backtest import BacktestConfig, run_backtest
+from playground.common.portfolio_backtest import BacktestConfig, run_backtest
 from validation.signal_store import SignalConfig, snapshot_candidates
 
 

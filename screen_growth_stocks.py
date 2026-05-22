@@ -869,8 +869,8 @@ def screen_all_stocks() -> pd.DataFrame:
     results_df = fundamental_quick_screen(results_df)
     fundamental_q = results_df.get("fundamental_quality_score", pd.Series(50.0, index=results_df.index))
     results_df['composite_score'] = (
-        results_df['consolidation_score'] * 0.35 +
-        results_df['volume_quality_score'] * 0.18 +
+        results_df['consolidation_score'] * 0.48 +
+        results_df['volume_quality_score'] * 0.05 +
         results_df['squeeze_readiness'] * 0.15 +
         results_df['valuation_quality_score'] * 0.10 +
         fundamental_q * 0.22
