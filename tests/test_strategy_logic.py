@@ -306,10 +306,9 @@ def test_screen_all_stocks_outputs_trend_emergence_columns(monkeypatch, tmp_path
         "fresh_breakout",
         "near_breakout",
         "trend_emergence_score",
-        "technical_selection_score",
+        "consolidation_score",
     ]:
         assert col in out.columns
-    assert row["technical_selection_score"] == row["composite_score"] * 0.85 + row["trend_emergence_score"] * 0.15
 
 
 def test_compute_signals_merges_candidate_technical_context(monkeypatch):
@@ -332,7 +331,7 @@ def test_compute_signals_merges_candidate_technical_context(monkeypatch):
                 "fresh_breakout": False,
                 "near_breakout": True,
                 "trend_emergence_score": 72.0,
-                "technical_selection_score": 64.0,
+                "consolidation_score": 64.0,
             }
         ]
     )
@@ -352,7 +351,7 @@ def test_compute_signals_merges_candidate_technical_context(monkeypatch):
     assert signals["A"]["fresh_breakout"] is False
     assert signals["A"]["near_breakout"] is True
     assert signals["A"]["trend_emergence_score"] == 72.0
-    assert signals["A"]["technical_selection_score"] == 64.0
+    assert signals["A"]["consolidation_score"] == 64.0
 
 
 def test_run_python_can_access_signal_ema20():
@@ -722,6 +721,10 @@ def test_end_to_end_fixture_ranking_and_audit_distribution():
                 "ma_spread": 0.10,
                 "theme_strength_score": 1.0,
                 "toplist_recency_score": 0.1,
+                "consolidation_score": 70.0,
+                "squeeze_readiness": 60.0,
+                "valuation_quality_score": 70.0,
+                "valuation_stretch_score": 30.0,
             },
             {
                 "ts_code": "000002.SZ",
@@ -731,6 +734,10 @@ def test_end_to_end_fixture_ranking_and_audit_distribution():
                 "ma_spread": 0.20,
                 "theme_strength_score": 0.7,
                 "toplist_recency_score": 0.5,
+                "consolidation_score": 55.0,
+                "squeeze_readiness": 40.0,
+                "valuation_quality_score": 60.0,
+                "valuation_stretch_score": 40.0,
             },
             {
                 "ts_code": "000003.SZ",
@@ -2770,29 +2777,31 @@ def test_phase2_technical_selection_prefers_trend_emergence_score(monkeypatch):
             [
                 {
                     "ts_code": "000001.SZ",
-                    "name": "CompositeOnly",
+                    "name": "LowQuality",
                     "industry": "软件",
                     "main_business": "软件",
                     "business_scope": "软件",
                     "introduction": "软件",
                     "consolidation_score": 70,
+                    "squeeze_readiness": 50.0,
+                    "fundamental_quality_score": 40.0,
+                    "valuation_quality_score": 50.0,
                     "volume_boost": 1.3,
                     "composite_score": 80.0,
-                    "trend_emergence_score": 10.0,
-                    "technical_selection_score": 59.0,
                 },
                 {
                     "ts_code": "000002.SZ",
-                    "name": "EmergingTrend",
+                    "name": "HighQuality",
                     "industry": "软件",
                     "main_business": "软件",
                     "business_scope": "软件",
                     "introduction": "软件",
                     "consolidation_score": 70,
+                    "squeeze_readiness": 50.0,
+                    "fundamental_quality_score": 80.0,
+                    "valuation_quality_score": 70.0,
                     "volume_boost": 1.3,
                     "composite_score": 76.0,
-                    "trend_emergence_score": 90.0,
-                    "technical_selection_score": 80.2,
                 },
             ]
         ),
@@ -2802,7 +2811,9 @@ def test_phase2_technical_selection_prefers_trend_emergence_score(monkeypatch):
     tech_rows = out[out["list_type"] == "technical"]
 
     assert tech_rows.iloc[0]["ts_code"] == "000002.SZ"
-    assert tech_rows.iloc[0]["alpha_rank_score"] == 80.2
+    # HighQuality: 80*0.35 + 70*0.15 + 70*0.35 + 50*0.15 = 28+10.5+24.5+7.5 = 70.5
+    # LowQuality:  40*0.35 + 50*0.15 + 70*0.35 + 50*0.15 = 14+7.5+24.5+7.5 = 53.5
+    assert tech_rows.iloc[0]["alpha_rank_score"] > tech_rows.iloc[1]["alpha_rank_score"]
 
 
 def test_rank_candidates_for_alpha_prefers_reasonable_valuation():
@@ -2821,6 +2832,8 @@ def test_rank_candidates_for_alpha_prefers_reasonable_valuation():
                 "valuation_quality_score": 80.0,
                 "valuation_stretch_score": 20.0,
                 "valuation_label": "合理",
+                "consolidation_score": 70.0,
+                "squeeze_readiness": 60.0,
             },
             {
                 "ts_code": "000002.SZ",
@@ -2835,6 +2848,8 @@ def test_rank_candidates_for_alpha_prefers_reasonable_valuation():
                 "valuation_quality_score": 25.0,
                 "valuation_stretch_score": 90.0,
                 "valuation_label": "显著高估",
+                "consolidation_score": 70.0,
+                "squeeze_readiness": 60.0,
             },
         ]
     )
@@ -3431,6 +3446,8 @@ def test_rank_candidates_for_alpha_trims_theme_post_audit_to_top_5_and_backfills
                 "valuation_quality_score": 70.0,
                 "valuation_stretch_score": 30.0,
                 "valuation_label": "合理",
+                "consolidation_score": 70.0,
+                "squeeze_readiness": 60.0,
             }
         )
         signals[ts_code] = {"breakout_window_ok": True, "already_breakout": False, "extended_breakout": False, "turnover_mult": 1.8}
@@ -3450,6 +3467,8 @@ def test_rank_candidates_for_alpha_trims_theme_post_audit_to_top_5_and_backfills
                 "valuation_quality_score": 70.0,
                 "valuation_stretch_score": 30.0,
                 "valuation_label": "合理",
+                "consolidation_score": 70.0,
+                "squeeze_readiness": 60.0,
             }
         )
         signals[ts_code] = {"breakout_window_ok": True, "already_breakout": False, "extended_breakout": False, "turnover_mult": 1.8}
@@ -3676,6 +3695,8 @@ def test_rank_candidates_for_alpha_uses_business_quality_signal():
                 "valuation_quality_score": 70.0,
                 "valuation_stretch_score": 30.0,
                 "valuation_label": "合理",
+                "consolidation_score": 70.0,
+                "squeeze_readiness": 60.0,
             },
             {
                 "ts_code": "000002.SZ",
@@ -3690,6 +3711,8 @@ def test_rank_candidates_for_alpha_uses_business_quality_signal():
                 "valuation_quality_score": 70.0,
                 "valuation_stretch_score": 30.0,
                 "valuation_label": "合理",
+                "consolidation_score": 70.0,
+                "squeeze_readiness": 60.0,
             },
         ]
     )

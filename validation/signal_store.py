@@ -20,7 +20,7 @@ class SignalConfig:
     score_columns: tuple[str, ...] = (
         "alpha_rank_score",
         "composite_score",
-        "technical_selection_score",
+        "consolidation_score",
         "volume_quality_score",
         "valuation_quality_score",
     )

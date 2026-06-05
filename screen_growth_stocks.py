@@ -54,6 +54,11 @@ VALUATION_WEIGHTS = {
 OBV_DIVERGENCE_MIN_NORM = 0.05
 OBV_DIVERGENCE_MAX_PRICE_CHANGE = 0.03
 
+# ── Risk filters (added 2026-06-06 post-backtest) ──
+PE_HARD_CAP = 300.0        # PE above this = hard filter (earnings too thin or negative → PE NaN)
+MIN_DAILY_TURNOVER = 30e4  # 最低日均成交额 30万元 (filters illiquid penny stocks)
+MIN_DATA_DAYS_LIQUIDITY = 60  # 流动性计算窗口
+
 
 def load_stock_basic() -> pd.DataFrame:
     """Load stock basic information."""
@@ -483,6 +488,26 @@ def analyze_stock_technical(df, current_date=None):
     if not (MARKET_CAP_MIN <= market_cap_yuan <= MARKET_CAP_MAX):
         return None
 
+    # 1.5 PE硬过滤：NaN（亏损）或极端高PE → 不入池
+    pe_val = latest.get("pe")
+    if pe_val is None or (isinstance(pe_val, float) and (pe_val != pe_val)):  # NaN check
+        # Check if it's a new IPO (< 2 years data) — give temporary pass
+        if len(df) >= 500:  # ~2 trading years
+            return None  # established company with negative earnings → skip
+    elif isinstance(pe_val, (int, float)) and pe_val > PE_HARD_CAP:
+        return None  # PE > 300 → earnings paper-thin, too fragile
+
+    # 1.6 流动性过滤：日均成交额 < MIN_DAILY_TURNOVER → 不入池
+    if "amount" in df.columns or "vol" in df.columns:
+        if "amount" in df.columns:
+            daily_amount = df["amount"].tail(MIN_DATA_DAYS_LIQUIDITY)
+        else:
+            # Approximate from vol * close when amount not available
+            vol_col = "vol" if "vol" in df.columns else "volume"
+            daily_amount = df[vol_col].tail(MIN_DATA_DAYS_LIQUIDITY) * df["close"].tail(MIN_DATA_DAYS_LIQUIDITY) * 100
+        if daily_amount.mean() < MIN_DAILY_TURNOVER:
+            return None
+
     # 2. 计算技术指标
     recent = df.tail(CONSOLIDATION_DAYS)
 
@@ -874,10 +899,6 @@ def screen_all_stocks() -> pd.DataFrame:
         results_df['squeeze_readiness'] * 0.15 +
         results_df['valuation_quality_score'] * 0.10 +
         fundamental_q * 0.22
-    )
-    results_df["technical_selection_score"] = (
-        results_df["composite_score"] * 0.85 +
-        results_df["trend_emergence_score"] * 0.15
     )
     results_df = results_df.sort_values('composite_score', ascending=False)
 

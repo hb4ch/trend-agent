@@ -13,7 +13,7 @@
 
 | 原则 | 含义 | 实现 |
 |------|------|------|
-| **重质** | 基本面质量是第一道筛子 | 生命周期感知的四维度评分（盈利/成长/财务健康/盈利质量），占复合权重22%，alpha权重27% |
+| **重质** | 基本面质量是第一道筛子 | 生命周期感知的四维度评分（盈利/成长/财务健康/盈利质量），quality_score占alpha权重40%（其中fundamental 70%） |
 | **通过滤** | 审计级排雷 | 机会发现 → 对抗性否决双重审查，立案/减持/退市/伪概念一票否决，warn股票从最终报告剔除 |
 | **待回踩** | 不在突破中买入，在回调中买入 | 5种市场状态分类器 → 状态感知alpha调制 → 箱顶惩罚/回踩奖励 |
 
@@ -99,15 +99,19 @@ flowchart TD
 
 ## Phase 4: 信号计算 + 状态分类
 
-### Alpha评分（状态感知）
+### Alpha评分（三支柱模型）
 
 ```python
 regime, regime_conf = classify_regime(signals)
 
-# 状态条件调制
-pullback_reward = 0.12×pullback if uptrend   else
-                  0.05×pullback if range_low  else 0.0
+# 三支柱核心
+quality_score = fundamental_quality * 0.70 + valuation_quality * 0.30   # 重质
+setup_score = consolidation * 0.50 + squeeze * 0.25 + pullback_depth * 0.25  # 待回踩
+audit_score = findings*0.30 + catalysts*0.25 + source_quality*0.20 + audit_safe*0.25  # 通过滤
 
+# 状态条件调制（同前）
+pullback_reward = 0.12×pullback if uptrend else
+                  0.05×pullback if range_low else 0.0
 mid_range_bonus = 0.08×regime_conf if range else 0.0
 breakout_penalty = -0.08×regime_conf if breakout_zone else
                    -0.05 if pos>0.90 else 0.0
@@ -115,14 +119,17 @@ regime_penalty = -0.06×conf if downtrend else
                  -0.03×conf if bottom_fishing else 0.0
 
 alpha = (
-    0.10×consolidation + 0.15×volume + 0.14×ma_comp
-    + 0.14×theme + 0.10×valuation + 0.27×fundamental
-    + 0.10×findings + 0.07×catalysts + 0.06×sources + 0.07×audit_safe
-    - 0.12×overcrowding - 0.10×valuation_stretch - 0.08×volatility
+    quality_score * 0.40    # 质量（重质）
+    + setup_score * 0.35    # 时机（待回踩）
+    + audit_score * 0.25    # 验证（通过滤）
+    - 0.12 * overcrowding   # 拥挤惩罚
+    - 0.08 * volatility     # 波动惩罚
     + pullback_reward + mid_range_bonus
     + breakout_penalty + regime_penalty
 )
 ```
+
+题材仅作为门控（决定能否进入题材池），不作为评分因子。Pre-audit排名统一使用 `pre_audit_score = fundamental*0.35 + valuation*0.15 + consolidation*0.35 + squeeze*0.15 - toplist*0.05`。
 
 ---
 
@@ -221,7 +228,6 @@ REGULATORY_MAX_AGE_DAYS=730
 THEME_MATCH_POLICY=balanced
 MIN_PASS_COUNT=5
 MAX_REFILL_ROUNDS=2
-FUNDAMENTAL_WEIGHT_ALPHA=0.27
 FUNDAMENTAL_PRE_SCREEN_ENABLED=1
 ```
 

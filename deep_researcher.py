@@ -489,13 +489,24 @@ def _get_exa():
 
 
 def search_backend(query: str, engine: str = "") -> str:
-    """Unified search: Brave primary, Exa fallback."""
+    """Unified search: Brave primary, Exa fallback on error/empty."""
     brave = _get_brave()
     if brave:
-        return brave.search(query)
+        result = brave.search(query)
+        try:
+            parsed = json.loads(result)
+            if parsed.get("results") and not parsed.get("summary", "").startswith("Brave error"):
+                return result
+        except (json.JSONDecodeError, TypeError):
+            pass
+        # Brave returned error or empty — fall through to Exa
+        print("⚠️  Brave returned empty/error, falling back to Exa...")
     exa = _get_exa()
     if exa:
         return exa.search(query)
+    # If Brave returned something (even error) but Exa unavailable, return Brave result
+    if brave:
+        return result
     return json.dumps({"results": [], "summary": "No search backend configured.", "meta": {}}, ensure_ascii=False)
 
 

@@ -121,9 +121,6 @@ class StrategyConfig:
     audit_llm_timeout_max_retries: int = 5
     audit_llm_timeout_base_delay_sec: float = 5.0
     audit_llm_timeout_max_delay_sec: float = 90.0
-    valuation_weight_alpha: float = 0.10
-    fundamental_weight_alpha: float = 0.14
-    valuation_allow_premium: bool = True
     veto_context_target_tokens: int = VETO_CONTEXT_TARGET_TOKENS
     veto_chunk_target_tokens: int = VETO_CHUNK_TARGET_TOKENS
     veto_combine_target_tokens: int = VETO_COMBINE_TARGET_TOKENS
@@ -158,9 +155,6 @@ class StrategyConfig:
             audit_llm_timeout_max_retries=max(0, int(os.environ.get("AUDIT_LLM_TIMEOUT_MAX_RETRIES", "5"))),
             audit_llm_timeout_base_delay_sec=max(0.0, float(os.environ.get("AUDIT_LLM_TIMEOUT_BASE_DELAY_SEC", "5.0"))),
             audit_llm_timeout_max_delay_sec=max(0.0, float(os.environ.get("AUDIT_LLM_TIMEOUT_MAX_DELAY_SEC", "90.0"))),
-            valuation_weight_alpha=max(0.0, float(os.environ.get("VALUATION_WEIGHT_ALPHA", "0.10"))),
-            fundamental_weight_alpha=max(0.0, float(os.environ.get("FUNDAMENTAL_WEIGHT_ALPHA", "0.14"))),
-            valuation_allow_premium=os.environ.get("VALUATION_ALLOW_PREMIUM", "1").strip() in {"1", "true", "True", "YES", "yes"},
             veto_context_target_tokens=max(1000, int(os.environ.get("VETO_CONTEXT_TARGET_TOKENS", str(VETO_CONTEXT_TARGET_TOKENS)))),
             veto_chunk_target_tokens=max(1000, int(os.environ.get("VETO_CHUNK_TARGET_TOKENS", str(VETO_CHUNK_TARGET_TOKENS)))),
             veto_combine_target_tokens=max(1000, int(os.environ.get("VETO_COMBINE_TARGET_TOKENS", str(VETO_COMBINE_TARGET_TOKENS)))),
@@ -689,9 +683,13 @@ def combine_veto_chunk_summaries(
     config: StrategyConfig,
 ) -> Dict[str, Any]:
     system_prompt = (
-        "你是A股尽调员。基于分块证据摘要合成最终审计结论。"
-        "缺少证据不等于fail；只有明确、来源支撑的一票否决证据才fail。"
-        "当正面证据存在且无风险信号时，应返回pass而非warn。warn仅用于存在疑虑但未达一票否决的情况。"
+        "你是A股尽调员。基于分块证据摘要合成最终审计结论。\n"
+        "缺少证据不等于fail；只有明确、来源支撑的一票否决证据才fail。\n"
+        "当正面证据存在且无风险信号时，应返回pass而非warn。warn仅用于存在疑虑但未达一票否决的情况。\n"
+        "【财务恶化检测】请检查context.business_quality中的信息：\n"
+        "  - 若bullets中出现\"净利润同比-30%以上\"或\"营收同比下滑>20%\"或\"连续亏损\"，这是重要风险信号\n"
+        "  - 若business_quality.score < 35 且 bullets中有\"恶化\"关键词 → 应给warn，在rationale中明确标注财务风险\n"
+        "  - 仅有法律/监管合规问题才给fail。财务恶化本身给warn，除非同时叠加合规问题才给fail\n"
         "输出JSON：{\"verdict\":\"pass|warn|fail\",\"rationale\":\"\",\"sources\":[\"url\"]}。"
     )
     payload = {
@@ -993,7 +991,7 @@ def gemma_match_themes(
                 business_scope = str(row.get("business_scope", "") or "")
                 full_text = f"{combined} {business_scope}"
                 full_hits = sum(1 for tok in toks if tok in full_text)
-                if main_hits >= 1 or combined_hits >= 2 or full_hits >= 3:
+                if main_hits >= 1 or combined_hits >= 2 or full_hits >= 2:
                     kept.append(theme_name)
             else:
                 if main_hits >= 1 or combined_hits >= 2:
@@ -1025,19 +1023,15 @@ def gemma_match_themes(
                 "content": (
                     "你是A股题材归属分类器，采用多层次关系分析。\n\n"
                     "**匹配层次（按优先级）：**\n"
-                    "1. **直接匹配**：公司业务直接属于题材\n"
-                    "2. **间接关联**：\n"
-                    "   - 产业链上下游（供应商/客户关系）\n"
-                    "   - 技术生态关联（技术兼容、生态位）\n"
-                    "   - 市场传导逻辑（需求传导、政策联动）\n"
-                    "3. **概念延伸**：符合题材叙事逻辑或市场预期的标的\n\n"
+                    "1. **直接匹配**：公司主营业务直接属于题材\n"
+                    "2. **间接关联**：产业链上下游、技术生态关联、市场传导逻辑\n"
+                    "3. **概念延伸**：行业与题材关键词有交集，或符合题材叙事逻辑的标的\n\n"
                     "**要求：**\n"
                     "- 从白名单中选择0-2个最相关题材\n"
-                    "- 仅当主营业务/产品/客户链条有实质关联时才可匹配\n"
-                    "- 不允许仅凭经营范围模板词（如通信设备制造、AI硬件销售等）直接匹配\n"
-                    "- 若证据主要来自经营范围而非主营业务，必须返回空数组\n"
-                    "- business_scope为工商登记经营范围模板词，不反映实际业务，不可作为匹配依据\n"
-                    "- 完全无关才返回空数组\n"
+                    "- 优先主营业务匹配，但间接关联和概念延伸级别也可匹配（标注匹配层次即可）\n"
+                    "- 行业字段与题材关键词有交集 → 至少概念延伸级别，应该匹配\n"
+                    "- 仅当公司业务与所有题材都毫无关联时才返回空数组\n"
+                    "- business_scope仅作参考，不作为主要匹配依据\n"
                     "- 输出严格JSON：{\"matches\":{\"ts_code\":[\"theme1\",\"theme2\"]},\"notes\":{\"ts_code\":\"reason\"}}\n"
                     "- notes中说明关联逻辑（直接/间接/概念延伸）"
                 ),
@@ -2580,26 +2574,21 @@ def phase2_quant_filter(themes: List[ThemeItem], config: Optional[StrategyConfig
             theme_matched = theme_pool[matched_mask].copy()
 
             if not theme_matched.empty:
-                # A6: Score with quality-weighted formula
+                # A6: Score with 三支柱 pre-audit formula (quality 50% + setup 50% - overcrowding)
                 theme_matched["theme_strength_score"] = theme_matched["matched_themes"].map(
                     lambda arr: max([theme_strength_map.get(str(t), 0.5) for t in arr], default=0.0)
                 )
-                volume_col = "volume_quality_score" if "volume_quality_score" in theme_matched.columns else "volume_boost"
-                toplist_penalty = theme_matched.get("toplist_recency_score", pd.Series(0.0, index=theme_matched.index))
-                valuation_quality = theme_matched.get("valuation_quality_score", pd.Series(50.0, index=theme_matched.index))
-                valuation_stretch = theme_matched.get("valuation_stretch_score", pd.Series(50.0, index=theme_matched.index))
-                valuation_penalty = valuation_stretch / 100.0
-                trend_emergence = theme_matched.get("trend_emergence_score", pd.Series(0.0, index=theme_matched.index))
                 fundamental_quality = theme_matched.get("fundamental_quality_score", pd.Series(50.0, index=theme_matched.index))
+                valuation_quality = theme_matched.get("valuation_quality_score", pd.Series(50.0, index=theme_matched.index))
+                consolidation = theme_matched.get("consolidation_score", pd.Series(50.0, index=theme_matched.index))
+                squeeze = theme_matched.get("squeeze_readiness", pd.Series(50.0, index=theme_matched.index))
+                toplist_recency = theme_matched.get("toplist_recency_score", pd.Series(0.0, index=theme_matched.index))
                 theme_matched["alpha_rank_score"] = (
-                    theme_matched["theme_strength_score"] * 20.0
-                    + theme_matched[volume_col] * 0.13
-                    + theme_matched["composite_score"] * 0.18
-                    + trend_emergence * 0.08
-                    + valuation_quality * 0.18
-                    + fundamental_quality * 0.27
-                    - toplist_penalty * (config.toplist_penalty_weight * 10.0)
-                    - valuation_penalty * 8.0
+                    fundamental_quality * 0.35
+                    + valuation_quality * 0.15
+                    + consolidation * 0.35
+                    + squeeze * 0.15
+                    - toplist_recency * 0.05
                 )
                 theme_matched = theme_matched.sort_values("alpha_rank_score", ascending=False)
 
@@ -2621,7 +2610,7 @@ def phase2_quant_filter(themes: List[ThemeItem], config: Optional[StrategyConfig
     if relaxation_round >= 2:
         cons_threshold = 20
     logger.info(f"Step B: Building technical alpha list (pre-audit budget={tech_budget}, cons>={cons_threshold})...")
-    technical_order_col = "technical_selection_score" if "technical_selection_score" in screen_df.columns else "composite_score"
+    technical_order_col = "composite_score"
 
     con_b = duckdb.connect()
     con_b.register("screen", screen_df)
@@ -2653,11 +2642,21 @@ def phase2_quant_filter(themes: List[ThemeItem], config: Optional[StrategyConfig
                 tech_pool = heuristic_match_themes(heuristic_themes, tech_pool)
             tech_pool = normalize_match_columns(tech_pool)
         tech_pool["theme_strength_score"] = 0.0
-        if "technical_selection_score" in tech_pool.columns:
-            tech_pool["alpha_rank_score"] = tech_pool["technical_selection_score"]
-        else:
-            tech_pool["alpha_rank_score"] = tech_pool["composite_score"]
+        # Use same pre_audit_score formula as theme pool
+        fundamental_quality = tech_pool.get("fundamental_quality_score", pd.Series(50.0, index=tech_pool.index))
+        valuation_quality = tech_pool.get("valuation_quality_score", pd.Series(50.0, index=tech_pool.index))
+        consolidation = tech_pool.get("consolidation_score", pd.Series(50.0, index=tech_pool.index))
+        squeeze = tech_pool.get("squeeze_readiness", pd.Series(50.0, index=tech_pool.index))
+        toplist_recency = tech_pool.get("toplist_recency_score", pd.Series(0.0, index=tech_pool.index))
+        tech_pool["alpha_rank_score"] = (
+            fundamental_quality * 0.35
+            + valuation_quality * 0.15
+            + consolidation * 0.35
+            + squeeze * 0.15
+            - toplist_recency * 0.05
+        )
 
+        tech_pool = tech_pool.sort_values("alpha_rank_score", ascending=False)
         tech_list = tech_pool.head(tech_budget).copy()
         tech_list["list_type"] = "technical"
         tech_list["filter_tier"] = "OFF_THEME_FALLBACK" if theme_list.empty else "technical"
@@ -3272,51 +3271,53 @@ def rank_candidates_for_alpha(
         ts_code = str(row["ts_code"])
         sig = signals.get(ts_code, {})
         af = audit_features(ts_code)
-        timing_score = float(sig.get("timing_score", 0.0))
-        _raw_vol = sig.get("turnover_mult")
-        if _raw_vol is None:
-            _raw_vol = row.get("volume_boost")
-        turnover_mult = float(_raw_vol) if _raw_vol is not None else 1.0
-        volume_quality = clamp01(1.0 - abs(turnover_mult - 1.8) / 1.8)
-        _raw_ma = row.get("ma_spread")
-        ma_spread = float(_raw_ma) if _raw_ma is not None else 0.3
-        ma_comp = clamp01(1.0 - ma_spread / 0.30)
-        theme_strength = clamp01(float(row.get("theme_strength_score", 0.0)))
+
+        # ===== 支柱1: quality_score (重质, 权重40%) =====
+        fundamental_quality = clamp01(float(af.get("business_quality_score", 50.0)) / 100.0)
         valuation_quality = clamp01(float(row.get("valuation_quality_score", 50.0)) / 100.0)
-        valuation_stretch = clamp01(float(row.get("valuation_stretch_score", 50.0)) / 100.0)
-        business_quality = clamp01(float(af.get("business_quality_score", 50.0)) / 100.0)
+        quality_score = fundamental_quality * 0.70 + valuation_quality * 0.30
+
+        # ===== 支柱2: setup_score (待回踩, 权重35%) =====
+        consolidation = clamp01(float(row.get("consolidation_score", 50.0)) / 100.0)
+        squeeze = clamp01(float(row.get("squeeze_readiness", 50.0)) / 100.0)
+        lps_pullback_sig = float(sig.get("lps_pullback", 0.0))
+        pullback_depth = clamp01(lps_pullback_sig / 5.0)
+        setup_score = consolidation * 0.50 + squeeze * 0.25 + pullback_depth * 0.25
+
+        # ===== 支柱3: audit_score (通过滤, 权重25%) =====
         source_quality = clamp01(af["source_quality_score"])
         finding_score = clamp01(af["positive_finding_count"] / 4.0)
         catalyst_score = clamp01(af["catalyst_diversity"] / 3.0)
         audit_safe = 1.0 - clamp01(af["audit_risk_score"])
+        audit_score = (
+            finding_score * 0.30
+            + catalyst_score * 0.25
+            + source_quality * 0.20
+            + audit_safe * 0.25
+        )
+
+        # ===== 惩罚项 =====
+        _raw_vol = sig.get("turnover_mult")
+        if _raw_vol is None:
+            _raw_vol = row.get("volume_boost")
+        turnover_mult = float(_raw_vol) if _raw_vol is not None else 1.0
         toplist_recency = clamp01(float(row.get("toplist_recency_score", 0.0) or 0.0))
         blowoff_penalty = clamp01(max(0.0, turnover_mult - 3.0) / 2.0)
         overcrowding_penalty = clamp01(0.65 * toplist_recency + 0.35 * blowoff_penalty)
 
-        # IC-validated sub-scores: mean reversion dominates, consolidation wins
         atr_pct_sig = float(sig.get("atr_pct", 0.05))
-        if atr_pct_sig < 0.001:
-            low_vol_score = 0.5  # neutral for effectively zero ATR (dead ticker)
-        else:
-            low_vol_score = clamp01(1.0 - atr_pct_sig / 0.08)
-        price_pos_sig = float(sig.get("price_position_60d", 0.5))
-        mid_range_score = clamp01(1.0 - abs(price_pos_sig - 0.3) / 0.5)
-        lps_pullback_sig = float(sig.get("lps_pullback", 0.0))
-        lps_norm = clamp01(lps_pullback_sig / 5.0)
-        consolidation_alpha = 0.40 * low_vol_score + 0.35 * mid_range_score + 0.25 * lps_norm
-
         range_60d_sig = float(sig.get("range_pct_60d", 0.30))
         volatility_penalty = clamp01(atr_pct_sig / 0.06 + range_60d_sig / 0.50) / 2.0
+
+        # ===== Regime-conditional bonuses/penalties =====
+        regime = str(sig.get("market_regime", "range") or "range")
+        regime_conf = float(sig.get("regime_confidence", 0.5) or 0.5)
+        pos_sig = float(sig.get("close_position", 0.5) or 0.5)
 
         bos_recent = bool(sig.get("timing_bos", False)) or bool(sig.get("bos_20d", False))
         in_pullback_zone = 0.5 <= lps_pullback_sig <= 4.0
         base_pullback = clamp01(lps_pullback_sig / 3.0) if (bos_recent and in_pullback_zone) else 0.0
 
-        regime = str(sig.get("market_regime", "range") or "range")
-        regime_conf = float(sig.get("regime_confidence", 0.5) or 0.5)
-        pos_sig = float(sig.get("close_position", 0.5) or 0.5)
-
-        # Regime-conditional pullback reward
         if regime == 'uptrend':
             pullback_reward = base_pullback * 0.12
         elif regime == 'range' and pos_sig < 0.4:
@@ -3324,13 +3325,11 @@ def rank_candidates_for_alpha(
         else:
             pullback_reward = 0.0
 
-        # Regime-conditional mid-range bonus: only in range-bound, near box bottom
         if regime == 'range':
             mid_range_bonus = clamp01(1.0 - abs(pos_sig - 0.3) / 0.4) * 0.08 * regime_conf
         else:
             mid_range_bonus = 0.0
 
-        # Breakout zone penalty: chasing near box top
         if regime == 'breakout_zone':
             breakout_penalty = -0.08 * regime_conf
         elif pos_sig > 0.90:
@@ -3338,7 +3337,6 @@ def rank_candidates_for_alpha(
         else:
             breakout_penalty = 0.0
 
-        # Downtrend/bottom_fishing penalty
         if regime == 'downtrend':
             regime_penalty = -0.06 * regime_conf
         elif regime == 'bottom_fishing':
@@ -3347,18 +3345,10 @@ def rank_candidates_for_alpha(
             regime_penalty = 0.0
 
         score_01 = (
-            0.10 * consolidation_alpha +
-            0.15 * volume_quality +
-            0.14 * ma_comp +
-            0.14 * theme_strength +
-            config.valuation_weight_alpha * valuation_quality +
-            config.fundamental_weight_alpha * business_quality +
-            0.10 * finding_score +
-            0.07 * catalyst_score +
-            0.06 * source_quality +
-            0.07 * audit_safe
+            quality_score * 0.40
+            + setup_score * 0.35
+            + audit_score * 0.25
             - 0.12 * overcrowding_penalty
-            - (0.10 if config.valuation_allow_premium else 0.18) * valuation_stretch
             - 0.08 * volatility_penalty
             + pullback_reward
             + mid_range_bonus
@@ -3366,17 +3356,20 @@ def rank_candidates_for_alpha(
             + regime_penalty
         )
         score_01 = clamp01(score_01)
+
+        audit_risk_score = af["audit_risk_score"]
+        valuation_stretch_val = float(row.get("valuation_stretch_score", 50.0))
         alpha_rows.append(
             {
                 "ts_code": ts_code,
-                "audit_risk_score": af["audit_risk_score"],
+                "audit_risk_score": audit_risk_score,
                 "positive_finding_count": af["positive_finding_count"],
                 "source_quality_score": source_quality,
                 "catalyst_diversity": af["catalyst_diversity"],
-                "business_quality_score": business_quality * 100.0,
+                "business_quality_score": fundamental_quality * 100.0,
                 "valuation_quality_score": valuation_quality * 100.0,
-                "valuation_stretch_score": valuation_stretch * 100.0,
-                "valuation_label": str(row.get("valuation_label", classify_valuation_label(valuation_stretch * 100.0))),
+                "valuation_stretch_score": valuation_stretch_val,
+                "valuation_label": str(row.get("valuation_label", classify_valuation_label(valuation_stretch_val))),
                 "alpha_rank_score": score_01 * 100.0,
             }
         )
@@ -4576,7 +4569,7 @@ def compute_signals(candidates: pd.DataFrame) -> Dict[str, Dict[str, object]]:
             "bbw_percentile", "vwap_ratio", "price_change_20d",
             "return_5d", "return_10d", "return_20d", "volume_ratio_5d_vs_60d",
             "fresh_breakout", "near_breakout", "trend_emergence_score",
-            "technical_selection_score",
+            "consolidation_score", "squeeze_readiness",
         ]
         for col in passthrough_cols:
             if col in row and pd.notna(row[col]):
@@ -4835,7 +4828,10 @@ def _is_placeholder_source_url(url: str) -> bool:
     text = str(url or "").strip().lower()
     if not text:
         return True
-    parsed = urlparse(text)
+    try:
+        parsed = urlparse(text)
+    except ValueError:
+        return True
     host = parsed.netloc.split("@")[-1].split(":")[0]
     if host in {"example.com", "example.org", "example.net"}:
         return True
@@ -4976,7 +4972,7 @@ def build_core_table_rows(candidates: pd.DataFrame, audits: List[AuditResult], t
 
 _MARKET_OVERVIEW_SYSTEM_PROMPT = (
     "你是资深A股投研团队负责人，遵循\"重质、通过滤、待回踩\"理念。\n"
-    "核心信条：不追涨、不接飞刀、只等回踩确认后的低吸机会。\n"
+    "核心信条：回踩低吸是唯一的入场方式——但\"回踩\"不意味着无限等待，当价格已到低位区间、盘整充分、质量过关时，当下就是回踩的终点。\n"
     "只返回严格JSON，不要Markdown，不要代码块。\n"
     "输出格式："
     "{\"themes\":[{\"name\":\"主题名称\",\"validation_status\":\"confirmed|web_only|capital_only|weak\","
@@ -4993,32 +4989,32 @@ _MARKET_OVERVIEW_SYSTEM_PROMPT = (
 
 _STOCK_SECTION_SYSTEM_PROMPT_TEMPLATE = (
     "你是资深A股投研分析师，遵循\"重质、通过滤、待回踩\"理念。\n"
-    "核心信条：不追涨、不接飞刀、只等回踩确认后的低吸机会。\n"
+    "核心信条：回踩低吸是唯一的入场方式——但\"回踩\"不意味着无限等待，当价格已到低位区间、盘整充分、质量过关时，当下就是回踩的终点。\n"
     "只返回严格JSON，不要Markdown，不要代码块。\n"
     "\n"
     "【核心原则 - 必须遵守】\n"
     "1. 箱体位置是首要判断依据。请从signal_row中读取close_position（0-1，表示股价在120日箱体中的分位）：\n"
-    "   - close_position > 0.80（箱体高位）：必须明确指出\"不具备追高性价比\"，trade_plan的第一条必须是\"等待回踩至XX支撑位\"\n"
-    "   - close_position < 0.30（箱体低位）：必须分析是否存在基本面恶化导致的\"低位陷阱\"，不能盲目看多\n"
-    "   - close_position 0.30-0.60（箱体中低位）：回踩充分时可重点关注，这是最佳配置区间\n"
+    "   - close_position > 0.80（箱体高位）：追高风险极大，recommendation=watch或avoid，明确指出\"不具备追高性价比\"\n"
+    "   - close_position < 0.25（箱体低位）：回踩已非常充分——重点判断是否有基本面硬伤。如无硬伤，这是低吸区间而非继续等待的理由\n"
+    "   - close_position 0.25-0.50（箱体中低位）：回踩已有一定深度，配合盘整质量和基本面，可视为配置区间\n"
     "2. 投资逻辑排序：先讲周期位置（箱体位置+回踩信号），再讲基本面质量，最后讲题材催化。禁止以\"推荐买入\"开头。\n"
-    "3. 交易建议必须以\"等待回踩至XX位置\"为主要建议。禁止出现\"现价买入\"\"追涨\"\"突破买入\"等建议。\n"
+    "3. 交易建议分层（替代\"一刀切等回踩\"）：\n"
+    "   - buy/strong_buy 标的：trade_plan首条为\"当前XX分位回踩已充分，可在XX-XX区间分批建仓，止损XX\"\n"
+    "   - watch 标的：trade_plan首条为\"等待回踩至XX位置+缩量企稳后再考虑\"\n"
+    "   禁止出现\"追涨\"\"突破买入\"。\n"
     "4. 摘要（summary）第一句必须是当前位置判断，格式如：\"箱体X%分位，回踩/高位/中位整理，...\"。禁止以\"推荐\"\"看好\"开头。\n"
-    "5. recommendation 值域（严格按以下标准，默认 watch）：\n"
-    "   - strong_buy：仅用于\"箱体低位(≤35%分位)+回踩信号确认+基本面质量≥60\"三重共振，极其罕见\n"
-    "   - buy：箱体中低位(≤60%分位)+回踩信号+LPS/均线支撑确认\n"
-    "   - watch：箱体中高位(>60%分位)或趋势未明，等待回踩（默认值，适用于大多数情况）\n"
+    "5. recommendation 值域（严格按以下标准，禁止偷懒默认watch）：\n"
+    "   - strong_buy：箱体低位(≤30%分位)+基本面质量≥50+盘整分≥50。回踩到位、质量过关即可，不需要等\"确认信号\"——确认信号出现时最佳买点已过\n"
+    "   - buy：箱体中低位(≤50%分位)+基本面质量≥45+盘整分≥40。回踩有一定深度，可开始分批关注\n"
+    "   - watch：箱体中高位(>50%分位)或箱体低位但质量差/有下行风险，仍需等待\n"
     "   - avoid：基本面硬伤(fail verdict)或箱顶(>90%分位)放量滞涨\n"
     "\n"
     "【状态感知写作规则 — 从 cycle_position.market_regime 读取市场状态】\n"
-    "6. regime='uptrend'（趋势上行）：强调\"趋势结构完好(BOS确认)，当前回踩X ATR，关注均线支撑\"\n"
-    "   交易建议：以\"回踩至XX均线不破+缩量企稳\"为入场点，不追高\n"
-    "7. regime='range'（箱体震荡）：强调\"箱体X%分位，距下沿X%空间，等待缩量企稳\"\n"
-    "   交易建议：以\"接近箱体下沿+缩量+OBV未创新低\"为入场信号\n"
-    "8. regime='breakout_zone'（箱顶试探）：摘要首句必须包含\"【高位】\"\n"
-    "   必须明确列出\"追高风险\"和\"需要等待的确认信号\"。禁止任何买入倾向。\n"
+    "6. regime='uptrend'（趋势上行）：趋势完好+回踩=加仓机会。\"回踩至XX均线+缩量企稳=入场点\"\n"
+    "7. regime='range'（箱体震荡）：低位吸筹、高位减仓。距箱底近→可配置，距箱顶近→等回踩\n"
+    "8. regime='breakout_zone'（箱顶试探）：摘要首句必须包含\"【高位】\"。追高风险明确，等回踩确认后再考虑。\n"
     "9. regime='downtrend'（下行趋势）或 regime='bottom_fishing'（箱底陷阱）：\n"
-    "   摘要首句必须包含\"【风险】\"警示。必须分析结构性风险，不能仅凭低位建议配置。\n"
+    "   摘要首句必须包含\"【风险】\"警示。即使低位也需警惕，recommendation最多watch。\n"
     "\n"
     "【强制工具调用 — 必须遵守】\n"
     "你必须先执行至少一次web_search来获取该股票的最新外部信息，然后再输出最终JSON。\n"
@@ -5480,16 +5476,58 @@ def _fallback_stock_section(
     else:
         regime = str((signal or {}).get("market_regime", "range") or "range")
         pos = float((signal or {}).get("close_position", 0.5) or 0.5)
-        lps_ok = bool((signal or {}).get("lps_pullback") or 0) > 0
-        timing_ok = float((signal or {}).get("timing_score") or 0) >= 0.29
-        if regime == 'uptrend' and lps_ok and pos < 0.7:
-            recommendation, label = ("strong_buy", "可配置")
-        elif regime == 'range' and pos < 0.4 and lps_ok:
-            recommendation, label = ("buy", "可配置")
-        elif regime == 'breakout_zone' or regime == 'downtrend':
-            recommendation, label = ("watch", "等回踩")
-        elif regime == 'bottom_fishing':
+        quality = float((signal or {}).get("fundamental_quality_score", 50) or 50)
+        consol = float((signal or {}).get("consolidation_score", 50) or 50)
+
+        # ── Hard filters: conditions that force "avoid" regardless of position ──
+        force_avoid = False
+
+        # 1) Q1 profit crash check — parse business quality bullets for YoY profit drops
+        biz_quality = aggregate_business_quality(stock_audits)
+        for bullet in biz_quality.get("business_quality_bullets", []):
+            bullet_str = str(bullet)
+            # Match patterns like "Q1归母净利同比-45.01%" or "净利润同比-30%"
+            m = re.search(r'(?:Q1|一季度|归母|净利(?:润)?).*?同比\s*([+-]?\d+\.?\d*)\s*%', bullet_str)
+            if m:
+                pct = float(m.group(1))
+                if pct < -30:
+                    force_avoid = True
+                    break
+            # Also catch "净利润趋势短期恶化" combined with low quality
+            if "恶化" in bullet_str and quality < 40:
+                force_avoid = True
+                break
+
+        # 2) Loss-making company with deteriorating trend → avoid
+        pe_val = row.get("pe")
+        if pe_val is None or (isinstance(pe_val, float) and (pe_val != pe_val)):
+            if quality < 45:
+                force_avoid = True  # Negative earnings + poor quality = structural decline
+
+        # 3) Recent spike + high position → cooling period needed
+        recent_spikes = []
+        if chart and chart.spike_dates:
+            today = datetime.now()
+            for sd in chart.spike_dates:
+                try:
+                    spike_dt = datetime.strptime(sd, "%Y-%m-%d")
+                    if (today - spike_dt).days <= 20:
+                        recent_spikes.append(sd)
+                except (ValueError, TypeError):
+                    pass
+        in_cooling = len(recent_spikes) >= 1 and pos > 0.40
+
+        if force_avoid:
             recommendation, label = ("avoid", "回避")
+        elif in_cooling and pos > 0.55:
+            # High position with recent spike → prohibit buying
+            recommendation, label = ("watch", "等回踩")
+        elif regime in ('breakout_zone', 'downtrend', 'bottom_fishing'):
+            recommendation, label = ("watch", "等回踩")
+        elif pos <= 0.30 and quality >= 50 and consol >= 50:
+            recommendation, label = ("strong_buy", "可配置")
+        elif pos <= 0.50 and quality >= 45 and consol >= 40:
+            recommendation, label = ("buy", "可配置")
         else:
             recommendation, label = ("watch", "等回踩")
     spike_note = "、".join(chart.spike_dates[:6]) if chart and chart.spike_dates else "未检测到明显量能异动"
@@ -5594,6 +5632,40 @@ def _normalize_stock_section_payload(
     fallback = _fallback_stock_section(row, stock_audits, chart, signal)
     business_quality = aggregate_business_quality(stock_audits)
     recommendation, label = _normalize_recommendation(payload.get("recommendation"))
+    # Deterministic floor: prevent LLM from downgrading buy→watch when signal data
+    # meets the criteria. LLM can still upgrade watch→buy or downgrade anything→avoid.
+    # BUT: first check for hard filters (Q1 profit crash, negative PE) that force avoid.
+    if recommendation not in ("avoid",) and label != "回避":
+        verdicts = {normalize_verdict(a.verdict) for a in stock_audits}
+        if "fail" not in verdicts:
+            regime = str((signal or {}).get("market_regime", "range") or "range")
+            pos = float((signal or {}).get("close_position", 0.5) or 0.5)
+            quality = float((signal or {}).get("fundamental_quality_score", 50) or 50)
+            consol = float((signal or {}).get("consolidation_score", 50) or 50)
+
+            # Check for hard avoids (Q1 profit crash, negative PE + low quality)
+            force_avoid = False
+            for bullet in business_quality.get("business_quality_bullets", []):
+                bullet_str = str(bullet)
+                m = re.search(r'(?:Q1|一季度|归母|净利(?:润)?).*?同比\s*([+-]?\d+\.?\d*)\s*%', bullet_str)
+                if m and float(m.group(1)) < -30:
+                    force_avoid = True
+                    break
+                if "恶化" in bullet_str and quality < 40:
+                    force_avoid = True
+                    break
+            pe_val = row.get("pe")
+            if (pe_val is None or (isinstance(pe_val, float) and (pe_val != pe_val))) and quality < 45:
+                force_avoid = True
+
+            if force_avoid:
+                recommendation, label = ("avoid", "回避")
+            elif recommendation in ("watch",) and label == "等回踩":
+                if regime not in ('breakout_zone', 'downtrend', 'bottom_fishing'):
+                    if pos <= 0.30 and quality >= 50 and consol >= 50:
+                        recommendation, label = ("strong_buy", "可配置")
+                    elif pos <= 0.50 and quality >= 45 and consol >= 40:
+                        recommendation, label = ("buy", "可配置")
     positive_findings = _normalize_positive_findings(
         payload.get("positive_findings"),
         fallback.positive_findings,

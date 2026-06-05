@@ -105,6 +105,27 @@ VOLATILITY_THRESHOLD = 0.50 # 50% max amplitude (relaxed from 35%)
 - Valuation Quality: 10%
 - Fundamental Quality: 22%
 
+### Alpha Ranking — Three-Pillar Model
+
+Post-audit alpha uses a clean three-pillar structure aligned with "重质、通过滤、待回踩":
+
+```python
+quality_score = fundamental_quality * 0.70 + valuation_quality * 0.30   # 重质 (40%)
+setup_score   = consolidation * 0.50 + squeeze * 0.25 + pullback_depth * 0.25  # 待回踩 (35%)
+audit_score   = findings*0.30 + catalysts*0.25 + source_quality*0.20 + audit_safe*0.25  # 通过滤 (25%)
+
+alpha = quality_score*0.40 + setup_score*0.35 + audit_score*0.25
+      - 0.12*overcrowding - 0.08*volatility
+      + pullback_reward + mid_range_bonus + breakout_penalty + regime_penalty
+```
+
+**Pre-audit ranking** (unified for theme pool and technical pool):
+```python
+pre_audit_score = fundamental*0.35 + valuation*0.15 + consolidation*0.35 + squeeze*0.15 - toplist*0.05
+```
+
+Theme is a **gate**, not a scoring factor — it determines pool membership, not rank within the pool.
+
 ### `deep_researcher.py` - Search Functions
 
 - `search_backend(query)`: Brave Search API (primary) + Exa.ai (backup)
