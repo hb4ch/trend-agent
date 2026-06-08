@@ -441,6 +441,8 @@ class DragonTigerList:
         basic_path = self.data_dir / "stock_basic" / "stock_basic.parquet"
         if basic_path.exists():
             self._stock_basic_cache = pd.read_parquet(basic_path)
+            if "list_status" in self._stock_basic_cache.columns:
+                self._stock_basic_cache = self._stock_basic_cache[self._stock_basic_cache["list_status"] == "L"]
             return self._stock_basic_cache
 
         logger.warning("stock_basic.parquet not found")

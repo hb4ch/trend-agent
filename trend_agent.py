@@ -1742,7 +1742,7 @@ def run_python(code: str, context: Dict) -> str:
 DUCKDB_REPO_TABLE_SPECS: Dict[str, Dict[str, Any]] = {
     "stock_basic": {
         "path_parts": ("stock_basic", "stock_basic.parquet"),
-        "columns": ["ts_code", "symbol", "name", "area", "industry", "list_date", "market", "exchange"],
+        "columns": ["ts_code", "symbol", "name", "area", "industry", "list_date", "delist_date", "market", "exchange", "list_status"],
         "sql": "CREATE VIEW stock_basic AS SELECT * FROM parquet_scan(?)",
     },
     "stock_company": {

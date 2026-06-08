@@ -64,6 +64,8 @@ def load_stock_basic() -> pd.DataFrame:
     """Load stock basic information."""
     logger.info("Loading stock basic info...")
     df = pd.read_parquet('data/stock_basic/stock_basic.parquet')
+    if "list_status" in df.columns:
+        df = df[df["list_status"] == "L"]
     return df
 
 
